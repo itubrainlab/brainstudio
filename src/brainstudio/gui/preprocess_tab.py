@@ -9,6 +9,7 @@ from PySide6 import QtCore, QtWidgets
 
 from .. import eeg as E
 from .. import preprocessing as P
+from .icaview import ICAComponentView
 from .theme import THEME
 from .widgets import (StageHeader, _spin, _themed_plot, has_positions, hint,
                       NO_POS)
@@ -156,13 +157,17 @@ class PreprocessTab(QtWidgets.QWidget):
         right = QtWidgets.QTabWidget()
         self.psd_plot = _themed_plot(bottom=("Frequency", "Hz"), left="Power (dB µV²/Hz)")
         self.psd_plot.addLegend()
-        right.addTab(self.psd_plot, "Spectrum (before / after)")
+        right.addTab(self.psd_plot, "Spectrum")
         self.ptp_plot = _themed_plot(bottom="channel", left="noisy / flat windows (%)")
-        right.addTab(self.ptp_plot, "Channel peak-to-peak")
+        right.addTab(self.ptp_plot, "Channels")
         self.blink_plot = _themed_plot(bottom=("Time from blink onset", "s"),
                                        left="Frontal EEG (µV)")
         self.blink_plot.addLegend()
         right.addTab(self.blink_plot, "Blink check")
+        self.ica_view = ICAComponentView()
+        right.addTab(self.ica_view, "ICA component")
+        right.setTabToolTip(0, "Spectrum before / after preprocessing")
+        right.setTabToolTip(1, "Noisy / flat windows per channel")
         self.right = right
         split.addWidget(right)
         split.setSizes([560, 860])
@@ -177,6 +182,11 @@ class PreprocessTab(QtWidgets.QWidget):
         for w in (self.interp, self.ica_on):
             w.toggled.connect(stale)
         self.ica_table.itemChanged.connect(stale)
+        self.ica_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.ica_table.currentCellChanged.connect(lambda r, *_: self.show_component(r))
+        self.ica_table.cellClicked.connect(lambda r, *_: self.show_component(r))
+        self.ica_table.cellDoubleClicked.connect(lambda *_: self.plot_properties())
+        self.ica_table.itemChanged.connect(self._ica_item_changed)
 
     # ================================================================== pipeline
     def _on_pipeline(self, what):
@@ -403,21 +413,29 @@ class PreprocessTab(QtWidgets.QWidget):
         def job():
             ica, fit_raw = P.fit_ica(raw, bads, h, notch, ip)
             scores = P.score_blink_components(ica, fit_raw, blinks, eog)
-            return ica, fit_raw, scores
+            sources = ica.get_sources(fit_raw).get_data()
+            return ica, fit_raw, scores, sources
 
         def done(res):
-            self.pl.ica, self.pl.ica_fit_raw, self.pl.ica_scores = res
+            self.pl.ica, self.pl.ica_fit_raw, self.pl.ica_scores, self.pl.ica_sources = res
             self.pl.ica_key = (tuple(bads), h, notch)
             self._fill_ica_table(use_suggested=True)
             self.pl.mark_stale("preprocessing")
+            if self.ica_table.rowCount():
+                self.ica_table.selectRow(0)
+                self.show_component(0)
 
         self.worker.run(f"Fitting ICA ({ip.method}, {ip.n_components} components)…", job, done)
 
     def _fill_ica_table(self, use_suggested=False):
         sc = self.pl.ica_scores
+        self.ica_table.blockSignals(True)
         self.ica_table.clear()
+        self.ica_table.blockSignals(False)
         if sc is None:
             self.ica_table.setRowCount(0)
+            self.ica_view._args = None
+            self.ica_view.restyle()
             return
         cols = ["exclude", "component", "EOG/frontal |r|", "blink-locked t", "suggested"]
         self.ica_table.setColumnCount(len(cols))
@@ -450,6 +468,26 @@ class PreprocessTab(QtWidgets.QWidget):
             "Inspect with ‘Components’ / ‘Properties’ and tick what to remove."
             + ("" if n_sug else " None stands out: if blinks are not visible in the EEG, "
                                 "removing nothing is the right call."))
+
+    def show_component(self, row: int):
+        """Display the component of a table row in the 'ICA component' panel."""
+        pl = self.pl
+        if pl.ica is None or getattr(pl, "ica_sources", None) is None or row < 0 \
+                or row >= self.ica_table.rowCount():
+            return
+        it = self.ica_table.item(row, 0)
+        k = int(it.data(QtCore.Qt.UserRole))
+        blinks = pl.gaze_events.blinks if pl.gaze_events is not None else None
+        try:
+            self.ica_view.show_component(pl.ica, pl.ica_fit_raw, pl.ica_sources, k, blinks,
+                                         pl.ica_scores, it.checkState() == CHECKED)
+        except Exception as e:  # a display problem must not break the table
+            self.ica_view._message(f"Cannot display ICA{k:03d}: {e}")
+        self.right.setCurrentWidget(self.ica_view)
+
+    def _ica_item_changed(self, item):
+        if item.column() == 0 and item.row() == self.ica_table.currentRow():
+            self.show_component(item.row())  # recolour when (un)ticked
 
     def ica_excluded(self) -> list[int]:
         out = []
@@ -499,6 +537,7 @@ class PreprocessTab(QtWidgets.QWidget):
     def restyle(self):
         for p in (self.psd_plot, self.ptp_plot, self.blink_plot):
             p.setBackground(THEME.bg)
+        self.ica_view.restyle()
         self._plot_all()
 
     def _plot_all(self):

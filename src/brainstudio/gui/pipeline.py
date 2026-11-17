@@ -39,6 +39,7 @@ class EEGPipeline(QtCore.QObject):
         self.ica_fit_raw = None
         self.ica_scores: pd.DataFrame | None = None
         self.ica_key = None
+        self.ica_sources = None
         self.psd_before = None
         self.psd_after = None
         self.epoch_settings = EpochSettings()
@@ -88,6 +89,7 @@ class EEGPipeline(QtCore.QObject):
 
     def invalidate_ica(self):
         self.ica = self.ica_fit_raw = self.ica_scores = self.ica_key = None
+        self.ica_sources = None
 
     def mark_stale(self, stage: str):
         """Settings of ``stage`` changed: it and every later stage are out of date."""
