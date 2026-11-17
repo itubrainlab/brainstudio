@@ -18,6 +18,7 @@ class ICAComponentView(QtWidgets.QWidget):
         super().__init__(parent)
         self.fig = Figure(figsize=(6, 5), layout="constrained")
         self.canvas = FigureCanvasQTAgg(self.fig)
+        self.canvas.setMinimumSize(160, 160)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self.canvas)

@@ -22,7 +22,14 @@ def main(argv=None):
 
     import pyqtgraph as pg  # noqa: F401
 
+    import warnings
+
     import matplotlib.pyplot as plt
+
+    # embedded figures are briefly tiny while tabs/splitters lay out; matplotlib then
+    # skips its layout for that frame and warns — harmless, the next draw is correct
+    warnings.filterwarnings("ignore", message="constrained_layout not applied",
+                            category=UserWarning)
 
     from .main_window import MainWindow
 

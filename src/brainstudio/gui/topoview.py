@@ -16,6 +16,7 @@ class TopoView(QtWidgets.QWidget):
         super().__init__(parent)
         self.fig = Figure(figsize=(3, 3), layout="constrained")
         self.canvas = FigureCanvasQTAgg(self.fig)
+        self.canvas.setMinimumSize(160, 160)
         self.ax = self.fig.add_subplot(111)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
