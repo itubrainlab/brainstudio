@@ -1,0 +1,91 @@
+"""Tests on synthetic data (BIDS + XDF round trips, gaze detection, FRPs)."""
+
+import numpy as np
+import pytest
+
+from brainstudio import eeg as E
+from brainstudio import gaze as G
+from brainstudio.demo import simulate, write_bids, write_xdf_demo
+from brainstudio.io import load_bids_run, load_xdf, scan_bids
+from brainstudio.io.xdf import _clean_timestamps
+from brainstudio.io.xdf_writer import write_xdf
+
+
+@pytest.fixture(scope="module")
+def demo(tmp_path_factory):
+    root = tmp_path_factory.mktemp("demo")
+    write_bids(root / "bids", subjects=("01",))
+    write_xdf_demo(root / "demo.xdf")
+    return root
+
+
+def test_bids_scan_and_load(demo):
+    runs = scan_bids(demo / "bids")
+    assert len(runs) == 1 and runs[0].eeg is not None and runs[0].gaze
+    rec = load_bids_run(demo / "bids", runs[0])
+    assert rec.has_eeg and rec.has_gaze
+    assert rec.gaze.times[0] == pytest.approx(0.5, abs=1e-6)  # StartTime alignment
+    assert rec.gaze.sfreq == pytest.approx(500, rel=1e-3)
+    ev = rec.all_events()
+    # EEG events.tsv and eye-tracker messages are merged without duplicates
+    assert (ev.description == "stimulus").sum() == len(simulate(seed=0).markers) // 2
+
+
+def test_xdf_load(demo):
+    rec = load_xdf(demo / "demo.xdf")
+    assert len(rec.raw.ch_names) == 32
+    assert rec.gaze.times[0] == pytest.approx(0.5, abs=0.01)
+    assert rec.all_events().description.iloc[0] == "stimulus"
+    assert rec.all_events().onset.iloc[0] == pytest.approx(3.0, abs=0.01)
+
+
+def test_fixation_detection_matches_truth():
+    sim = simulate(duration=60, seed=3)
+    from brainstudio.model import GazeData
+    g = GazeData(sim.gaze_t, sim.gx, sim.gy, sim.pupil)
+    fix = G.detect_fixations(g)
+    err = np.abs(fix.onset.to_numpy()[:, None] - sim.fix_onsets[None]).min(1)
+    assert np.median(err) < 0.03
+    assert 0.8 < len(fix) / len(sim.fix_onsets) < 1.4
+
+
+def test_aoi_stats_use_pygaze():
+    import pandas as pd
+    fix = pd.DataFrame({"onset": [0, 1], "offset": [.2, 1.3], "duration": [.2, .3],
+                        "x": [100, 900], "y": [100, 500]})
+    st = G.aoi_statistics(fix, {"a": G.make_aoi("rectangle", (50, 50), (100, 100))})
+    assert st.n_fixations.iloc[0] == 1 and st.dwell_time.iloc[0] == pytest.approx(.2)
+
+
+def test_frp_recovers_lambda_response(demo):
+    rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
+    raw = E.preprocess(rec.raw, E.FilterParams(1, 30))
+    ev = G.detect_events(rec.gaze)
+    evk = E.fixation_related_epochs(raw, ev.fixations, min_duration=0.1).average()
+    oz = evk.copy().pick(["Oz"]).data[0]
+    assert 0.06 < evk.times[np.argmax(oz)] < 0.14  # simulated P1 at ~90 ms
+
+
+def test_foreign_clock_samples_recover_offset(tmp_path):
+    """Samples stamped on another clock (seen in real Gazepoint recordings)."""
+    n, sr, off = 3000, 150.0, 325222.957
+    ts = 1000 + np.arange(n) / sr
+    for i in (500, 1500, 1501):
+        ts[i] += off
+    stream = {"time_stamps": ts, "info": {"nominal_srate": [str(sr)]}}
+    clean, idx, info = _clean_timestamps(stream)
+    assert len(idx) == n - 3
+    assert info["foreign_offset"] == pytest.approx(off, abs=0.01)
+    # loader maps the stream onto the EEG clock
+    eeg_t = 1000 + off + np.arange(int(20 * 256)) / 256
+    write_xdf(tmp_path / "f.xdf", [
+        dict(name="EEG", type="EEG", srate=256, format="float32", labels=["Cz", "Pz"],
+             timestamps=eeg_t, data=np.zeros((len(eeg_t), 2))),
+        dict(name="Tracker", type="gaze", srate=sr, format="float32",
+             labels=["FPOGX", "FPOGY", "FPOGV"], timestamps=ts,
+             data=np.column_stack([np.full(n, .5), np.full(n, .25), np.ones(n)])),
+    ])
+    rec = load_xdf(tmp_path / "f.xdf")
+    assert rec.gaze.times[0] == pytest.approx(0.0, abs=0.02)
+    assert np.nanmedian(rec.gaze.x) == pytest.approx(960)
+    assert np.nanmedian(rec.gaze.y) == pytest.approx(270)
