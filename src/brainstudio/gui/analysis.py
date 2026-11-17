@@ -28,6 +28,17 @@ def fill_table(table: QtWidgets.QTableWidget, df: pd.DataFrame, fmt="{:.3g}"):
     table.resizeColumnsToContents()
 
 
+def has_positions(inst) -> bool:
+    """True if at least 4 EEG channels of an MNE object have sensor locations."""
+    locs = np.array([ch["loc"][:3] for ch in inst.info["chs"]
+                     if ch["kind"] == 2])  # FIFFV_EEG_CH
+    return len(locs) > 0 and int((np.isfinite(locs).all(1) & (np.abs(locs).sum(1) > 0)).sum()) >= 4
+
+
+NO_POS = ("The EEG channels have no electrode positions (unlabelled channels, no montage), "
+          "so scalp topographies cannot be drawn.")
+
+
 def _spin(lo, hi, val, step=0.05, dec=3, suffix=""):
     w = QtWidgets.QDoubleSpinBox()
     w.setRange(lo, hi)
@@ -182,6 +193,9 @@ class AnalysisPanel(QtWidgets.QTabWidget):
         if self.psd is None:
             self.compute_psd()
         if self.psd is not None:
+            if not has_positions(self.psd):
+                QtWidgets.QMessageBox.information(self, "Topomap", NO_POS)
+                return
             try:
                 self.psd.plot_topomap(show=True)
             except Exception as e:  # no montage etc.
@@ -292,7 +306,10 @@ class AnalysisPanel(QtWidgets.QTabWidget):
             self.compute_erp()
         if self.evoked is not None:
             try:
-                self.evoked.plot_joint(show=True)
+                if has_positions(self.evoked):
+                    self.evoked.plot_joint(show=True)
+                else:  # butterfly without topomaps rather than guessed positions
+                    self.evoked.plot(spatial_colors=False, gfp=True, show=True)
             except Exception as e:
                 QtWidgets.QMessageBox.warning(self, "Joint plot", str(e))
 

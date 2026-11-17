@@ -22,7 +22,13 @@ def main(argv=None):
 
     import pyqtgraph as pg  # noqa: F401
 
+    import matplotlib.pyplot as plt
+
     from .main_window import MainWindow
+
+    # Interactive mode: MNE's plt.show() must not start a nested Qt event loop
+    # ("QCoreApplication::exec: The event loop is already running").
+    plt.ion()
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     app.setApplicationName("BrainStudio")
