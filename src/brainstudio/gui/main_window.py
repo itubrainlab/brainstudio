@@ -12,11 +12,14 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import eeg as E
+from .. import events as EV
 from .. import gaze as G
 from .. import io as bio
 from ..model import Recording
 from .analysis import AnalysisPanel, _spin, fill_table
+from .montage_dialog import MontageDialog
 from .screenview import ScreenView
+from .theme import THEME, apply_theme
 from .timeplots import EEGPlot, GazePlot, OverviewBar
 from .topoview import TopoView
 
@@ -45,6 +48,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.play_timer.setInterval(40)
         self.play_timer.timeout.connect(self._play_step)
         self.statusBar().showMessage("Open a BIDS dataset (File ▸ Open BIDS…) or an XDF file.")
+        self.event_df = EV.build_event_table(None)
+        self._apply_theme()
+        hints = QtGui.QGuiApplication.styleHints()
+        if hasattr(hints, "colorSchemeChanged"):  # Qt >= 6.5: follow system light/dark
+            hints.colorSchemeChanged.connect(lambda *_: QtCore.QTimer.singleShot(
+                0, self._apply_theme))
 
     # ================================================================== layout
     def _build_central(self):
@@ -86,7 +95,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gaze_plot.cursorMoved.connect(self.set_cursor)
         self.eeg_plot.windowChanged.connect(self._on_window)
         self.overview.regionChanged.connect(lambda a, b: self.eeg_plot.set_window(a, b))
-        self.screen.aoisChanged.connect(self.analysis.update_aoi_stats)
+        self.screen.aoisChanged.connect(self._aois_changed)
         # click in a time plot moves the cursor
         for plot in (self.eeg_plot.plotItem, self.gaze_plot.pos_plot):
             plot.scene().sigMouseClicked.connect(lambda ev, p=plot: self._click(ev, p))
@@ -259,6 +268,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Open &BIDS dataset…", "Ctrl+B", self.action_open_bids),
             ("&Open file (XDF / EEG / EyeLink)…", QtGui.QKeySequence.Open, self.action_open_file),
             ("Attach &eye-tracking file…", "Ctrl+E", self.action_attach_gaze),
+            ("Channel names && &montage…", "Ctrl+M", self.action_montage),
             ("Load &stimulus image…", "Ctrl+I", self.action_stimulus),
             (None, None, None),
             ("Export gaze events (CSV)…", None, self.export_gaze_events),
@@ -411,7 +421,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.detect_gaze_events()
         self.info.setPlainText(rec.summary() + ("\n" + rec.description if rec.description else ""))
         self._refresh_events()
-        self.analysis.refresh_sources()
+        self._rebuild_event_table()
         self.analysis.update_gaze_stats()
         win = min(self.win_len.value(), max(rec.duration, 0.5))
         if rec.raw is None and rec.has_gaze:
@@ -492,7 +502,58 @@ class MainWindow(QtWidgets.QMainWindow):
         self._overlay_toggled()
         self._heat_toggled()
         self.analysis.update_gaze_stats()
+        self._rebuild_event_table()
         self._update_screen()
+
+    # ================================================================== events / montage
+    def _rebuild_event_table(self):
+        aois = self.screen.pygaze_aois() if self.screen.aois else None
+        self.event_df = EV.build_event_table(self.rec, self.gaze_events, aois)
+        self.analysis.set_event_table(self.event_df)
+
+    def _aois_changed(self):
+        self.analysis.update_aoi_stats()
+        if self.rec is not None:
+            self._rebuild_event_table()
+
+    def action_montage(self):
+        if self.rec is None or self.rec.raw is None:
+            QtWidgets.QMessageBox.information(self, "Montage", "Load a recording with EEG first.")
+            return
+        dlg = MontageDialog(self.rec.raw, self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        try:
+            with self._busy("Applying montage…"):
+                rep = E.apply_montage(self.rec.raw, dlg.montage, dlg.names_out)
+                if self.display_raw is not None and self.display_raw is not self.rec.raw:
+                    E.apply_montage(self.display_raw, dlg.montage, dlg.names_out)
+        except Exception as e:
+            self._error("Montage", e)
+            return
+        self._load_eeg_plot()
+        self.topo.set_raw(self.display_raw)
+        self.info.setPlainText(self.rec.summary() + "\n" + self.rec.description)
+        self.statusBar().showMessage(
+            f"Montage applied: {rep['n_renamed']} channels renamed, "
+            f"{rep['n_positioned']} EEG channels with positions", 8000)
+
+    # ================================================================== theme
+    def _apply_theme(self):
+        apply_theme(QtWidgets.QApplication.instance(), self)
+        for w in (self.eeg_plot, self.gaze_plot, self.overview, self.screen, self.topo):
+            w.restyle()
+        self.analysis.restyle()
+        self._heat_toggled()
+
+    def changeEvent(self, ev):
+        if ev.type() in (QtCore.QEvent.PaletteChange, QtCore.QEvent.ApplicationPaletteChange) \
+                and hasattr(self, "analysis"):
+            dark = QtWidgets.QApplication.instance().palette().color(
+                QtGui.QPalette.Base).lightness() < 128
+            if dark != THEME.dark:
+                QtCore.QTimer.singleShot(0, self._apply_theme)
+        super().changeEvent(ev)
 
     def _after_gaze_change(self):
         g = self.rec.gaze

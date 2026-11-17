@@ -123,3 +123,154 @@ def set_standard_montage(raw: mne.io.BaseRaw) -> None:
         raw.set_montage(name, on_missing="ignore", match_case=False, verbose="error")
     except Exception:
         pass
+
+
+# =========================================================================== montage
+def montage_from_source(source: str) -> mne.channels.DigMontage:
+    """Built-in montage name (see ``mne.channels.get_builtin_montages``) or file path."""
+    from pathlib import Path
+
+    p = Path(source)
+    if not p.exists():  # a montage name (incl. deprecated aliases MNE still accepts)
+        try:
+            return mne.channels.make_standard_montage(source)
+        except ValueError as e:
+            raise ValueError(f"'{source}' is neither a file nor a built-in montage") from e
+    if p.suffix.lower() == ".fif":
+        return mne.channels.read_dig_fif(p)
+    if p.name.endswith("_electrodes.tsv"):  # BIDS electrodes file
+        import pandas as pd
+        df = pd.read_csv(p, sep="\t", na_values=["n/a"]).dropna(subset=["x", "y", "z"])
+        pos = df[["x", "y", "z"]].to_numpy(float)
+        if np.nanmax(np.abs(pos)) > 1.0:  # mm / cm → m
+            pos = pos / (1000.0 if np.nanmax(np.abs(pos)) > 30 else 100.0)
+        return mne.channels.make_dig_montage(dict(zip(df["name"].astype(str), pos)),
+                                             coord_frame="head")
+    return mne.channels.read_custom_montage(p)
+
+
+def guess_channel_type(name: str) -> str:
+    n = name.upper()
+    for key, kind in (("EOG", "eog"), ("ECG", "ecg"), ("EKG", "ecg"), ("EMG", "emg"),
+                      ("TRIG", "stim"), ("STI", "stim")):
+        if key in n:
+            return kind
+    return "eeg"
+
+
+def apply_montage(raw: mne.io.BaseRaw, montage: mne.channels.DigMontage | None,
+                  new_names: list[str] | None = None, set_types: bool = True) -> dict:
+    """Rename channels (in recording order), set types and apply ``montage`` in place.
+
+    Returns a report: n_renamed, n_positioned, missing (EEG channels without position).
+    """
+    report = {"n_renamed": 0}
+    if new_names:
+        mapping = {}
+        for old, new in zip(raw.ch_names, new_names):
+            new = new.strip()
+            if new and new != old:
+                mapping[old] = new
+        if len(set(mapping.values())) != len(mapping) or \
+                set(mapping.values()) & (set(raw.ch_names) - set(mapping)):
+            raise ValueError("Channel names must be unique")
+        raw.rename_channels(mapping, verbose="error")
+        report["n_renamed"] = len(mapping)
+    if set_types:
+        types = {ch: guess_channel_type(ch) for ch in raw.ch_names}
+        changed = {ch: t for ch, t in types.items()
+                   if t != "eeg" and raw.get_channel_types([ch])[0] == "eeg"}
+        if changed:
+            raw.set_channel_types(changed, verbose="error")
+    if montage is not None:
+        raw.set_montage(montage, match_case=False, on_missing="ignore", verbose="error")
+    eeg = mne.pick_types(raw.info, eeg=True, exclude=[])
+    has = [i for i in eeg if np.isfinite(raw.info["chs"][i]["loc"][:3]).all()
+           and np.abs(raw.info["chs"][i]["loc"][:3]).sum() > 0]
+    report["n_positioned"] = len(has)
+    report["missing"] = [raw.ch_names[i] for i in eeg if i not in has]
+    return report
+
+
+# =========================================================================== event-table epochs
+def epochs_from_table(raw: mne.io.BaseRaw, table, tmin: float = -0.2, tmax: float = 0.8,
+                      baseline=(None, 0), reject_uv: float | None = None,
+                      max_epochs: int | None = 2000, seed: int = 0,
+                      picks="eeg") -> mne.Epochs:
+    """MNE Epochs locked to the rows of an event table, with the table as metadata.
+
+    Event IDs are the table's ``name`` column, so standard MNE selection works:
+    ``epochs["fixation"]``, ``epochs['cond == "AI"']`` (metadata query), etc.
+    Rows outside the recording, or falling on an already used sample, are
+    dropped; ``max_epochs`` randomly subsamples (reproducibly) to bound memory.
+    """
+    import pandas as pd
+
+    tab = table.reset_index(drop=True).copy()
+    sf = raw.info["sfreq"]
+    samples = np.round(tab["onset"].to_numpy(float) * sf).astype(int) + raw.first_samp
+    lo = raw.first_samp + int(np.ceil(-tmin * sf))
+    hi = raw.last_samp - int(np.ceil(tmax * sf))
+    ok = (samples >= lo) & (samples <= hi)
+    tab, samples = tab[ok], samples[ok]
+    _, first = np.unique(samples, return_index=True)  # MNE needs unique samples
+    keep = np.sort(first)
+    tab, samples = tab.iloc[keep], samples[keep]
+    if max_epochs and len(tab) > max_epochs:
+        sel = np.sort(np.random.default_rng(seed).choice(len(tab), max_epochs, replace=False))
+        tab, samples = tab.iloc[sel], samples[sel]
+    if not len(tab):
+        raise ValueError("No selected events fall inside the EEG recording")
+    names = sorted(tab["name"].astype(str).unique())
+    event_id = {n: i + 1 for i, n in enumerate(names)}
+    codes = tab["name"].astype(str).map(event_id).to_numpy()
+    events = np.column_stack([samples, np.zeros_like(samples), codes]).astype(int)
+    picks_idx = mne.pick_types(raw.info, eeg=True, exclude="bads") if picks == "eeg" else picks
+    if picks == "eeg" and not len(picks_idx):
+        picks_idx = eeg_picks(raw)
+    reject = dict(eeg=reject_uv * 1e-6) if reject_uv else None
+    meta = tab.reset_index(drop=True)
+    meta = meta.astype({c: object for c in meta.columns
+                        if isinstance(meta[c].dtype, pd.StringDtype)})
+    return mne.Epochs(raw, events, event_id=event_id, tmin=tmin, tmax=tmax,
+                      baseline=baseline, picks=picks_idx, reject=reject, preload=True,
+                      metadata=meta, verbose="error")
+
+
+# =========================================================================== contrasts
+def contrast_evokeds(epochs_a: mne.Epochs, epochs_b: mne.Epochs,
+                     labels=("A", "B")) -> dict[str, mne.Evoked]:
+    """Averages per group and their difference (A − B) via ``mne.combine_evoked``."""
+    ev_a, ev_b = epochs_a.average(), epochs_b.average()
+    ev_a.comment, ev_b.comment = labels
+    diff = mne.combine_evoked([ev_a, ev_b], weights=[1, -1])
+    diff.comment = f"{labels[0]} − {labels[1]}"
+    return {labels[0]: ev_a, labels[1]: ev_b, diff.comment: diff}
+
+
+def cluster_contrast(epochs_a: mne.Epochs, epochs_b: mne.Epochs, roi=None,
+                     n_permutations: int = 1000, tmin=None, tmax=None, seed: int = 0,
+                     spatial: bool = False):
+    """Cluster-based permutation test between two groups of epochs (MNE).
+
+    ``spatial=False``: ``mne.stats.permutation_cluster_test`` on the ROI average
+    (``roi`` = channel names, default all). ``spatial=True``:
+    ``mne.stats.spatio_temporal_cluster_test`` over all channels using the
+    montage adjacency. Returns a dict with times, F, clusters, p_values.
+    """
+    a = epochs_a.copy().crop(tmin, tmax)
+    b = epochs_b.copy().crop(tmin, tmax)
+    kw = dict(n_permutations=n_permutations, rng=seed, out_type="mask", verbose="error")
+    if spatial:
+        adjacency, ch_names = mne.channels.find_ch_adjacency(a.info, ch_type="eeg")
+        a.pick(ch_names)
+        b.pick(ch_names)
+        X = [a.get_data(copy=False).transpose(0, 2, 1), b.get_data(copy=False).transpose(0, 2, 1)]
+        F, clusters, p, _ = mne.stats.spatio_temporal_cluster_test(X, adjacency=adjacency, **kw)
+        return {"times": a.times, "F": F, "clusters": clusters, "p_values": p,
+                "ch_names": ch_names, "spatial": True}
+    roi = [c for c in (roi or a.ch_names) if c in a.ch_names]
+    X = [a.get_data(picks=roi).mean(1), b.get_data(picks=roi).mean(1)]
+    F, clusters, p, _ = mne.stats.permutation_cluster_test(X, **kw)
+    return {"times": a.times, "F": F, "clusters": clusters, "p_values": p, "roi": roi,
+            "spatial": False}

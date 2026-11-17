@@ -8,6 +8,8 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PySide6 import QtCore, QtWidgets
 
+from .theme import THEME
+
 
 class TopoView(QtWidgets.QWidget):
     def __init__(self, parent=None):
@@ -57,7 +59,13 @@ class TopoView(QtWidgets.QWidget):
         if not self._timer.isActive():
             self._timer.start()
 
+    def restyle(self):
+        self.fig.set_facecolor(THEME.bg)
+        self._draw()
+
     def _draw(self):
+        self.fig.set_facecolor(THEME.bg)
+        self.ax.set_facecolor(THEME.bg)
         self.ax.clear()
         self.ax.set_axis_off()
         if not self.enabled.isChecked() or self.raw is None:
@@ -65,7 +73,7 @@ class TopoView(QtWidgets.QWidget):
             return
         if self._info is None:
             self.ax.text(0.5, 0.5, "No EEG channel positions", ha="center", va="center",
-                         transform=self.ax.transAxes, color="gray")
+                         transform=self.ax.transAxes, color=THEME.muted)
             self.canvas.draw_idle()
             return
         sf = self.raw.info["sfreq"]
@@ -77,5 +85,11 @@ class TopoView(QtWidgets.QWidget):
         lim = max(np.abs(data).max(), 1e-3)
         mne.viz.plot_topomap(data, self._info, axes=self.ax, show=False, contours=4,
                              vlim=(-lim, lim), cmap="RdBu_r", sensors=True)
-        self.ax.set_title(f"{self._t:.3f} s   (±{lim:.1f} µV, avg ref)", fontsize=9)
+        # MNE draws the head outline in black: recolour it for dark themes
+        from matplotlib.colors import to_hex
+        for ln in self.ax.lines:
+            if to_hex(ln.get_color()) == "#000000":
+                ln.set_color(THEME.fg)
+        self.ax.set_title(f"{self._t:.3f} s   (±{lim:.1f} µV, avg ref)", fontsize=9,
+                          color=THEME.fg)
         self.canvas.draw_idle()

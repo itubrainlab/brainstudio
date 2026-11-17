@@ -89,3 +89,57 @@ def test_foreign_clock_samples_recover_offset(tmp_path):
     assert rec.gaze.times[0] == pytest.approx(0.0, abs=0.02)
     assert np.nanmedian(rec.gaze.x) == pytest.approx(960)
     assert np.nanmedian(rec.gaze.y) == pytest.approx(270)
+
+
+def test_event_table_parsing_and_context(demo):
+    import mne
+    import pandas as pd
+
+    from brainstudio import events as EV
+    from brainstudio.model import Recording
+
+    ev = pd.DataFrame({"onset": [1.0, 2.0, 3.0, 9.0, 10.0],
+                       "duration": 0.0,
+                       "description": ["TASK_START|n=1|cond=AI", "PAGE|page=2", "PAGE|page=3",
+                                       "TASK_END|n=1|cond=AI", "PAGE|page=4"]})
+    rec = Recording(events=ev)
+    fix = pd.DataFrame({"onset": [2.5, 9.5], "offset": [2.7, 9.8], "duration": [.2, .3],
+                        "x": [10.0, 10.0], "y": [10.0, 10.0]})
+    from brainstudio.model import GazeEvents
+    ge = GazeEvents.empty()
+    ge.fixations = fix
+    tab = EV.build_event_table(rec, ge)
+    assert pd.api.types.is_numeric_dtype(tab["page"])
+    sel = EV.filter_events(tab, query='phase == "TASK" and cond == "AI"', names={"fixation"})
+    assert list(sel.onset) == [2.5]  # the 9.5 s fixation is after TASK_END
+    assert len(EV.filter_events(tab, query="page >= 3", names={"PAGE"})) == 2
+    with pytest.raises(ValueError):
+        EV.filter_events(tab, query="cond ==")
+
+
+def test_montage_and_metadata_epochs_contrast(demo):
+    import mne
+
+    from brainstudio import events as EV
+
+    rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
+    raw = rec.raw.copy()
+    raw.set_montage(None)
+    names = list(raw.ch_names)
+    raw.rename_channels({n: f"ch{i}" for i, n in enumerate(names)})
+    rep = E.apply_montage(raw, E.montage_from_source("standard_1005"), names)
+    assert rep["n_renamed"] == len(names) and rep["n_positioned"] == 30
+    assert raw.get_channel_types(["HEOG"]) == ["eog"]
+
+    ge = G.detect_events(rec.gaze)
+    tab = EV.build_event_table(rec, ge)
+    ep = E.epochs_from_table(E.preprocess(raw, E.FilterParams(1, 30)),
+                             EV.filter_events(tab, names={"fixation", "stimulus"}), -0.2, 0.5)
+    assert set(ep.event_id) == {"fixation", "stimulus"} and ep.metadata is not None
+    a, b = ep["fixation"], ep["stimulus"]
+    evs = E.contrast_evokeds(a, b, ("fix", "stim"))
+    assert "fix − stim" in evs
+    st = E.cluster_contrast(a, b, roi=["Pz"], n_permutations=200)
+    assert len(st["clusters"]) == len(st["p_values"])
+    # the stimulus P300 at Pz should differ from fixations (simulated effect)
+    assert min(st["p_values"]) < 0.05

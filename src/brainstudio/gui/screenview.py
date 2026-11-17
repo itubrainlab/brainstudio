@@ -7,16 +7,24 @@ import pyqtgraph as pg
 from PySide6 import QtCore
 
 from .. import gaze as G
+from .theme import _SERIES_DARK, THEME
 
-AOI_COLORS = [(228, 26, 28), (55, 126, 184), (77, 175, 74), (152, 78, 163),
-              (255, 127, 0), (166, 86, 40), (247, 129, 191)]
+# The display area is always drawn dark (like a monitor), so on-screen items
+# use the dark-scheme series colours in both light and dark app themes.
+ON_SCREEN = _SERIES_DARK
+
+
+def _c(i: int, alpha: int = 255):
+    q = pg.mkColor(ON_SCREEN[i % len(ON_SCREEN)])
+    q.setAlpha(alpha)
+    return q
 
 
 class ScreenView(pg.PlotWidget):
     aoisChanged = QtCore.Signal()
 
     def __init__(self, parent=None):
-        super().__init__(parent, background=(25, 25, 30))
+        super().__init__(parent, background=THEME.bg)
         self.plotItem.invertY(True)
         self.plotItem.setAspectLocked(True)
         self.plotItem.showGrid(x=False, y=False)
@@ -25,7 +33,7 @@ class ScreenView(pg.PlotWidget):
         self.plotItem.hideButtons()
         self.screen = (1920, 1080)
         self.frame = pg.QtWidgets.QGraphicsRectItem(0, 0, *self.screen)
-        self.frame.setPen(pg.mkPen((200, 200, 200), width=2))
+        self.frame.setZValue(-30)
         self.addItem(self.frame)
         self.image = pg.ImageItem()
         self.image.setZValue(-20)
@@ -34,13 +42,12 @@ class ScreenView(pg.PlotWidget):
         self.heat.setZValue(-10)
         self.heat.setOpacity(0.7)
         self.addItem(self.heat)
-        self.scan_line = self.plot(pen=pg.mkPen((255, 255, 255, 140), width=1.5))
-        self.fix_scatter = pg.ScatterPlotItem(pen=pg.mkPen("w", width=1),
-                                              brush=pg.mkBrush(255, 200, 0, 110))
+        self.scan_line = self.plot(pen=pg.mkPen((235, 235, 240, 130), width=1.5))
+        self.fix_scatter = pg.ScatterPlotItem(pen=pg.mkPen((235, 235, 240), width=1))
         self.addItem(self.fix_scatter)
-        self.trail = self.plot(pen=pg.mkPen((0, 220, 255, 160), width=2))
-        self.point = pg.ScatterPlotItem(size=18, pen=pg.mkPen((255, 255, 255), width=2),
-                                        brush=pg.mkBrush(255, 40, 40, 200))
+        self.trail = self.plot(pen=pg.mkPen(_c(5, 170), width=2))
+        self.point = pg.ScatterPlotItem(size=18, pen=pg.mkPen((245, 245, 245), width=2),
+                                        brush=pg.mkBrush(_c(3, 220)))
         self.point.setZValue(50)
         self.addItem(self.point)
         self.fix_labels: list[pg.TextItem] = []
@@ -49,6 +56,13 @@ class ScreenView(pg.PlotWidget):
         self.show_heatmap = False
         self.trail_len = 0.5
         self.set_screen(self.screen)
+        self.restyle()
+
+    def restyle(self):
+        self._theme_bg = "bg"
+        self.setBackground(THEME.bg)
+        self.frame.setBrush(pg.mkBrush(THEME.screen_bg))
+        self.frame.setPen(pg.mkPen(THEME.muted, width=2))
 
     # ----------------------------------------------------------------- setup
     def set_screen(self, size):
@@ -101,7 +115,7 @@ class ScreenView(pg.PlotWidget):
                 f = f.iloc[:400]
             past = f["onset"].to_numpy() <= t
             sizes = np.clip(np.sqrt(f["duration"].to_numpy() * 1000) * 1.6, 6, 60)
-            brushes = [pg.mkBrush(255, 200, 0, 140) if p else pg.mkBrush(160, 160, 160, 70)
+            brushes = [pg.mkBrush(_c(1, 150)) if p else pg.mkBrush(160, 160, 170, 70)
                        for p in past]
             self.fix_scatter.setData(f["x"].to_numpy(), f["y"].to_numpy(), size=sizes,
                                      brush=brushes)
@@ -121,7 +135,7 @@ class ScreenView(pg.PlotWidget):
         name = name or f"AOI{len(self.aois) + 1}"
         while name in self.aois:
             name += "'"
-        color = AOI_COLORS[len(self.aois) % len(AOI_COLORS)]
+        color = _c(len(self.aois) + 2)
         size = size or (self.screen[0] / 5, self.screen[1] / 5)
         pos = pos or (self.screen[0] / 2 - size[0] / 2, self.screen[1] / 2 - size[1] / 2)
         pen = pg.mkPen(color, width=2)

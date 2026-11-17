@@ -66,20 +66,70 @@ as missing.
   * Screen view: live gaze point and trail, numbered scanpath, fixation heatmap,
     optional stimulus image, and draggable **AOIs**.
   * **Live topomap** of the EEG around the cursor (needs channel positions).
-* **Analysis tab**
-  * *Gaze statistics*: fixation, saccade and blink summary; fixation-duration and
-    amplitude histograms; main sequence; per-AOI fixation count, dwell time and time to
-    first fixation, computed with `pygaze.plugins.aoi.AOI` (CSV export).
-  * *Spectrum*: PSD per channel (MNE `compute_psd`) and band topomaps.
-  * *Fixation / event-related potentials*:
-    * Epoch on fixation onsets (FRPs) or on any marker. Structured markers like
-      `READING_PAGE|page=2|…` can also be grouped by name.
-    * Baseline and amplitude rejection.
-    * Butterfly plot with GFP; MNE joint plot and epochs image.
+* **Analysis tab** (all EEG analysis runs in MNE)
+  * *Gaze statistics*:
+    * fixation, saccade and blink summary
+    * fixation-duration and amplitude histograms, main sequence
+    * per-AOI fixation count, dwell time and time to first fixation, computed with
+      `pygaze.plugins.aoi.AOI` (CSV export)
+  * *Spectrum*: PSD per channel (`Raw.compute_psd`) and band topomaps.
+  * *Event-related potentials*: an `mne.Epochs` locked to any selection of events
+    (see below), with the event table attached as **epochs metadata**. Butterfly + GFP
+    plot, MNE joint plot, epochs image, and saving `-epo.fif` with metadata.
+  * *Contrast*: two event groups A and B, each chosen with its own checklist and
+    filters.
+    * Evokeds use `mne.combine_evoked` for the A − B difference wave and are shown with
+      ±SEM on an ROI.
+    * Statistics are a cluster-based permutation test with `mne.stats`: either
+      `permutation_cluster_test` on the ROI mean or `spatio_temporal_cluster_test` with
+      the montage adjacency. Significant clusters are shaded.
+    * MNE `plot_compare_evokeds` and difference joint/topomaps.
+    * Export: evokeds and epochs as `.fif`, clusters as `.csv`, plus a text file
+      describing the selection.
 * **Controls dock**
   * MNE filtering: high-pass, low-pass, notch, average reference.
   * Gaze-detection parameters, gaze offset, screen size.
   * "Open in MNE browser" adds blinks and saccades as annotations.
+
+### Selecting events
+All markers and detected gaze events go into one table
+(`brainstudio.events.build_event_table`):
+
+* `name`, `kind` (marker, fixation, saccade or blink), `onset`, `duration`.
+* Structured markers like `READING_PAGE|page=2|task=JF|cond=AI` are split into
+  `name=READING_PAGE` plus columns `page`, `task`, `cond` (numeric where possible).
+* Gaze events have `x`, `y`, `amplitude`, `peak_velocity` and `aoi`, the AOI drawn in
+  the screen view.
+* Every event inherits a `phase`, the innermost `X_START`…`X_END` span it falls in,
+  together with that span's attributes. That makes queries like "fixations while
+  reading in the AI condition" possible.
+
+Each selector combines:
+* a **checklist** of event types, with live counts after filtering;
+* a **text filter**: a regex on the raw description;
+* a **metadata filter**: a pandas `query`, the same syntax as MNE's
+  `epochs['…']`. Examples: `phase == "READING" and cond == "AI"`,
+  `duration > 0.2 and aoi == "TOP"`, `page in [1, 2]`.
+
+The *Columns* menu lists the available columns with example values.
+
+### Montage
+**File ▸ Channel names & montage… (Ctrl+M)**:
+* Choose a built-in MNE montage or a montage file (`.elc .sfp .loc .bvef .csd .txt`,
+  BIDS `*_electrodes.tsv`, …).
+* Optionally rename channels in recording order. Edit the list, load names from a text
+  file, or fill them from the montage's file order. Channels named *EOG/ECG/EMG* get
+  those channel types.
+* *Check* reports how many EEG channels got positions. *Plot sensors* shows the layout
+  with MNE.
+
+Topomaps, joint plots and spatio-temporal tests need positions.
+
+### Colours
+Every chart follows the app's light or dark palette and updates when the system
+setting changes. That covers pyqtgraph plots, the topomap, and MNE's own matplotlib
+figures (through rcParams). A single colour-blind-safe series palette is shared, so
+group A and B have the same colours in the app and in MNE plots.
 
 Shortcuts: ←/→ page, Space play, +/- EEG scale, PgUp/PgDn scroll channels, click a time
 plot to move the cursor.
@@ -94,7 +144,13 @@ rec = load_xdf("recording.xdf")              # or load_bids_run(root, scan_bids(
 print(rec.summary(), rec.description)
 ev = G.detect_events(rec.gaze)               # fixations / saccades / blinks DataFrames
 raw = E.preprocess(rec.raw, E.FilterParams(1, 40))
-frp = E.fixation_related_epochs(raw, ev.fixations, min_duration=0.1).average()
+from brainstudio import events as EV
+table = EV.build_event_table(rec, ev)          # markers + gaze events, parsed attributes
+sel = EV.filter_events(table, query='phase == "READING"', names={"fixation"})
+epochs = E.epochs_from_table(raw, sel, -0.2, 0.6, reject_uv=150)   # metadata attached
+a, b = epochs['cond == "AI"'], epochs['cond == "NoAI"']           # MNE metadata queries
+evokeds = E.contrast_evokeds(a, b, ("AI", "NoAI"))                 # incl. "AI − NoAI"
+stats = E.cluster_contrast(a, b, roi=["O1", "Oz", "O2"], n_permutations=1000)
 aoi = G.aoi_statistics(ev.fixations, {"left": G.make_aoi("rectangle", (0, 0), (960, 1080))})
 ```
 

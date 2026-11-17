@@ -5,26 +5,39 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
-from PySide6 import QtCore, QtGui
+from PySide6 import QtCore
 
 from ..model import GazeEvents
+from .theme import THEME
 
-EVENT_PEN = pg.mkPen((220, 60, 60, 180), width=1, style=QtCore.Qt.DashLine)
-CURSOR_PEN = pg.mkPen((255, 170, 0), width=2)
-OVERLAY_BRUSH = {
-    "fixations": pg.mkBrush(70, 160, 255, 45),
-    "saccades": pg.mkBrush(255, 140, 0, 70),
-    "blinks": pg.mkBrush(150, 150, 150, 110),
-}
-TYPE_COLORS = {"eeg": (30, 30, 30), "eog": (40, 90, 200), "ecg": (200, 40, 40),
-               "emg": (40, 150, 60), "misc": (120, 70, 160), "stim": (160, 110, 0)}
+
+def event_pen():
+    return pg.mkPen(THEME.rgba("event", 190), width=1, style=QtCore.Qt.DashLine)
+
+
+def cursor_pen():
+    return pg.mkPen(THEME.accent, width=2)
+
+
+def overlay_brush(kind: str):
+    a = 55 if THEME.dark else 45
+    return {"fixations": pg.mkBrush(THEME.s(0, a)),
+            "saccades": pg.mkBrush(THEME.s(1, a + 25)),
+            "blinks": pg.mkBrush(THEME.rgba("muted", a + 45))}[kind]
+
+
+def type_color(ch_type: str, bad: bool = False):
+    if bad:
+        return THEME.rgba("muted", 140)
+    idx = {"eog": 0, "ecg": 3, "emg": 2, "misc": 4, "stim": 6}
+    return THEME.s(idx[ch_type]) if ch_type in idx else THEME.rgba("trace")
 
 
 class TimeCursorMixin:
     """Adds a draggable vertical cursor emitting ``cursorMoved(float)``."""
 
     def _init_cursor(self, plot: pg.PlotItem):
-        self.cursor = pg.InfiniteLine(0, angle=90, movable=True, pen=CURSOR_PEN)
+        self.cursor = pg.InfiniteLine(0, angle=90, movable=True, pen=cursor_pen())
         self.cursor.setZValue(100)
         plot.addItem(self.cursor, ignoreBounds=True)
         self.cursor.sigPositionChanged.connect(
@@ -45,9 +58,9 @@ class EventLinesMixin:
             return
         for on, desc in events[["onset", "description"]].itertuples(index=False):
             line = pg.InfiniteLine(
-                on, angle=90, pen=EVENT_PEN,
+                on, angle=90, pen=event_pen(),
                 label=str(desc).split("|")[0] if labels else None,
-                labelOpts={"position": 0.985, "color": (200, 40, 40),
+                labelOpts={"position": 0.985, "color": THEME.event,
                            "anchors": [(-0.05, 0.5), (-0.05, 0.5)]})
             plot.addItem(line, ignoreBounds=True)
             self._event_items.append(line)
@@ -79,7 +92,7 @@ class GazeOverlayMixin:
             if not len(sel) or len(sel) > 3000:
                 continue
             item = pg.BarGraphItem(x0=sel["onset"].to_numpy(), width=sel["duration"].to_numpy(),
-                                   y0=y0, height=y1 - y0, brush=OVERLAY_BRUSH[kind],
+                                   y0=y0, height=y1 - y0, brush=overlay_brush(kind),
                                    pen=pg.mkPen(None))
             item.setZValue(-10)
             self._overlay_plot.addItem(item, ignoreBounds=True)
@@ -94,7 +107,7 @@ class EEGPlot(pg.PlotWidget, TimeCursorMixin, EventLinesMixin, GazeOverlayMixin)
     windowChanged = QtCore.Signal(float, float)
 
     def __init__(self, parent=None):
-        super().__init__(parent, background="w")
+        super().__init__(parent, background=THEME.bg)
         self.plotItem.setLabel("bottom", "Time", "s")
         self.plotItem.showGrid(x=True, y=False, alpha=0.2)
         self.plotItem.setMouseEnabled(x=True, y=True)
@@ -121,8 +134,7 @@ class EEGPlot(pg.PlotWidget, TimeCursorMixin, EventLinesMixin, GazeOverlayMixin)
             self.removeItem(c)
         self.curves = []
         for i, (n, t) in enumerate(zip(self.names, self.types)):
-            color = (180, 180, 180) if n in self.bads else TYPE_COLORS.get(t, (30, 30, 30))
-            c = pg.PlotDataItem(pen=pg.mkPen(color, width=1))
+            c = pg.PlotDataItem(pen=pg.mkPen(type_color(t, n in self.bads), width=1))
             c.setDownsampling(auto=True, method="peak")
             c.setClipToView(True)
             self.addItem(c)
@@ -134,6 +146,16 @@ class EEGPlot(pg.PlotWidget, TimeCursorMixin, EventLinesMixin, GazeOverlayMixin)
         vb.setLimits(xMin=times[0] - 1, xMax=times[-1] + 1, yMin=-n - 1, yMax=2,
                      minXRange=0.05)
         self.set_visible_channels(self.n_visible)
+        self._redraw()
+
+    def restyle(self):
+        self.cursor.setPen(cursor_pen())
+        for c, n, t in zip(self.curves, self.names, self.types):
+            c.setPen(pg.mkPen(type_color(t, n in self.bads), width=1))
+        for line in getattr(self, "_event_items", []):
+            line.setPen(event_pen())
+            if line.label is not None:
+                line.label.setColor(THEME.event)
         self._redraw()
 
     def update_values(self, data: np.ndarray):
@@ -199,7 +221,7 @@ class GazePlot(pg.GraphicsLayoutWidget, TimeCursorMixin, EventLinesMixin, GazeOv
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setBackground("w")
+        self.setBackground(THEME.bg)
         self.pos_plot = self.addPlot(row=0, col=0)
         self.pupil_plot = self.addPlot(row=1, col=0)
         self.ci.layout.setRowStretchFactor(0, 3)
@@ -212,20 +234,31 @@ class GazePlot(pg.GraphicsLayoutWidget, TimeCursorMixin, EventLinesMixin, GazeOv
         self.pupil_plot.setLabel("left", "Pupil")
         self.pupil_plot.setLabel("bottom", "Time", "s")
         self.pupil_plot.setXLink(self.pos_plot)
-        self.pos_plot.addLegend(offset=(-10, 5), brush=(255, 255, 255, 200))
-        self.cx = self.pos_plot.plot(pen=pg.mkPen((31, 119, 180), width=1.3), name="x")
-        self.cy = self.pos_plot.plot(pen=pg.mkPen((255, 127, 14), width=1.3), name="y")
-        self.cp = self.pupil_plot.plot(pen=pg.mkPen((44, 160, 44), width=1.3))
+        self.pos_plot.addLegend(offset=(-10, 5))
+        self.cx = self.pos_plot.plot(name="x")
+        self.cy = self.pos_plot.plot(name="y")
+        self.cp = self.pupil_plot.plot()
         self.cv = None
         for c in (self.cx, self.cy, self.cp):
             c.setDownsampling(auto=True, method="peak")
             c.setClipToView(True)
         self._init_cursor(self.pos_plot)
-        self.cursor2 = pg.InfiniteLine(0, angle=90, movable=False, pen=CURSOR_PEN)
+        self.cursor2 = pg.InfiniteLine(0, angle=90, movable=False, pen=cursor_pen())
         self.pupil_plot.addItem(self.cursor2, ignoreBounds=True)
         self.cursor.sigPositionChanged.connect(lambda l: self.cursor2.setValue(l.value()))
         self._init_overlays(self.pos_plot)
         self._ylim = (0, 1920)
+        self.restyle()
+
+    def restyle(self):
+        self.cx.setPen(pg.mkPen(THEME.s(0), width=1.3))
+        self.cy.setPen(pg.mkPen(THEME.s(1), width=1.3))
+        self.cp.setPen(pg.mkPen(THEME.s(2), width=1.3))
+        self.cursor.setPen(cursor_pen())
+        self.cursor2.setPen(cursor_pen())
+        for line in getattr(self, "_event_items", []):
+            line.setPen(event_pen())
+        self.refresh_overlays()
 
     def set_cursor(self, t: float):
         super().set_cursor(t)
@@ -266,20 +299,28 @@ class OverviewBar(pg.PlotWidget):
     regionChanged = QtCore.Signal(float, float)
 
     def __init__(self, parent=None):
-        super().__init__(parent, background="w")
+        super().__init__(parent, background=THEME.bg)
         self.setFixedHeight(70)
         self.plotItem.hideAxis("left")
         self.plotItem.setMouseEnabled(x=False, y=False)
         self.plotItem.hideButtons()
         self.plotItem.setMenuEnabled(False)
-        self.region = pg.LinearRegionItem(brush=pg.mkBrush(255, 170, 0, 60))
+        self.region = pg.LinearRegionItem()
         self.region.setZValue(10)
         self.addItem(self.region)
         self.region.sigRegionChanged.connect(self._emit)
-        self.validity = self.plot(pen=None, fillLevel=0, brush=(120, 170, 220, 120),
-                                  stepMode="center")
+        self.validity = self.plot(pen=None, fillLevel=0, stepMode="center")
         self.ticks: list = []
         self._block = False
+        self.restyle()
+
+    def restyle(self):
+        self.region.setBrush(pg.mkBrush(THEME.rgba("accent", 60)))
+        for ln in self.region.lines:
+            ln.setPen(pg.mkPen(THEME.accent, width=1.5))
+        self.validity.setBrush(pg.mkBrush(THEME.s(0, 110)))
+        for t in self.ticks:
+            t.setBrush(pg.mkBrush(THEME.event))
 
     def set_recording(self, duration: float, events: pd.DataFrame, gaze=None):
         self.plotItem.setXRange(0, max(duration, 1e-3), padding=0.01)
@@ -290,7 +331,7 @@ class OverviewBar(pg.PlotWidget):
         self.ticks = []
         if events is not None and len(events):
             tick = pg.ScatterPlotItem(events["onset"].to_numpy(), np.full(len(events), 0.9),
-                                      symbol="t", size=7, brush=(200, 40, 40), pen=None)
+                                      symbol="t", size=7, brush=THEME.event, pen=None)
             self.addItem(tick)
             self.ticks.append(tick)
         if gaze is not None and gaze.n_samples:
@@ -314,6 +355,3 @@ class OverviewBar(pg.PlotWidget):
             t0, t1 = self.region.getRegion()
             self.regionChanged.emit(t0, t1)
 
-
-def qcolor(rgb) -> QtGui.QColor:
-    return QtGui.QColor(*rgb)
