@@ -141,6 +141,8 @@ def test_montage_and_metadata_epochs_contrast(demo):
     assert "fix − stim" in evs
     st = E.cluster_contrast(a, b, roi=["Pz"], n_permutations=200)
     assert len(st["clusters"]) == len(st["p_values"])
+    for m in st["clusters"]:  # always boolean masks over time
+        assert m.dtype == bool and m.shape == st["times"].shape
     # the stimulus P300 at Pz should differ from fixations (simulated effect)
     assert min(st["p_values"]) < 0.05
 
@@ -159,3 +161,25 @@ def test_channel_reference(demo):
     pair = E.preprocess(rec.raw, E.FilterParams(None, None, None, "O1, O2"))
     o = pair.get_data(picks=["O1", "O2"])
     assert np.abs(o.sum(0)).max() < 1e-12  # linked reference: O1 = -O2
+
+
+def test_spatial_contrast_with_channel_reference(demo):
+    """Single-channel reference → flat channel must not poison the F statistic."""
+    import warnings
+
+    from brainstudio import events as EV
+
+    rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
+    raw = E.preprocess(rec.raw, E.FilterParams(1, 30, None, "Cz"))
+    tab = EV.build_event_table(rec, G.detect_events(rec.gaze))
+    ep = E.epochs_from_table(raw, EV.filter_events(tab, names={"fixation", "stimulus"}),
+                             -0.1, 0.5)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)  # no 0/0 in the F test
+        st = E.cluster_contrast(ep["fixation"], ep["stimulus"], n_permutations=100,
+                                spatial=True)
+    assert "Cz" in st["excluded"] and "Cz" not in st["ch_names"]
+    for m in st["clusters"]:
+        assert m.dtype == bool and m.shape == (len(st["times"]), len(st["ch_names"]))
+    with pytest.raises(ValueError, match="flat"):
+        E.cluster_contrast(ep["fixation"], ep["stimulus"], roi=["Cz"], n_permutations=10)

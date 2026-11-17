@@ -499,6 +499,9 @@ class AnalysisPanel(QtWidgets.QTabWidget):
                         tmin=0.0 if self.con_twin.isChecked() else None, spatial=spatial)
             except Exception as e:
                 notes.append(f"test failed: {e}")
+            if stats and stats.get("excluded"):
+                notes.append("flat channels left out of the test: "
+                             + ", ".join(stats["excluded"]))
         self.contrast = {"a": a, "b": b, "labels": (la, lb), "evokeds": evokeds,
                          "roi": roi, "stats": stats}
         sig = [p for p in (stats or {}).get("p_values", []) if p < 0.05]

@@ -279,6 +279,25 @@ def contrast_evokeds(epochs_a: mne.Epochs, epochs_b: mne.Epochs,
     return {labels[0]: ev_a, labels[1]: ev_b, diff.comment: diff}
 
 
+def _cluster_masks(clusters, shape) -> list[np.ndarray]:
+    """MNE returns clusters as boolean masks *or* index tuples (e.g. ``(slice,)``
+    for 1-D data) depending on version and data shape: always return masks."""
+    out = []
+    for c in clusters:
+        if isinstance(c, np.ndarray) and c.dtype == bool and c.shape == shape:
+            out.append(c)
+        else:
+            m = np.zeros(shape, bool)
+            m[c] = True
+            out.append(m)
+    return out
+
+
+def _flat(data: np.ndarray, axis) -> np.ndarray:
+    """True for signals with (numerically) zero variance, e.g. the reference channel."""
+    return np.nanstd(data, axis=axis) < 1e-15
+
+
 def cluster_contrast(epochs_a: mne.Epochs, epochs_b: mne.Epochs, roi=None,
                      n_permutations: int = 1000, tmin=None, tmax=None, seed: int = 0,
                      spatial: bool = False):
@@ -287,21 +306,35 @@ def cluster_contrast(epochs_a: mne.Epochs, epochs_b: mne.Epochs, roi=None,
     ``spatial=False``: ``mne.stats.permutation_cluster_test`` on the ROI average
     (``roi`` = channel names, default all). ``spatial=True``:
     ``mne.stats.spatio_temporal_cluster_test`` over all channels using the
-    montage adjacency. Returns a dict with times, F, clusters, p_values.
+    montage adjacency. Flat channels (e.g. a single-channel reference) are
+    excluded. Returns a dict with times, F, clusters (boolean masks of shape
+    (n_times,) or (n_times, n_channels)), p_values and the channels used.
     """
     a = epochs_a.copy().crop(tmin, tmax)
     b = epochs_b.copy().crop(tmin, tmax)
-    kw = dict(n_permutations=n_permutations, rng=seed, out_type="mask", verbose="error")
+    kw = dict(n_permutations=n_permutations, rng=seed, verbose="error")
     if spatial:
         adjacency, ch_names = mne.channels.find_ch_adjacency(a.info, ch_type="eeg")
         a.pick(ch_names)
         b.pick(ch_names)
-        X = [a.get_data(copy=False).transpose(0, 2, 1), b.get_data(copy=False).transpose(0, 2, 1)]
-        F, clusters, p, _ = mne.stats.spatio_temporal_cluster_test(X, adjacency=adjacency, **kw)
-        return {"times": a.times, "F": F, "clusters": clusters, "p_values": p,
-                "ch_names": ch_names, "spatial": True}
+        Xa = a.get_data(copy=False).transpose(0, 2, 1)  # (epochs, times, channels)
+        Xb = b.get_data(copy=False).transpose(0, 2, 1)
+        flat = _flat(np.concatenate([Xa, Xb]), axis=(0, 1))
+        keep = np.flatnonzero(~flat)
+        if len(keep) < 2:
+            raise ValueError("Not enough non-flat channels for a spatio-temporal test")
+        Xa, Xb = Xa[:, :, keep], Xb[:, :, keep]
+        adjacency = adjacency.tocsr()[keep][:, keep]
+        ch_names = [ch_names[i] for i in keep]
+        F, clusters, p, _ = mne.stats.spatio_temporal_cluster_test(
+            [Xa, Xb], adjacency=adjacency, **kw)
+        return {"times": a.times, "F": F, "p_values": np.asarray(p),
+                "clusters": _cluster_masks(clusters, F.shape), "ch_names": ch_names,
+                "excluded": [n for n, f in zip(a.ch_names, flat) if f], "spatial": True}
     roi = [c for c in (roi or a.ch_names) if c in a.ch_names]
-    X = [a.get_data(picks=roi).mean(1), b.get_data(picks=roi).mean(1)]
-    F, clusters, p, _ = mne.stats.permutation_cluster_test(X, **kw)
-    return {"times": a.times, "F": F, "clusters": clusters, "p_values": p, "roi": roi,
-            "spatial": False}
+    Xa, Xb = a.get_data(picks=roi).mean(1), b.get_data(picks=roi).mean(1)
+    if _flat(np.concatenate([Xa, Xb]), axis=None):
+        raise ValueError("The ROI signal is flat (is the ROI only the reference channel?)")
+    F, clusters, p, _ = mne.stats.permutation_cluster_test([Xa, Xb], **kw)
+    return {"times": a.times, "F": F, "p_values": np.asarray(p),
+            "clusters": _cluster_masks(clusters, F.shape), "roi": roi, "spatial": False}
