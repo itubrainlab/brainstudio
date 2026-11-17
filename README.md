@@ -121,6 +121,13 @@ The *Columns* menu lists the available columns with example values.
 **File ▸ Channel names & montage… (Ctrl+M)**:
 * Choose a built-in MNE montage or a montage file (`.elc .sfp .loc .bvef .csd .txt`,
   BIDS `*_electrodes.tsv`, …).
+* **Channel layouts** are listed first. A layout gives the electrode for each amplifier
+  input, so picking one also fills in the channel names. `gtec_64` is the g.tec 64-channel
+  extended 10-20 "standard" setup: 1 Fp1 … 60 O2, 61 F9, 62 F10, 63 A1, 64 A2, ground
+  at AFz. It is preselected for recordings with 64 unnamed channels. Positions come from
+  MNE's 10-05 template. To add your own layout, put a text file with one
+  `<input> <name>` per line in `~/.brainstudio/montages/` (see
+  `src/brainstudio/montages/gtec_64.txt`).
 * Optionally rename channels in recording order. Edit the list, load names from a text
   file, or fill them from the montage's file order. Channels named *EOG/ECG/EMG* get
   those channel types.

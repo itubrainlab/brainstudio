@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import mne
 import numpy as np
@@ -157,10 +158,63 @@ def set_standard_montage(raw: mne.io.BaseRaw) -> None:
 
 
 # =========================================================================== montage
-def montage_from_source(source: str) -> mne.channels.DigMontage:
-    """Built-in montage name (see ``mne.channels.get_builtin_montages``) or file path."""
-    from pathlib import Path
+#: Folders with channel-layout montages: text files listing electrode names in amplifier
+#: input order (``<number> <name>`` or just ``<name>`` per line, ``#`` comments). Positions
+#: come from an MNE template, set with a ``# positions: <template>`` line (default
+#: standard_1005). Files in the user folder show up as built-ins too.
+MONTAGE_DIRS = (Path(__file__).parent / "montages", Path.home() / ".brainstudio" / "montages")
 
+
+def layout_montages() -> dict[str, Path]:
+    """Channel-layout montages shipped with BrainStudio or in ~/.brainstudio/montages."""
+    out: dict[str, Path] = {}
+    for d in MONTAGE_DIRS:
+        if d.is_dir():
+            out.update({f.stem: f for f in sorted(d.glob("*.txt"))})
+    return out
+
+
+def builtin_montages() -> list[str]:
+    """Layout montages first, then MNE's built-in montages."""
+    extra = layout_montages()
+    return list(extra) + [m for m in mne.channels.get_builtin_montages() if m not in extra]
+
+
+def read_channel_layout(path) -> tuple[list[str], str]:
+    """Electrode names in input order and the MNE template that gives their positions."""
+    names, template = [], "standard_1005"
+    for line in Path(path).read_text().splitlines():
+        s = line.strip()
+        if s.startswith("#"):
+            key, _, val = s.lstrip("# ").partition(":")
+            if key.strip().lower() == "positions" and val.strip():
+                template = val.strip()
+            continue
+        if s:
+            names.append(s.split()[-1])
+    return names, template
+
+
+def montage_from_layout(names: list[str], template: str = "standard_1005"
+                        ) -> mne.channels.DigMontage:
+    """DigMontage whose channel order is ``names``, positioned from ``template``."""
+    if template == "standard_1005" and "colin27_1005" in mne.channels.get_builtin_montages():
+        template = "colin27_1005"  # MNE's new name for the 10-05 template
+    pos = mne.channels.make_standard_montage(template).get_positions()
+    lookup = {k.upper(): v for k, v in pos["ch_pos"].items()}
+    missing = [n for n in names if n.upper() not in lookup]
+    if missing:
+        raise ValueError(f"No position in {template} for: {', '.join(missing)}")
+    return mne.channels.make_dig_montage(
+        ch_pos={n: lookup[n.upper()] for n in names}, nasion=pos["nasion"],
+        lpa=pos["lpa"], rpa=pos["rpa"], coord_frame=pos["coord_frame"])
+
+
+def montage_from_source(source: str) -> mne.channels.DigMontage:
+    """Montage name (layout montage or ``mne.channels.get_builtin_montages``) or file."""
+    layouts = layout_montages()
+    if source in layouts:
+        return montage_from_layout(*read_channel_layout(layouts[source]))
     p = Path(source)
     if not p.exists():  # a montage name (incl. deprecated aliases MNE still accepts)
         try:

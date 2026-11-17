@@ -6,7 +6,7 @@ from pathlib import Path
 
 import mne
 import numpy as np
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 from .. import eeg as E
 
@@ -30,9 +30,16 @@ class MontageDialog(QtWidgets.QDialog):
         self.rb_none = QtWidgets.QRadioButton("None (rename channels only)")
         self.rb_builtin.setChecked(True)
         self.builtin = QtWidgets.QComboBox()
-        names = mne.channels.get_builtin_montages()
+        names = E.builtin_montages()
+        self.layouts = E.layout_montages()
         self.builtin.addItems(names)
-        for pref in ("colin27_1005", "standard_1005", "standard_1020"):
+        for i, n in enumerate(self.layouts):
+            self.builtin.setItemData(i, "Channel layout: also defines the input order "
+                                        "(names are filled in when you pick it)",
+                                     QtCore.Qt.ToolTipRole)
+        if self.layouts:
+            self.builtin.insertSeparator(len(self.layouts))
+        for pref in self._preferred(raw) + ["colin27_1005", "standard_1005", "standard_1020"]:
             if pref in names:
                 self.builtin.setCurrentText(pref)
                 break
@@ -70,6 +77,9 @@ class MontageDialog(QtWidgets.QDialog):
         self.preview = QtWidgets.QLabel("")
         self.preview.setWordWrap(True)
         lay.addWidget(self.preview)
+        self.builtin.currentTextChanged.connect(self._builtin_changed)
+        if self.builtin.currentText() in self.layouts:
+            self._builtin_changed(self.builtin.currentText())
         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok |
                                         QtWidgets.QDialogButtonBox.Cancel)
         check = bb.addButton("Check", QtWidgets.QDialogButtonBox.ActionRole)
@@ -81,6 +91,26 @@ class MontageDialog(QtWidgets.QDialog):
         lay.addWidget(bb)
 
     # ------------------------------------------------------------------ helpers
+    def _preferred(self, raw) -> list[str]:
+        """A layout with this many channels, if the recording's names have no positions."""
+        ref = mne.channels.make_standard_montage(
+            "colin27_1005" if "colin27_1005" in mne.channels.get_builtin_montages()
+            else "standard_1005")
+        known = {n.upper() for n in ref.ch_names}
+        if sum(n.upper() in known for n in raw.ch_names) >= 4:
+            return []
+        out = []
+        for name, path in self.layouts.items():
+            if len(E.read_channel_layout(path)[0]) == len(raw.ch_names):
+                out.append(name)
+        return out
+
+    def _builtin_changed(self, name: str):
+        if name not in self.layouts:
+            return
+        self.rb_builtin.setChecked(True)
+        self._fill_from_montage()
+
     def _browse(self):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Montage file", "", MONTAGE_FILES)
         if fn:
@@ -117,8 +147,16 @@ class MontageDialog(QtWidgets.QDialog):
         # keep existing names beyond the montage length
         filled = names[:n] + self.raw.ch_names[len(names):]
         self.names.setPlainText("\n".join(filled))
-        self.preview.setText(f"Filled {min(n, len(names))} names from the montage's file order."
-                             " Check that it matches your cap's channel order.")
+        src = self.builtin.currentText() if self.rb_builtin.isChecked() else ""
+        if src in self.layouts:
+            msg = (f"Filled {min(n, len(names))} names from the {src} layout "
+                   f"(amplifier input order, {len(names)} channels).")
+            if len(names) != n:
+                msg += f" The recording has {n} channels: check the extra/missing ones."
+        else:
+            msg = (f"Filled {min(n, len(names))} names from the montage's file order. "
+                   "Check that it matches your cap's channel order.")
+        self.preview.setText(msg)
 
     def new_names(self) -> list[str]:
         names = [n.strip() for n in self.names.toPlainText().splitlines()]

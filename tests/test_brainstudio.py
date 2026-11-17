@@ -183,3 +183,17 @@ def test_spatial_contrast_with_channel_reference(demo):
         assert m.dtype == bool and m.shape == (len(st["times"]), len(st["ch_names"]))
     with pytest.raises(ValueError, match="flat"):
         E.cluster_contrast(ep["fixation"], ep["stimulus"], roi=["Cz"], n_permutations=10)
+
+
+def test_gtec_64_layout_montage():
+    import mne
+    assert "gtec_64" in E.builtin_montages()
+    m = E.montage_from_source("gtec_64")
+    assert len(m.ch_names) == 64
+    assert m.ch_names[:3] == ["Fp1", "Fpz", "Fp2"] and m.ch_names[18] == "FC3"
+    assert m.ch_names[-4:] == ["F9", "F10", "A1", "A2"]
+    info = mne.create_info([f"EEG{i:03d}" for i in range(1, 65)], 256.0, "eeg")
+    raw = mne.io.RawArray(np.zeros((64, 10)), info, verbose="error")
+    rep = E.apply_montage(raw, m, list(m.ch_names))
+    assert rep["n_renamed"] == 64 and rep["n_positioned"] == 64 and not rep["missing"]
+    assert raw.ch_names[29] == "Cz"
