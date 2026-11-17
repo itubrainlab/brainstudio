@@ -364,6 +364,10 @@ def cluster_contrast(epochs_a: mne.Epochs, epochs_b: mne.Epochs, roi=None,
     excluded. Returns a dict with times, F, clusters (boolean masks of shape
     (n_times,) or (n_times, n_channels)), p_values and the channels used.
     """
+    if min(len(epochs_a), len(epochs_b)) < 2:
+        raise ValueError(f"A cluster test needs at least 2 epochs per group (got "
+                         f"{len(epochs_a)} and {len(epochs_b)}): pick events that occur "
+                         "more than once, e.g. fixations within a phase")
     a = epochs_a.copy().crop(tmin, tmax)
     b = epochs_b.copy().crop(tmin, tmax)
     kw = dict(n_permutations=n_permutations, rng=seed, verbose="error")

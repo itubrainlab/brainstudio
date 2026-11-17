@@ -259,3 +259,13 @@ def test_pipeline_bads_ica_groups_bandpower(demo):
     tab = ST.comparison_table(pd.concat(per), ["θ/α", "α ERD % (parietal)"], ["stim", "fix"])
     assert list(tab.columns[:3]) == ["measure", "stim mean", "stim sem"]
     assert tab["q (FDR)"].notna().all() and (tab["q (FDR)"] >= tab["p"] - 1e-12).all()
+
+
+def test_cluster_test_needs_two_epochs_per_group():
+    import mne
+    info = mne.create_info(["Cz", "Pz"], 100.0, "eeg")
+    rng = np.random.default_rng(0)
+    one = mne.EpochsArray(rng.normal(0, 1e-6, (1, 2, 50)), info, verbose="error")
+    many = mne.EpochsArray(rng.normal(0, 1e-6, (5, 2, 50)), info, verbose="error")
+    with pytest.raises(ValueError, match="at least 2 epochs"):
+        E.cluster_contrast(one, many, n_permutations=10)
