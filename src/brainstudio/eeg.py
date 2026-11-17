@@ -14,7 +14,8 @@ class FilterParams:
     l_freq: float | None = 1.0
     h_freq: float | None = 40.0
     notch: float | None = None  # e.g. 50 or 60 Hz
-    reference: str | None = None  # None (keep), "average", or a channel name
+    # None (keep as recorded), "average", or channel name(s): "Cz" / "M1, M2"
+    reference: str | list[str] | None = None
 
 
 def eeg_picks(raw: mne.io.BaseRaw) -> np.ndarray:
@@ -38,10 +39,40 @@ def preprocess(raw: mne.io.BaseRaw, p: FilterParams) -> mne.io.BaseRaw:
     if p.notch and p.notch < nyq:
         freqs = np.arange(p.notch, nyq, p.notch)
         out.notch_filter(freqs, picks=picks, verbose="error")
-    if p.reference == "average":
+    ref = parse_reference(p.reference, out)
+    if ref == "average":
         out.set_eeg_reference("average", projection=False, verbose="error")
-    elif p.reference:
-        out.set_eeg_reference([p.reference], verbose="error")
+    elif ref:
+        # re-reference to the (mean of the) given channel(s); they become flat
+        out.set_eeg_reference(ref, projection=False, verbose="error")
+    return out
+
+
+def parse_reference(ref, raw: mne.io.BaseRaw):
+    """Normalise a reference spec → None, "average" or a list of EEG channel names.
+
+    Accepts None/"keep", "average"/"avg"/"car", a channel name, a comma- or
+    space-separated string of names, or a list. Matching is case-insensitive.
+    """
+    if ref is None:
+        return None
+    if isinstance(ref, str):
+        r = ref.strip()
+        if not r or r.lower() in ("keep", "none", "as recorded"):
+            return None
+        if r.lower() in ("average", "avg", "car", "common average"):
+            return "average"
+        names = [n for n in r.replace(";", ",").replace(",", " ").split() if n]
+    else:
+        names = list(ref)
+    eeg = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude=[])]
+    lower = {n.lower(): n for n in eeg}
+    out, missing = [], []
+    for n in names:
+        (out if n.lower() in lower else missing).append(lower.get(n.lower(), n))
+    if missing:
+        raise ValueError(f"Reference channel(s) not found among EEG channels: "
+                         f"{', '.join(missing)}")
     return out
 
 

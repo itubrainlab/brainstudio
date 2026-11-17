@@ -200,6 +200,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.notch = QtWidgets.QComboBox()
         self.notch.addItems(["off", "50 Hz", "60 Hz"])
         self.ref = QtWidgets.QComboBox()
+        self.ref.setEditable(True)  # pick a channel or type several: "M1, M2"
+        self.ref.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.ref.setToolTip("keep = as recorded · average = common average · a channel, "
+                            "or several separated by commas (their mean, e.g. M1, M2)")
         self.ref.addItems(["keep", "average"])
         f.addRow("High-pass", self.hp)
         f.addRow("Low-pass", self.lp)
@@ -409,6 +413,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.display_raw = None
         self.screen.reset_view()
         if rec.raw is not None:
+            self._refresh_reference_choices()
             self.apply_filters(redraw=False)
             self._load_eeg_plot()
         else:
@@ -446,12 +451,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.n_chan.setMaximum(max(len(names), 1))
         self.eeg_plot.set_visible_channels(min(self.n_chan.value(), len(names)))
 
+    def _refresh_reference_choices(self):
+        """Reference options: keep, average, then the recording's EEG channels."""
+        cur = self.ref.currentText()
+        raw = self.rec.raw if self.rec is not None else None
+        names = ([raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude=[])]
+                 if raw is not None else [])
+        self.ref.blockSignals(True)
+        self.ref.clear()
+        self.ref.addItems(["keep", "average"])
+        if names:
+            self.ref.insertSeparator(2)
+            self.ref.addItems(names)
+        try:  # keep the previous choice when it still exists in this recording
+            ok = raw is not None and E.parse_reference(cur, raw) is not None
+        except ValueError:
+            ok = False
+        self.ref.setCurrentText(cur if ok or cur in ("keep", "average") else "keep")
+        self.ref.blockSignals(False)
+
     def apply_filters(self, redraw=True):
         if self.rec is None or self.rec.raw is None:
             return
         notch = {"off": None, "50 Hz": 50.0, "60 Hz": 60.0}[self.notch.currentText()]
         p = E.FilterParams(self.hp.value() or None, self.lp.value() or None, notch,
-                           None if self.ref.currentText() == "keep" else "average")
+                           self.ref.currentText())
+        try:
+            E.parse_reference(p.reference, self.rec.raw)
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self, "Reference", f"{e}\nUsing the recorded "
+                                          "reference instead.")
+            self.ref.setCurrentText("keep")
+            p.reference = None
         try:
             with self._busy("Filtering…"):
                 self.display_raw = E.preprocess(self.rec.raw, p)
@@ -531,6 +562,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self._error("Montage", e)
             return
+        self._refresh_reference_choices()
         self._load_eeg_plot()
         self.topo.set_raw(self.display_raw)
         self.info.setPlainText(self.rec.summary() + "\n" + self.rec.description)

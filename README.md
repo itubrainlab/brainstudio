@@ -87,7 +87,11 @@ as missing.
     * Export: evokeds and epochs as `.fif`, clusters as `.csv`, plus a text file
       describing the selection.
 * **Controls dock**
-  * MNE filtering: high-pass, low-pass, notch, average reference.
+  * MNE filtering: high-pass, low-pass, notch.
+  * Re-referencing (`set_eeg_reference`): *keep* (as recorded), *average*, any EEG
+    channel from the list, or several typed with commas (`M1, M2`) for their mean,
+    e.g. linked mastoids. The list follows channel renames from the montage dialog.
+    ERPs and contrasts use the re-referenced data.
   * Gaze-detection parameters, gaze offset, screen size.
   * "Open in MNE browser" adds blinks and saccades as annotations.
 

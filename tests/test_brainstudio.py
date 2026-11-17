@@ -143,3 +143,19 @@ def test_montage_and_metadata_epochs_contrast(demo):
     assert len(st["clusters"]) == len(st["p_values"])
     # the stimulus P300 at Pz should differ from fixations (simulated effect)
     assert min(st["p_values"]) < 0.05
+
+
+def test_channel_reference(demo):
+    rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
+    assert E.parse_reference("keep", rec.raw) is None
+    assert E.parse_reference("CAR", rec.raw) == "average"
+    assert E.parse_reference("cz", rec.raw) == ["Cz"]
+    assert E.parse_reference("TP9, Cz", rec.raw.copy().rename_channels({"T7": "TP9"})) == [
+        "TP9", "Cz"]
+    with pytest.raises(ValueError, match="not found"):
+        E.parse_reference("M1", rec.raw)
+    out = E.preprocess(rec.raw, E.FilterParams(None, None, None, "Cz"))
+    assert np.abs(out.get_data(picks=["Cz"])).max() < 1e-12  # reference channel is flat
+    pair = E.preprocess(rec.raw, E.FilterParams(None, None, None, "O1, O2"))
+    o = pair.get_data(picks=["O1", "O2"])
+    assert np.abs(o.sum(0)).max() < 1e-12  # linked reference: O1 = -O2
