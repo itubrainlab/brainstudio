@@ -58,7 +58,9 @@ as missing.
 
 ## GUI
 
-* **Viewer tab**
+Three main tabs:
+
+* **Viewer** (shows the preprocessed EEG by default; switch to raw in the Controls dock)
   * Stacked EEG traces with event markers and shaded saccades, blinks and fixations.
   * Gaze x/y and pupil traces, linked on the same time axis.
   * Overview bar showing gaze validity and events.
@@ -66,34 +68,78 @@ as missing.
   * Screen view: live gaze point and trail, numbered scanpath, fixation heatmap,
     optional stimulus image, and draggable **AOIs**.
   * **Live topomap** of the EEG around the cursor (needs channel positions).
-* **Analysis tab** (all EEG analysis runs in MNE)
-  * *Gaze statistics*:
-    * fixation, saccade and blink summary
-    * fixation-duration and amplitude histograms, main sequence
-    * per-AOI fixation count, dwell time and time to first fixation, computed with
-      `pygaze.plugins.aoi.AOI` (CSV export)
-  * *Spectrum*: PSD per channel (`Raw.compute_psd`) and band topomaps.
-  * *Event-related potentials*: an `mne.Epochs` locked to any selection of events
-    (see below), with the event table attached as **epochs metadata**. Butterfly + GFP
-    plot, MNE joint plot, epochs image, and saving `-epo.fif` with metadata.
-  * *Contrast*: two event groups A and B, each chosen with its own checklist and
-    filters.
-    * Evokeds use `mne.combine_evoked` for the A − B difference wave and are shown with
-      ±SEM on an ROI.
-    * Statistics are a cluster-based permutation test with `mne.stats`: either
-      `permutation_cluster_test` on the ROI mean or `spatio_temporal_cluster_test` with
-      the montage adjacency. Significant clusters are shaded.
-    * MNE `plot_compare_evokeds` and difference joint/topomaps.
-    * Export: evokeds and epochs as `.fif`, clusters as `.csv`, plus a text file
-      describing the selection.
-* **Controls dock**
-  * MNE filtering: high-pass, low-pass, notch.
-  * Re-referencing (`set_eeg_reference`): *keep* (as recorded), *average*, any EEG
-    channel from the list, or several typed with commas (`M1, M2`) for their mean,
-    e.g. linked mastoids. The list follows channel renames from the montage dialog.
-    ERPs and contrasts use the re-referenced data.
-  * Gaze-detection parameters, gaze offset, screen size.
-  * "Open in MNE browser" adds blinks and saccades as annotations.
+* **EEG** is a three-stage pipeline. Every analysis runs in MNE.
+  * Each stage takes its input from the stage before. A banner at the top of each stage
+    says what that input is and whether the stage's results are up to date (●), out of
+    date (▲) or not run yet (○).
+  * Changing a setting marks that stage, and every stage after it, out of date.
+  * **Run pipeline ▶▶** runs everything from the first stage that is out of date.
+  * Long computations run in the background.
+  * The stages:
+    1. **Preprocessing**
+       * *Channels*: automated peak-to-peak rejection. The data are cut into windows and
+         band-passed/notched like the output will be. A channel is bad when too many of
+         its windows are noisy (ptp above a threshold) or flat, or when it is a
+         robust-z outlier. Tick or untick channels by hand. Bad channels are left out of
+         ICA, the average reference, epochs and statistics, or interpolated with
+         spherical splines.
+       * *Filtering & reference*: high-pass, low-pass, notch; keep, average, one
+         channel, or the mean of several (`M1, M2`).
+       * *ICA blink removal* (`mne.preprocessing.ICA`, picard):
+         * Fitted on a ≥ 1 Hz copy of the good channels.
+         * Components are scored against the eye tracker's blinks, using a
+           blink-locked t-score.
+         * They are also scored against EOG channels or, without EOG, the frontal
+           electrodes (`find_bads_eog`).
+         * Suggested components are pre-ticked.
+         * MNE component, source and property plots are available.
+       * Checks: spectrum before/after, per-channel noisy/flat %, and the
+         blink-locked frontal EEG before/after.
+    2. **Epoching**
+       * Map events into named **groups** (conditions). Each group has its own
+         checklist and filters (see *Selecting events*).
+       * Set the epoch start and end around each event, peak-to-peak and flat
+         rejection, optionally drop epochs containing an eye-tracker blink, and cap the
+         epochs per group.
+       * Shows a summary (selected, outside, rejected, kept) and a timeline of where
+         each group's events fall.
+       * Save one `-epo.fif` per group.
+       * Epochs are *not* baseline-corrected here. Each analysis picks its own baseline.
+    3. **Analysis** of the ticked groups:
+       * *ERP*:
+         * Baseline = a window **before the event** (e.g. −0.2…0 s).
+         * ROI waveforms ± SEM; with two groups, the A − B difference and a cluster
+           permutation test, on the ROI or spatio-temporal (`mne.stats`).
+         * Mean and peak amplitude and peak latency in a measurement window, compared
+           across groups.
+         * MNE compare-evokeds, joint plots and topomaps.
+       * *Band power*:
+         * Editable bands. Power in a window of the epoch from `Epochs.compute_psd`
+           (Welch or multitaper).
+         * Baseline = a window **after a baseline event**, e.g. 5…115 s after
+           `BASELINE_START`. It is cut into segments as long as the analysis window.
+           Either the mean of all baseline events or the nearest preceding one is
+           used, and results are expressed in dB, % change, ratio or z.
+         * Bar charts ± SEM, a Morlet ERD/ERS time course on the same baseline, and
+           MNE topomaps per band, group and difference.
+       * *Cognitive indices* per epoch, with editable regions:
+         * engagement β/(α+θ) (Pope 1995)
+         * workload = frontal-midline θ / parietal α (Gevins & Smith 2003)
+         * θ/α, frontal θ/β, frontal alpha asymmetry
+         * parietal α ERD % and frontal-midline θ ERS % relative to the baseline
+         * eye metrics: task-evoked pupil dilation, blink rate, mean fixation duration
+       * Groups are compared with a Welch t-test and Mann-Whitney test (two groups) or
+         ANOVA and Kruskal-Wallis (more), with Hedges' g and FDR q-values. These are
+         epoch-level statistics within one recording.
+       * Every result exports to CSV/FIF with a provenance text file.
+* **Gaze**:
+  * fixation, saccade and blink summary
+  * fixation-duration and amplitude histograms, main sequence
+  * per-AOI fixation count, dwell time and time to first fixation, computed with
+    `pygaze.plugins.aoi.AOI` (CSV export)
+* **Controls dock**: viewer options, which EEG to display (preprocessed or raw),
+  gaze-detection parameters, gaze offset, screen size. "Open in MNE browser" adds blinks
+  and saccades as annotations.
 
 ### Selecting events
 All markers and detected gaze events go into one table
@@ -148,21 +194,45 @@ plot to move the cursor.
 ## Library use
 
 ```python
-from brainstudio.io import scan_bids, load_bids_run, load_xdf
-from brainstudio import gaze as G, eeg as E
+from brainstudio.io import load_xdf
+from brainstudio import gaze as G, events as EV, preprocessing as P, epoching as EP
+from brainstudio import bandpower as BP, stats as ST, eeg as E
 
-rec = load_xdf("recording.xdf")              # or load_bids_run(root, scan_bids(root)[0])
-print(rec.summary(), rec.description)
-ev = G.detect_events(rec.gaze)               # fixations / saccades / blinks DataFrames
-raw = E.preprocess(rec.raw, E.FilterParams(1, 40))
-from brainstudio import events as EV
-table = EV.build_event_table(rec, ev)          # markers + gaze events, parsed attributes
-sel = EV.filter_events(table, query='phase == "READING"', names={"fixation"})
-epochs = E.epochs_from_table(raw, sel, -0.2, 0.6, reject_uv=150)   # metadata attached
-a, b = epochs['cond == "AI"'], epochs['cond == "NoAI"']           # MNE metadata queries
-evokeds = E.contrast_evokeds(a, b, ("AI", "NoAI"))                 # incl. "AI − NoAI"
-stats = E.cluster_contrast(a, b, roi=["O1", "Oz", "O2"], n_permutations=1000)
-aoi = G.aoi_statistics(ev.fixations, {"left": G.make_aoi("rectangle", (0, 0), (960, 1080))})
+rec = load_xdf("recording.xdf")
+gtec = E.montage_from_source("gtec_64")                         # names + positions
+E.apply_montage(rec.raw, gtec, gtec.ch_names)
+ev = G.detect_events(rec.gaze)                                  # fixations / saccades / blinks
+table = EV.build_event_table(rec, ev)                           # markers + gaze events
+
+# 1 preprocessing
+bad = P.detect_bad_channels(rec.raw, P.BadChannelParams(ptp_max_uv=250, notch=50))
+bads = bad.loc[bad.bad, "channel"].tolist()
+ica, fit_raw = P.fit_ica(rec.raw, bads, h_freq=40, notch=50)
+scores = P.score_blink_components(ica, fit_raw, ev.blinks)      # blink-locked + EOG/frontal
+pp = P.PreprocParams(bads=bads, l_freq=1, h_freq=40, notch=50, reference="average",
+                     ica_exclude=scores.loc[scores.suggested, "component"].tolist())
+clean = P.run_preprocessing(rec.raw, pp, ica)
+
+# 2 epoching: named groups of events
+fx = EV.filter_events(table, query='phase == "READING"', names={"fixation"})
+groups = {"AI": fx[fx.cond == "AI"], "NoAI": fx[fx.cond == "NoAI"]}
+epochs, summary = EP.build_group_epochs(clean, groups, EP.EpochSettings(-0.5, 1.5, 150))
+
+# 3 analysis: ERP (pre-event baseline) and band power (baseline after a baseline event)
+erp = {g: e.copy().apply_baseline((-0.2, 0)) for g, e in epochs.items()}
+stats = E.cluster_contrast(erp["AI"], erp["NoAI"], roi=["Pz", "P3", "P4"])
+s = BP.BandSettings(tmin=0, tmax=1.5)
+base = BP.BandBaseline(table.loc[table.name == "BASELINE_START", "onset"].values, 5, 115)
+per = []
+for g, ep in epochs.items():
+    bp = BP.band_power(ep, s)                                     # (epochs, channels, bands) µV²
+    bb, owner = BP.baseline_band_power(clean, base, s, ep.ch_names, 1.5)
+    ref, sd = BP.reference_for(ep.metadata.onset.values, base, bb, owner)
+    idx, notes = BP.eeg_indices(bp, ep.ch_names, s.bands, ref=ref)  # engagement, workload…
+    per.append(idx.assign(group=g))
+import pandas as pd
+print(ST.comparison_table(pd.concat(per), ["engagement β/(α+θ)", "α ERD % (parietal)"],
+                          ["AI", "NoAI"]))
 ```
 
 ## Notes on the gaze algorithms

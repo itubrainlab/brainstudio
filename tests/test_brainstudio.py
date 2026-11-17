@@ -197,3 +197,65 @@ def test_gtec_64_layout_montage():
     rep = E.apply_montage(raw, m, list(m.ch_names))
     assert rep["n_renamed"] == 64 and rep["n_positioned"] == 64 and not rep["missing"]
     assert raw.ch_names[29] == "Cz"
+
+
+def test_pipeline_bads_ica_groups_bandpower(demo):
+    """Preprocessing → epoching → analysis on synthetic data with real blink artifacts."""
+    from brainstudio import bandpower as BP
+    from brainstudio import epoching as EP
+    from brainstudio import events as EV
+    from brainstudio import preprocessing as P
+    from brainstudio import stats as ST
+
+    rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
+    raw = rec.raw.copy().load_data()
+    raw._data[raw.ch_names.index("T7")] = 0.0                                   # flat
+    raw._data[raw.ch_names.index("C4")] += np.random.default_rng(0).normal(
+        0, 400e-6, raw.n_times)                                                  # noisy
+    bad = P.detect_bad_channels(raw)
+    assert {"T7", "C4"} <= set(bad.loc[bad.bad, "channel"])
+    assert bad.bad.sum() <= 4
+
+    ev = G.detect_events(rec.gaze)
+    bads = ["T7", "C4"]
+    ica, fit_raw = P.fit_ica(raw, bads, 40.0, None, P.ICAParams(n_components=10))
+    assert not set(bads) & set(ica.ch_names)
+    sc = P.score_blink_components(ica, fit_raw, ev.blinks)
+    assert sc.suggested.any()
+    assert sc.loc[sc.suggested, "blink_t"].max() == sc.blink_t.max()
+    params = P.PreprocParams(bads=bads, l_freq=1, h_freq=40, reference="average",
+                             ica_exclude=sc.loc[sc.suggested, "component"].tolist())
+    clean = P.run_preprocessing(raw, params, ica)
+    assert clean.info["bads"] == bads and raw.info["bads"] == []  # input untouched
+    before = P.blink_locked_average(P._filtered(raw, 1, 40, None), ev.blinks, ["Fp1", "Fp2"])
+    after = P.blink_locked_average(clean, ev.blinks, ["Fp1", "Fp2"])
+    assert np.ptp(after[1]) < 0.5 * np.ptp(before[1])                            # blinks gone
+
+    table = EV.build_event_table(rec, ev)
+    groups = {"stim": table[table.name == "stimulus"],
+              "fix": table[table.name == "fixation"].iloc[:200]}
+    eps, summary = EP.build_group_epochs(clean, groups, EP.EpochSettings(-0.2, 1.0, None),
+                                         ev.blinks)
+    assert set(eps) == {"stim", "fix"} and (summary.kept > 0).all()
+    assert eps["stim"].baseline is None and "group" in eps["stim"].metadata
+    assert not set(bads) & set(eps["stim"].ch_names)
+
+    s = BP.BandSettings(tmin=0.0, tmax=1.0)
+    base = BP.BandBaseline(np.array([1.0]), 0.0, 20.0)
+    per = []
+    for g, ep in eps.items():
+        bp = BP.band_power(ep, s)
+        assert bp.shape == (len(ep), len(ep.ch_names), len(s.bands)) and np.nanmin(bp) > 0
+        bb, owner = BP.baseline_band_power(clean, base, s, ep.ch_names, 1.0)
+        assert len(bb) == 20 and (owner == 0).all()
+        ref, sd = BP.reference_for(ep.metadata.onset.to_numpy(), base, bb, owner)
+        assert np.isfinite(BP.normalise(bp, ref, sd, "dB")).mean() > 0.9
+        idx, _ = BP.eeg_indices(bp, ep.ch_names, s.bands, ref=ref)
+        assert idx["engagement β/(α+θ)"].notna().all()
+        assert idx["α ERD % (parietal)"].notna().all()
+        idx["group"] = g
+        per.append(idx)
+    import pandas as pd
+    tab = ST.comparison_table(pd.concat(per), ["θ/α", "α ERD % (parietal)"], ["stim", "fix"])
+    assert list(tab.columns[:3]) == ["measure", "stim mean", "stim sem"]
+    assert tab["q (FDR)"].notna().all() and (tab["q (FDR)"] >= tab["p"] - 1e-12).all()

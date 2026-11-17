@@ -386,9 +386,40 @@ def cluster_contrast(epochs_a: mne.Epochs, epochs_b: mne.Epochs, roi=None,
                 "clusters": _cluster_masks(clusters, F.shape), "ch_names": ch_names,
                 "excluded": [n for n, f in zip(a.ch_names, flat) if f], "spatial": True}
     roi = [c for c in (roi or a.ch_names) if c in a.ch_names]
+    if not roi:
+        raise ValueError("None of the ROI channels are in the epochs (renamed or bad?)")
     Xa, Xb = a.get_data(picks=roi).mean(1), b.get_data(picks=roi).mean(1)
     if _flat(np.concatenate([Xa, Xb]), axis=None):
         raise ValueError("The ROI signal is flat (is the ROI only the reference channel?)")
     F, clusters, p, _ = mne.stats.permutation_cluster_test([Xa, Xb], **kw)
     return {"times": a.times, "F": F, "p_values": np.asarray(p),
             "clusters": _cluster_masks(clusters, F.shape), "roi": roi, "spatial": False}
+
+
+# =========================================================================== ERP measures
+def erp_measures(epochs: mne.BaseEpochs, roi: list[str], window: tuple[float, float]
+                 ) -> pd.DataFrame:
+    """Per-epoch ERP measures on the ROI mean inside ``window`` (µV, s):
+    mean amplitude, positive/negative peak amplitude and their latencies.
+    Apply the ERP baseline to ``epochs`` first."""
+    roi = [c for c in roi if c in epochs.ch_names] or list(epochs.ch_names)
+    m = (epochs.times >= window[0]) & (epochs.times <= window[1])
+    if not m.any():
+        raise ValueError("The measurement window lies outside the epochs")
+    x = epochs.get_data(picks=roi).mean(1)[:, m] * 1e6
+    t = epochs.times[m]
+    return pd.DataFrame({"mean amplitude µV": x.mean(1),
+                         "peak + µV": x.max(1), "peak + latency s": t[x.argmax(1)],
+                         "peak − µV": x.min(1), "peak − latency s": t[x.argmin(1)]})
+
+
+def evoked_peak(evoked: mne.Evoked, roi: list[str], window: tuple[float, float],
+                polarity: str = "pos") -> tuple[float, float]:
+    """Latency (s) and amplitude (µV) of the ROI-mean evoked peak inside ``window``."""
+    roi = [c for c in roi if c in evoked.ch_names] or list(evoked.ch_names)
+    m = (evoked.times >= window[0]) & (evoked.times <= window[1])
+    y = evoked.copy().pick(roi).data.mean(0)[m] * 1e6
+    t = evoked.times[m]
+    i = int(np.argmax(y) if polarity == "pos" else np.argmin(y) if polarity == "neg"
+            else np.argmax(np.abs(y)))
+    return float(t[i]), float(y[i])

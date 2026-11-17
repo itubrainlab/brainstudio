@@ -16,12 +16,18 @@ from .. import events as EV
 from .. import gaze as G
 from .. import io as bio
 from ..model import Recording
-from .analysis import AnalysisPanel, _spin, fill_table
+from .eeg_analysis import AnalysisTab
+from .epoch_tab import EpochTab
+from .gaze_tab import GazeTab
 from .montage_dialog import MontageDialog
+from .pipeline import STAGES, EEGPipeline
+from .preprocess_tab import PreprocessTab
 from .screenview import ScreenView
 from .theme import THEME, apply_theme
 from .timeplots import EEGPlot, GazePlot, OverviewBar
 from .topoview import TopoView
+from .widgets import _spin, fill_table
+from .worker import Worker
 
 pg.setConfigOptions(antialias=False, useOpenGL=False)
 
@@ -39,6 +45,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cursor_t = 0.0
         self.gaze_offset = 0.0  # manual sync correction (s), applied to gaze
         self._raw_gaze = None
+        self.pipeline = EEGPipeline(self)
+        self.worker = Worker(self)
 
         self._build_central()
         self._build_left_dock()
@@ -49,6 +57,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.play_timer.timeout.connect(self._play_step)
         self.statusBar().showMessage("Open a BIDS dataset (File ▸ Open BIDS…) or an XDF file.")
         self.event_df = EV.build_event_table(None)
+        self.pipeline.changed.connect(self._on_pipeline)
+        self.pipeline.stateChanged.connect(self._update_pipeline_titles)
+        self._update_pipeline_titles()
         self._apply_theme()
         hints = QtGui.QGuiApplication.styleHints()
         if hasattr(hints, "colorSchemeChanged"):  # Qt >= 6.5: follow system light/dark
@@ -84,10 +95,32 @@ class MainWindow(QtWidgets.QMainWindow):
         h.addWidget(right)
         h.setSizes([1000, 560])
 
-        self.analysis = AnalysisPanel(self)
+        # --- EEG: preprocessing → epoching → analysis pipeline
+        self.pre_tab = PreprocessTab(self.pipeline, self.worker)
+        self.epoch_tab = EpochTab(self.pipeline, self.worker)
+        self.eeg_analysis = AnalysisTab(self.pipeline, self.worker)
+        eeg = QtWidgets.QWidget()
+        ev = QtWidgets.QVBoxLayout(eeg)
+        ev.setContentsMargins(4, 4, 4, 4)
+        bar = QtWidgets.QHBoxLayout()
+        self.pipe_label = QtWidgets.QLabel("")
+        bar.addWidget(self.pipe_label, 1)
+        self.btn_pipe = QtWidgets.QPushButton("Run pipeline ▶▶")
+        self.btn_pipe.setToolTip("Run every stage that is not up to date, in order")
+        self.btn_pipe.clicked.connect(self.run_pipeline)
+        bar.addWidget(self.btn_pipe)
+        ev.addLayout(bar)
+        self.eeg_tabs = QtWidgets.QTabWidget()
+        self.eeg_tabs.addTab(self.pre_tab, "① Preprocessing")
+        self.eeg_tabs.addTab(self.epoch_tab, "② Epoching")
+        self.eeg_tabs.addTab(self.eeg_analysis, "③ Analysis")
+        ev.addWidget(self.eeg_tabs, 1)
+
+        self.gaze_tab = GazeTab(self)
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(h, "Viewer")
-        self.tabs.addTab(self.analysis, "Analysis")
+        self.tabs.addTab(eeg, "EEG")
+        self.tabs.addTab(self.gaze_tab, "Gaze")
         self.tabs.currentChanged.connect(self._on_tab)
         self.setCentralWidget(self.tabs)
 
@@ -190,33 +223,19 @@ class MainWindow(QtWidgets.QMainWindow):
         f.addRow("Gaze trail", self.trail)
         lay.addWidget(box)
 
-        # --- EEG preprocessing
-        box = QtWidgets.QGroupBox("EEG preprocessing (MNE)")
+        # --- EEG display (preprocessing itself lives in the EEG tab)
+        box = QtWidgets.QGroupBox("EEG display")
         f = QtWidgets.QFormLayout(box)
-        self.hp = _spin(0, 100, 1.0, 0.1, 2, " Hz")
-        self.lp = _spin(0, 1000, 40.0, 1, 1, " Hz")
-        self.hp.setSpecialValueText("off")
-        self.lp.setSpecialValueText("off")
-        self.notch = QtWidgets.QComboBox()
-        self.notch.addItems(["off", "50 Hz", "60 Hz"])
-        self.ref = QtWidgets.QComboBox()
-        self.ref.setEditable(True)  # pick a channel or type several: "M1, M2"
-        self.ref.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
-        self.ref.setToolTip("keep = as recorded · average = common average · a channel, "
-                            "or several separated by commas (their mean, e.g. M1, M2)")
-        self.ref.addItems(["keep", "average"])
-        f.addRow("High-pass", self.hp)
-        f.addRow("Low-pass", self.lp)
-        f.addRow("Notch", self.notch)
-        f.addRow("Reference", self.ref)
-        row = QtWidgets.QHBoxLayout()
-        b = QtWidgets.QPushButton("Apply")
-        b.clicked.connect(self.apply_filters)
-        r = QtWidgets.QPushButton("Raw")
-        r.clicked.connect(self.reset_filters)
-        row.addWidget(b)
-        row.addWidget(r)
-        f.addRow(row)
+        self.show_clean = QtWidgets.QRadioButton("Preprocessed (EEG ▸ ① Preprocessing)")
+        self.show_raw = QtWidgets.QRadioButton("Raw, as recorded")
+        self.show_clean.setChecked(True)
+        self.show_clean.toggled.connect(lambda _: self._update_display())
+        f.addRow(self.show_clean)
+        f.addRow(self.show_raw)
+        b = QtWidgets.QPushButton("Edit preprocessing…")
+        b.clicked.connect(lambda: (self.tabs.setCurrentIndex(1),
+                                   self.eeg_tabs.setCurrentIndex(0)))
+        f.addRow(b)
         mb = QtWidgets.QPushButton("Open in MNE browser…")
         mb.clicked.connect(self.open_mne_browser)
         f.addRow(mb)
@@ -410,11 +429,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.scr_w.setValue(rec.gaze.screen_size[0])
             self.scr_h.setValue(rec.gaze.screen_size[1])
             self.screen.set_screen(rec.gaze.screen_size)
-        self.display_raw = None
+        self.display_raw = rec.raw
         self.screen.reset_view()
+        self.pipeline.set_recording(rec)
         if rec.raw is not None:
-            self._refresh_reference_choices()
-            self.apply_filters(redraw=False)
             self._load_eeg_plot()
         else:
             self.eeg_plot.data = None
@@ -427,7 +445,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.info.setPlainText(rec.summary() + ("\n" + rec.description if rec.description else ""))
         self._refresh_events()
         self._rebuild_event_table()
-        self.analysis.update_gaze_stats()
+        self.gaze_tab.update_gaze_stats()
+        if rec.raw is not None:  # default preprocessing (1–40 Hz) so the viewer is filtered
+            self.pre_tab.run()
         win = min(self.win_len.value(), max(rec.duration, 0.5))
         if rec.raw is None and rec.has_gaze:
             self.eeg_plot.plotItem.getViewBox().setLimits(xMin=-1, xMax=rec.duration + 1)
@@ -451,56 +471,48 @@ class MainWindow(QtWidgets.QMainWindow):
         self.n_chan.setMaximum(max(len(names), 1))
         self.eeg_plot.set_visible_channels(min(self.n_chan.value(), len(names)))
 
-    def _refresh_reference_choices(self):
-        """Reference options: keep, average, then the recording's EEG channels."""
-        cur = self.ref.currentText()
-        raw = self.rec.raw if self.rec is not None else None
-        names = ([raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude=[])]
-                 if raw is not None else [])
-        self.ref.blockSignals(True)
-        self.ref.clear()
-        self.ref.addItems(["keep", "average"])
-        if names:
-            self.ref.insertSeparator(2)
-            self.ref.addItems(names)
-        try:  # keep the previous choice when it still exists in this recording
-            ok = raw is not None and E.parse_reference(cur, raw) is not None
-        except ValueError:
-            ok = False
-        self.ref.setCurrentText(cur if ok or cur in ("keep", "average") else "keep")
-        self.ref.blockSignals(False)
+    # ================================================================== pipeline
+    def _on_pipeline(self, what):
+        if what == "preprocessing":
+            self._update_display()
 
-    def apply_filters(self, redraw=True):
+    def _update_display(self):
         if self.rec is None or self.rec.raw is None:
             return
-        notch = {"off": None, "50 Hz": 50.0, "60 Hz": 60.0}[self.notch.currentText()]
-        p = E.FilterParams(self.hp.value() or None, self.lp.value() or None, notch,
-                           self.ref.currentText())
-        try:
-            E.parse_reference(p.reference, self.rec.raw)
-        except ValueError as e:
-            QtWidgets.QMessageBox.warning(self, "Reference", f"{e}\nUsing the recorded "
-                                          "reference instead.")
-            self.ref.setCurrentText("keep")
-            p.reference = None
-        try:
-            with self._busy("Filtering…"):
-                self.display_raw = E.preprocess(self.rec.raw, p)
-        except Exception as e:
-            self._error("Filtering failed", e)
-            self.display_raw = self.rec.raw
-        if redraw:
-            picks = self._eeg_picks(self.display_raw)
-            self.eeg_plot.update_values(self.display_raw.get_data(picks=picks).astype(np.float32))
-            self.topo.set_raw(self.display_raw)
-
-    def reset_filters(self):
-        if self.rec is None or self.rec.raw is None:
-            return
-        self.display_raw = self.rec.raw
-        self.eeg_plot.update_values(
-            self.display_raw.get_data(picks=self._eeg_picks(self.display_raw)).astype(np.float32))
+        clean = self.pipeline.clean
+        self.display_raw = clean if (self.show_clean.isChecked() and clean is not None) \
+            else self.rec.raw
+        self._load_eeg_plot()
         self.topo.set_raw(self.display_raw)
+
+    def _update_pipeline_titles(self):
+        mark = {"pending": "○", "ok": "●", "stale": "▲"}
+        st = self.pipeline.state
+        names = ("① Preprocessing", "② Epoching", "③ Analysis")
+        for i, (stage, name) in enumerate(zip(STAGES, names)):
+            self.eeg_tabs.setTabText(i, f"{name} {mark[st[stage]]}")
+        words = {"pending": "not run", "ok": "up to date", "stale": "out of date"}
+        self.pipe_label.setText(
+            "Pipeline:  " + "  →  ".join(f"{n} <i>{words[st[s]]}</i>"
+                                         for s, n in zip(STAGES, names))
+            + "   <span style='color:gray'>(● up to date · ▲ out of date · ○ not run)</span>")
+
+    def run_pipeline(self):
+        """Run the first stage that is not up to date and everything after it."""
+        st = self.pipeline.state
+        stages = [self.pre_tab.run, self.epoch_tab.run, self.eeg_analysis.run]
+        first = next((i for i, s in enumerate(STAGES) if st[s] != "ok"), None)
+        if first is None:
+            self.statusBar().showMessage("Every stage is up to date.", 4000)
+            return
+
+        def chain(i):
+            if i >= len(stages):
+                return
+            self.eeg_tabs.setCurrentIndex(i)
+            stages[i](then=lambda: chain(i + 1))
+
+        chain(first)
 
     def open_mne_browser(self):
         if self.display_raw is None:
@@ -525,6 +537,7 @@ class MainWindow(QtWidgets.QMainWindow):
         with self._busy("Detecting fixations, saccades and blinks…"):
             self.gaze_events = G.detect_events(self.rec.gaze, self._gaze_params())
             self.rec.gaze_events = self.gaze_events
+            self.pipeline.set_gaze_events(self.gaze_events)
             self.pupil_clean = (G.clean_pupil(self.rec.gaze, self.gaze_events.blinks)
                                 if self.cb_pupil_clean.isChecked() else None)
         self.gaze_plot.set_gaze(self.rec.gaze, self.pupil_clean)
@@ -532,7 +545,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gaze_plot.gaze_events = self.gaze_events
         self._overlay_toggled()
         self._heat_toggled()
-        self.analysis.update_gaze_stats()
+        self.gaze_tab.update_gaze_stats()
         self._rebuild_event_table()
         self._update_screen()
 
@@ -540,10 +553,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _rebuild_event_table(self):
         aois = self.screen.pygaze_aois() if self.screen.aois else None
         self.event_df = EV.build_event_table(self.rec, self.gaze_events, aois)
-        self.analysis.set_event_table(self.event_df)
+        self.pipeline.set_event_table(self.event_df)
 
     def _aois_changed(self):
-        self.analysis.update_aoi_stats()
+        self.gaze_tab.update_aoi_stats()
         if self.rec is not None:
             self._rebuild_event_table()
 
@@ -551,20 +564,34 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.rec is None or self.rec.raw is None:
             QtWidgets.QMessageBox.information(self, "Montage", "Load a recording with EEG first.")
             return
+        if self.worker.busy:
+            QtWidgets.QMessageBox.information(self, "Montage", "Wait for the running "
+                                              "computation to finish.")
+            return
         dlg = MontageDialog(self.rec.raw, self)
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
+        old = list(self.rec.raw.ch_names)
         try:
             with self._busy("Applying montage…"):
                 rep = E.apply_montage(self.rec.raw, dlg.montage, dlg.names_out)
-                if self.display_raw is not None and self.display_raw is not self.rec.raw:
-                    E.apply_montage(self.display_raw, dlg.montage, dlg.names_out)
         except Exception as e:
             self._error("Montage", e)
             return
-        self._refresh_reference_choices()
+        # carry the preprocessing choices over to the new names; ICA must be refitted
+        rename = dict(zip(old, self.rec.raw.ch_names))
+        pl = self.pipeline
+        pl.params.bads = [rename.get(b, b) for b in self.pre_tab.bads()]
+        pl.invalidate_ica()
+        self.pre_tab._stats = None
+        self.pre_tab.refresh_channels()
+        self.pre_tab.refresh_reference_choices()
+        self.pre_tab._fill_ica_table()
+        self.display_raw = self.rec.raw
         self._load_eeg_plot()
         self.topo.set_raw(self.display_raw)
+        pl.mark_stale("preprocessing")
+        self.pre_tab.run()
         self.info.setPlainText(self.rec.summary() + "\n" + self.rec.description)
         self.statusBar().showMessage(
             f"Montage applied: {rep['n_renamed']} channels renamed, "
@@ -575,12 +602,13 @@ class MainWindow(QtWidgets.QMainWindow):
         apply_theme(QtWidgets.QApplication.instance(), self)
         for w in (self.eeg_plot, self.gaze_plot, self.overview, self.screen, self.topo):
             w.restyle()
-        self.analysis.restyle()
+        for w in (self.pre_tab, self.epoch_tab, self.eeg_analysis, self.gaze_tab):
+            w.restyle()
         self._heat_toggled()
 
     def changeEvent(self, ev):
         if ev.type() in (QtCore.QEvent.PaletteChange, QtCore.QEvent.ApplicationPaletteChange) \
-                and hasattr(self, "analysis"):
+                and hasattr(self, "gaze_tab"):
             dark = QtWidgets.QApplication.instance().palette().color(
                 QtGui.QPalette.Base).lightness() < 128
             if dark != THEME.dark:
@@ -692,8 +720,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.screen.update_view(self.rec.gaze, self.gaze_events, self.cursor_t, t0, t1)
 
     def _on_tab(self, i):
-        if i == 1:
-            self.analysis.update_aoi_stats()
+        if self.tabs.widget(i) is self.gaze_tab:
+            self.gaze_tab.update_aoi_stats()
 
     def _event_jump(self, row, _col):
         try:
