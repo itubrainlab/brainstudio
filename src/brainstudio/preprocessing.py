@@ -61,8 +61,12 @@ def detect_bad_channels(raw: mne.io.BaseRaw, p: BadChannelParams | None = None
         block = picks[start:start + 8]
         x = raw.get_data(picks=block) * 1e6
         h = p.h_freq if p.h_freq and p.h_freq < sf / 2 else None
-        if p.l_freq or h:
-            x = mne.filter.filter_data(x, sf, p.l_freq or None, h, verbose="error")
+        lf = p.l_freq if p.l_freq and p.l_freq > 0 else None
+        if lf and highpass_method(lf):
+            x = mne.filter.filter_data(x, sf, lf, None, verbose="error", **highpass_method(lf))
+            lf = None
+        if lf or h:
+            x = mne.filter.filter_data(x, sf, lf, h, verbose="error")
         if p.notch and p.notch < sf / 2:
             x = mne.filter.notch_filter(x, sf, np.arange(p.notch, sf / 2, p.notch),
                                         verbose="error")
@@ -103,6 +107,18 @@ class ICAParams:
     seed: int = 97
 
 
+#: below this high-pass cut-off an FIR filter gets very long: use a zero-phase IIR
+IIR_BELOW_HZ = 0.5
+IIR_PARAMS = dict(order=4, ftype="butter", output="sos")
+
+
+def highpass_method(l_freq) -> dict:
+    """Filter arguments for a high-pass: FIR, or zero-phase Butterworth below 0.5 Hz."""
+    if l_freq and l_freq < IIR_BELOW_HZ:
+        return dict(method="iir", iir_params=IIR_PARAMS)
+    return {}
+
+
 def _filtered(raw: mne.io.BaseRaw, l_freq, h_freq, notch, picks=None) -> mne.io.BaseRaw:
     out = raw.copy().load_data()
     if picks is not None:
@@ -110,8 +126,13 @@ def _filtered(raw: mne.io.BaseRaw, l_freq, h_freq, notch, picks=None) -> mne.io.
     fp = mne.pick_types(out.info, eeg=True, eog=True, ecg=True, emg=True, exclude=[])
     nyq = out.info["sfreq"] / 2
     h = h_freq if h_freq and h_freq < nyq else None
-    if len(fp) and (l_freq or h):
-        out.filter(l_freq or None, h, picks=fp, verbose="error")
+    l_freq = l_freq if l_freq and l_freq > 0 else None  # 0 Hz = no high-pass
+    if len(fp) and l_freq and highpass_method(l_freq):
+        out.filter(l_freq, None, picks=fp, verbose="error", **highpass_method(l_freq))
+        if h:
+            out.filter(None, h, picks=fp, verbose="error")
+    elif len(fp) and (l_freq or h):
+        out.filter(l_freq, h, picks=fp, verbose="error")
     if len(fp) and notch and notch < nyq:
         out.notch_filter(np.arange(notch, nyq, notch), picks=fp, verbose="error")
     return out

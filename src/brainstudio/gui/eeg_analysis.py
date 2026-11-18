@@ -151,10 +151,21 @@ class AnalysisTab(QtWidgets.QWidget):
         self.erp_bl1 = _spin(-60, 1, 0.0, 0.05, 3, " s")
         for x in (self.erp_bl0, self.erp_bl1):
             x.setToolTip("Pre-event baseline window, subtracted from every epoch")
+        # ERP component (as in Rhino ERP): preset → window, polarity, channel cluster
+        self.erp_comp = QtWidgets.QComboBox()
+        self.erp_comp.addItem("Custom")
+        self.erp_comp.addItems(list(E.COMPONENT_PRESETS))
+        self.erp_comp.setToolTip("ERP component presets (conventional windows and sites — "
+                                 "starting points, adjust to your paradigm). Any edit makes it "
+                                 "Custom.")
+        self.erp_pol = QtWidgets.QComboBox()
+        self.erp_pol.addItem("positive peak (+)", +1)
+        self.erp_pol.addItem("negative peak (−)", -1)
         self.erp_roi = QtWidgets.QLineEdit()
-        self.erp_roi.setPlaceholderText("ROI, e.g. Pz, P3, P4  (empty = all good channels)")
-        self.erp_m0 = _spin(-60, 120, 0.3, 0.05, 3, " s")
-        self.erp_m1 = _spin(-60, 120, 0.5, 0.05, 3, " s")
+        self.erp_roi.setPlaceholderText("channel cluster, e.g. Pz, CPz, Cz  (empty = all good "
+                                        "channels)")
+        self.erp_m0 = _spin(-60, 120, 0.3, 0.01, 3, " s")
+        self.erp_m1 = _spin(-60, 120, 0.5, 0.01, 3, " s")
         self.erp_perm = QtWidgets.QSpinBox()
         self.erp_perm.setRange(0, 100000)
         self.erp_perm.setValue(1000)
@@ -166,46 +177,97 @@ class AnalysisTab(QtWidgets.QWidget):
         g.addWidget(self.erp_bl0, 0, 1)
         g.addWidget(QtWidgets.QLabel("to"), 0, 2)
         g.addWidget(self.erp_bl1, 0, 3)
-        g.addWidget(QtWidgets.QLabel("ROI"), 0, 4)
-        g.addWidget(self.erp_roi, 0, 5, 1, 3)
-        g.addWidget(QtWidgets.QLabel("measure window"), 1, 0)
-        g.addWidget(self.erp_m0, 1, 1)
-        g.addWidget(QtWidgets.QLabel("to"), 1, 2)
-        g.addWidget(self.erp_m1, 1, 3)
-        g.addWidget(QtWidgets.QLabel("cluster test"), 1, 4)
-        g.addWidget(self.erp_perm, 1, 5)
-        g.addWidget(self.erp_spatial, 1, 6)
-        g.addWidget(self.erp_post, 1, 7)
-        g.setColumnStretch(5, 1)
+        g.addWidget(QtWidgets.QLabel("cluster permutation test"), 0, 4)
+        g.addWidget(self.erp_perm, 0, 5)
+        g.addWidget(self.erp_spatial, 0, 6)
+        g.addWidget(self.erp_post, 0, 7)
+        g.addWidget(QtWidgets.QLabel("component"), 1, 0)
+        g.addWidget(self.erp_comp, 1, 1)
+        g.addWidget(self.erp_pol, 1, 2, 1, 2)
+        g.addWidget(QtWidgets.QLabel("window"), 1, 4)
+        wr = QtWidgets.QHBoxLayout()
+        wr.addWidget(self.erp_m0)
+        wr.addWidget(QtWidgets.QLabel("to"))
+        wr.addWidget(self.erp_m1)
+        g.addLayout(wr, 1, 5)
+        g.addWidget(QtWidgets.QLabel("channels"), 1, 6)
+        g.addWidget(self.erp_roi, 1, 7)
+        g.setColumnStretch(7, 1)
         lay.addLayout(g)
+        self.erp_comp.currentTextChanged.connect(self._apply_component_preset)
+        for sig in (self.erp_m0.valueChanged, self.erp_m1.valueChanged,
+                    self.erp_pol.currentIndexChanged, self.erp_roi.textEdited):
+            sig.connect(self._component_edited)
+
         row = QtWidgets.QHBoxLayout()
         b = QtWidgets.QPushButton("Compute ERP ▶")
+        b.setObjectName("Primary")
         b.clicked.connect(lambda: self.compute_erp())
         row.addWidget(b)
         for label, fn in (("Compare evokeds (MNE)…", self.erp_compare),
                           ("Joint plot (MNE)…", self.erp_joint),
-                          ("Topomaps in window (MNE)…", self.erp_topo),
+                          ("Topomaps (MNE)…", self.erp_topo),
                           ("Export…", self.erp_export)):
             bb = QtWidgets.QPushButton(label)
             bb.clicked.connect(fn)
             row.addWidget(bb)
         row.addStretch()
+        row.addWidget(QtWidgets.QLabel("show"))
+        self.erp_view = QtWidgets.QComboBox()
+        self.erp_view.addItems(["Cluster mean", "Single channel", "GFP", "Butterfly"])
+        self.erp_view.currentTextChanged.connect(lambda *_: self._plot_erp())
+        row.addWidget(self.erp_view)
+        self.erp_chan = QtWidgets.QComboBox()
+        self.erp_chan.setMinimumWidth(70)
+        self.erp_chan.currentTextChanged.connect(lambda *_: self._plot_erp())
+        row.addWidget(self.erp_chan)
         lay.addLayout(row)
         self.erp_info = hint("")
         lay.addWidget(self.erp_info)
         split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self.erp_plot = _themed_plot(bottom=("Time", "s"), left="Amplitude (µV)")
         self.erp_plot.addLegend()
+        self.erp_plot.scene().sigMouseClicked.connect(self._erp_clicked)
+        self._erp_t = None
         split.addWidget(self.erp_plot)
         tabs = QtWidgets.QTabWidget()
         self.erp_table = QtWidgets.QTableWidget()
         self.erp_clusters = QtWidgets.QTableWidget()
-        tabs.addTab(self.erp_table, "Measures in window")
-        tabs.addTab(self.erp_clusters, "Clusters")
+        self.erp_trials = QtWidgets.QTableWidget()
+        tabs.addTab(self.erp_table, "Component statistics")
+        tabs.addTab(self.erp_clusters, "Cluster test")
+        tabs.addTab(self.erp_trials, "Per epoch")
         split.addWidget(tabs)
-        split.setSizes([520, 200])
+        split.setSizes([500, 220])
         lay.addWidget(split, 1)
         self.tabs.addTab(w, "ERP")
+        self.erp_comp.setCurrentText("P300")
+
+    def _apply_component_preset(self, name: str):
+        comp = E.COMPONENT_PRESETS.get(name)
+        if comp is None:
+            return
+        for wdg in (self.erp_m0, self.erp_m1, self.erp_pol, self.erp_roi):
+            wdg.blockSignals(True)
+        self.erp_m0.setValue(comp.tmin)
+        self.erp_m1.setValue(comp.tmax)
+        self.erp_pol.setCurrentIndex(0 if comp.polarity > 0 else 1)
+        self.erp_roi.setText(", ".join(comp.channels))
+        for wdg in (self.erp_m0, self.erp_m1, self.erp_pol, self.erp_roi):
+            wdg.blockSignals(False)
+
+    def _component_edited(self, *_):
+        if self.erp_comp.currentText() != "Custom":
+            self.erp_comp.blockSignals(True)
+            self.erp_comp.setCurrentText("Custom")
+            self.erp_comp.blockSignals(False)
+
+    def component(self, available: list[str]) -> E.Component:
+        found, _ = parse_channels(self.erp_roi.text(), available)
+        name = self.erp_comp.currentText()
+        return E.Component(name if name != "Custom" else "custom", self.erp_m0.value(),
+                           self.erp_m1.value(), tuple(found or available),
+                           int(self.erp_pol.currentData()))
 
     def _fix_baseline_range(self):
         st = self.pl.epoch_settings
@@ -222,14 +284,18 @@ class AnalysisTab(QtWidgets.QWidget):
         try:
             roi = self._roi(self.erp_roi, first.ch_names)
         except ValueError as e:
-            QtWidgets.QMessageBox.warning(self, "ROI", str(e))
+            QtWidgets.QMessageBox.warning(self, "Channels", str(e))
             return False
         bl = (self.erp_bl0.value(), self.erp_bl1.value()) if self.erp_bl_on.isChecked() else None
         if bl and bl[1] <= bl[0]:
             QtWidgets.QMessageBox.warning(self, "Baseline", "The baseline end must be after "
                                           "its start.")
             return False
-        win = (self.erp_m0.value(), self.erp_m1.value())
+        comp = self.component(list(first.ch_names))
+        if comp.tmax <= comp.tmin:
+            QtWidgets.QMessageBox.warning(self, "Component", "The window must start before it "
+                                          "ends.")
+            return False
         n_perm = self.erp_perm.value()
         spatial = self.erp_spatial.isChecked() and has_positions(first)
         post = self.erp_post.isChecked()
@@ -238,18 +304,12 @@ class AnalysisTab(QtWidgets.QWidget):
             notes = []
             eps = {g: (ep.copy().apply_baseline(bl, verbose="error") if bl else ep)
                    for g, ep in groups.items()}
-            evokeds, sem, per = {}, {}, []
+            evokeds = {}
             for g, ep in eps.items():
                 ev = ep.average()
                 ev.comment = g
                 evokeds[g] = ev
-                sem[g] = _sem(ep.get_data(picks=roi).mean(1)) * 1e6
-                m = E.erp_measures(ep, roi, win)
-                m["group"] = g
-                per.append(m)
-            per = pd.concat(per, ignore_index=True)
-            table = ST.comparison_table(per, [c for c in per.columns if c != "group"],
-                                        list(eps))
+            summary, per = E.component_analysis(eps, comp)
             stats, diff = None, None
             if len(eps) == 2:
                 (la, a), (lb, b) = eps.items()
@@ -263,22 +323,41 @@ class AnalysisTab(QtWidgets.QWidget):
                         stats = E.cluster_contrast(a, b, roi, n_perm,
                                                    tmin=0.0 if post else None, spatial=spatial)
                         if stats.get("excluded"):
-                            notes.append("flat channels left out of the test: "
+                            notes.append("flat channels left out of the cluster test: "
                                          + ", ".join(stats["excluded"]))
                     except Exception as e:  # report, keep the ERPs
-                        notes.append(f"cluster test failed: {e}")
+                        notes.append(f"cluster test: {e}")
             elif n_perm:
-                notes.append("cluster test needs exactly two groups")
-            return dict(evokeds=evokeds, sem=sem, per_epoch=per, table=table, stats=stats,
-                        diff=diff, roi=roi, baseline=bl, window=win, notes=notes)
+                notes.append("the cluster test needs exactly two groups")
+            return dict(eps=eps, evokeds=evokeds, summary=summary, per_epoch=per,
+                        stats=stats, diff=diff, roi=list(comp.channels), comp=comp,
+                        baseline=bl, notes=notes)
 
         def done(res):
             self.erp = res
+            cur = self.erp_chan.currentText()
+            self.erp_chan.blockSignals(True)
+            self.erp_chan.clear()
+            self.erp_chan.addItems(list(next(iter(res["evokeds"].values())).ch_names))
+            if cur:
+                self.erp_chan.setCurrentText(cur)
+            elif res["roi"]:
+                self.erp_chan.setCurrentText(res["roi"][0])
+            self.erp_chan.blockSignals(False)
             self._plot_erp()
             if then:
                 then()
 
         return self.worker.run("Computing ERPs…", job, done)
+
+    def _erp_clicked(self, ev):
+        if self.erp is None or ev.button() != QtCore.Qt.LeftButton:
+            return
+        vb = self.erp_plot.getPlotItem().getViewBox()
+        if not vb.sceneBoundingRect().contains(ev.scenePos()):
+            return
+        self._erp_t = float(vb.mapSceneToView(ev.scenePos()).x())
+        self._plot_erp()
 
     def _plot_erp(self):
         p = self.erp_plot
@@ -289,29 +368,64 @@ class AnalysisTab(QtWidgets.QWidget):
         if r is None:
             self.erp_table.clear()
             return
-        roi = r["roi"]
+        roi, comp, view = r["roi"], r["comp"], self.erp_view.currentText()
+        self.erp_chan.setVisible(view == "Single channel")
+        unit = "Amplitude (µV)"
         for g, ev in r["evokeds"].items():
             t = ev.times
-            y = ev.copy().pick(roi).data.mean(0) * 1e6
-            lo = p.plot(t, y - r["sem"][g], pen=None)
-            hi = p.plot(t, y + r["sem"][g], pen=None)
+            col = self._color(g)
+            if view == "GFP":
+                p.plot(t, ev.data.std(0) * 1e6, pen=pg.mkPen(col, width=2.2), name=g)
+                unit = "GFP (µV)"
+                continue
+            if view == "Butterfly":
+                for k, ch in enumerate(ev.ch_names):
+                    c = p.plot(t, ev.data[k] * 1e6, pen=pg.mkPen(self._color(g, 70)))
+                    c.setToolTip(f"{g}: {ch}")
+                p.plot(t, ev.data.std(0) * 1e6, pen=pg.mkPen(col, width=2.4),
+                       name=f"{g} (GFP)")
+                continue
+            chans = [self.erp_chan.currentText()] if view == "Single channel" and \
+                self.erp_chan.currentText() in ev.ch_names else roi
+            y = ev.copy().pick(chans).data.mean(0) * 1e6
+            x = r["eps"][g].get_data(picks=chans).mean(1) * 1e6
+            sem = _sem(x)
+            lo = p.plot(t, y - sem, pen=None)
+            hi = p.plot(t, y + sem, pen=None)
             p.addItem(pg.FillBetweenItem(lo, hi, brush=self._color(g, 50)))
-            p.plot(t, y, pen=pg.mkPen(self._color(g), width=2.2), name=f"{g} (n={ev.nave})")
-        if r["diff"] is not None:
-            d = r["diff"].copy().pick(roi).data.mean(0) * 1e6
+            p.plot(t, y, pen=pg.mkPen(col, width=2.2), name=f"{g} (n={ev.nave})")
+            if view == "Cluster mean":
+                row = r["summary"][r["summary"]["group"] == g]
+                if len(row):
+                    p.plot([row["peak latency ms"].iloc[0] / 1000], [row["peak µV"].iloc[0]],
+                           pen=None, symbol="o", symbolSize=9, symbolBrush=col,
+                           symbolPen=pg.mkPen(THEME.fg))
+        if r["diff"] is not None and view in ("Cluster mean", "Single channel"):
+            chans = [self.erp_chan.currentText()] if view == "Single channel" and \
+                self.erp_chan.currentText() in r["diff"].ch_names else roi
+            d = r["diff"].copy().pick(chans).data.mean(0) * 1e6
             p.plot(r["diff"].times, d, pen=pg.mkPen(THEME.fg, width=1.5,
                                                      style=QtCore.Qt.DashLine),
                    name=r["diff"].comment)
+        p.setLabel("left", unit)
         p.addItem(pg.InfiniteLine(0, angle=90, pen=pg.mkPen(THEME.muted)))
         if r["baseline"]:
             reg = pg.LinearRegionItem(r["baseline"], movable=False,
                                       brush=THEME.rgba("muted", 35), pen=pg.mkPen(None))
             reg.setZValue(-30)
             p.addItem(reg)
-        reg = pg.LinearRegionItem(r["window"], movable=False, brush=THEME.s(3, 30),
+        reg = pg.LinearRegionItem((comp.tmin, comp.tmax), movable=False, brush=THEME.s(3, 30),
                                   pen=pg.mkPen(THEME.s(3, 120)))
         reg.setZValue(-25)
         p.addItem(reg)
+        if self._erp_t is not None:
+            cur = pg.InfiniteLine(self._erp_t, angle=90, movable=True,
+                                  pen=pg.mkPen(THEME.accent, width=1.5),
+                                  label=f"{self._erp_t * 1000:.0f} ms",
+                                  labelOpts={"color": THEME.accent, "position": 0.95})
+            cur.sigPositionChangeFinished.connect(
+                lambda line: setattr(self, "_erp_t", float(line.value())))
+            p.addItem(cur)
         rows = []
         st = r["stats"]
         if st:
@@ -330,18 +444,30 @@ class AnalysisTab(QtWidgets.QWidget):
                     p.addItem(reg)
             if rows:
                 fill_table(self.erp_clusters, pd.DataFrame(rows).sort_values("p"), fmt="{:.4g}")
-        fill_table(self.erp_table, r["table"], fmt="{:.4g}")
+        fill_table(self.erp_table, r["summary"], fmt="{:.4g}")
+        fill_table(self.erp_trials, r["per_epoch"].iloc[:5000], fmt="{:.4g}")
         sig = sum(1 for x in rows if x["p"] < 0.05)
-        roi_txt = "all good channels" if len(roi) == len(next(iter(r["evokeds"].values())).ch_names) \
-            else ", ".join(roi)
         test = ""
         if st:
-            test = (f"  ·  {'spatio-temporal' if st['spatial'] else 'ROI'} cluster test: "
-                    f"{len(st['p_values'])} clusters, {sig} with p < 0.05")
+            test = (f"  ·  {'spatio-temporal' if st['spatial'] else 'cluster-mean'} permutation "
+                    f"test: {len(st['p_values'])} clusters, {sig} with p < 0.05")
         bl = f"{r['baseline'][0]:g}…{r['baseline'][1]:g} s" if r["baseline"] else "none"
-        self.erp_info.setText(f"ROI: {roi_txt}  ·  baseline {bl}  ·  measures in "
-                              f"{r['window'][0]:g}…{r['window'][1]:g} s{test}"
-                              + ("\n" + "; ".join(r["notes"]) if r["notes"] else ""))
+        sm = r["summary"]
+        welch = ""
+        if "p" in sm and sm["p"].notna().any():
+            last = sm.iloc[-1]
+            if "Welch t" in sm and pd.notna(last.get("Welch t")):
+                welch = (f"  ·  window mean {last['group']}: Δ = {last['window mean µV']:.2f} µV, "
+                         f"Welch t({last['df']:.1f}) = {last['Welch t']:.2f}, "
+                         f"p = {last['p']:.3g}")
+        self.erp_info.setText(
+            f"{comp.name} {comp.tmin * 1000:.0f}–{comp.tmax * 1000:.0f} ms, "
+            f"{'positive' if comp.polarity > 0 else 'negative'} peak, cluster "
+            f"{'+'.join(roi) if len(roi) <= 8 else f'{len(roi)} channels'}  ·  baseline {bl}"
+            f"{welch}{test}  ·  click the plot to set a latency for the topomaps"
+            + ("\n" + "; ".join(r["notes"]) if r["notes"] else "")
+            + "\nTrials are the observations: single-subject statistics, valid if the window "
+              "was chosen before looking at the data.")
 
     def erp_compare(self):
         r = self.erp
@@ -362,13 +488,16 @@ class AnalysisTab(QtWidgets.QWidget):
         ev = r["diff"] if r["diff"] is not None else next(iter(r["evokeds"].values()))
         try:
             if has_positions(ev):
-                ev.plot_joint(title=ev.comment, show=True)
+                times = [self._erp_t] if self._erp_t is not None else "peaks"
+                ev.plot_joint(times=times, title=ev.comment, show=True)
             else:
                 ev.plot(gfp=True, show=True)
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Joint plot", str(e))
 
     def erp_topo(self):
+        """Scalp maps of every group (and A − B) at the clicked latency (±10 ms) or
+        over the component window."""
         r = self.erp
         if r is None:
             return
@@ -379,7 +508,12 @@ class AnalysisTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.information(self, "Topomaps", NO_POS)
             return
         import matplotlib.pyplot as plt
-        t0, t1 = r["window"]
+        if self._erp_t is not None:
+            t0, t1 = self._erp_t - 0.01, self._erp_t + 0.01
+            what = f"{self._erp_t * 1000:.0f} ms (±10 ms)"
+        else:
+            t0, t1 = r["comp"].tmin, r["comp"].tmax
+            what = f"{r['comp'].name} window {t0 * 1000:.0f}–{t1 * 1000:.0f} ms"
         fig, axes = plt.subplots(1, len(evs), figsize=(3 * len(evs), 3.2), squeeze=False)
         data = {g: ev.copy().crop(t0, t1).data.mean(1) * 1e6 for g, ev in evs.items()}
         lim = max(np.nanmax(np.abs(v)) for v in data.values())
@@ -387,7 +521,7 @@ class AnalysisTab(QtWidgets.QWidget):
             mne.viz.plot_topomap(data[g], ev.info, axes=ax, show=False, vlim=(-lim, lim),
                                  cmap="RdBu_r", contours=4)
             ax.set_title(g, fontsize=10)
-        fig.suptitle(f"Mean amplitude {t0:g}…{t1:g} s (±{lim:.1f} µV)")
+        fig.suptitle(f"Mean amplitude at {what} (±{lim:.1f} µV)")
         plt.show()
 
     def erp_export(self):
@@ -400,8 +534,8 @@ class AnalysisTab(QtWidgets.QWidget):
         out = Path(d)
         evs = list(r["evokeds"].values()) + ([r["diff"]] if r["diff"] is not None else [])
         mne.write_evokeds(out / "erp-ave.fif", evs, overwrite=True, verbose="error")
-        r["table"].to_csv(out / "erp_measures_comparison.csv", index=False)
-        r["per_epoch"].to_csv(out / "erp_measures_per_epoch.csv", index=False)
+        r["summary"].to_csv(out / "erp_component_summary.csv", index=False)
+        r["per_epoch"].to_csv(out / "erp_component_per_epoch.csv", index=False)
         if r["stats"]:
             st = r["stats"]
             rows = []
@@ -411,9 +545,10 @@ class AnalysisTab(QtWidgets.QWidget):
                     rows.append({"cluster": k + 1, "tmin": st["times"][tm][0],
                                  "tmax": st["times"][tm][-1], "p": pv})
             pd.DataFrame(rows).to_csv(out / "erp_clusters.csv", index=False)
-        self._write_provenance(out / "erp.txt", {"ROI": ", ".join(r["roi"]),
-                                                 "baseline": r["baseline"],
-                                                 "measure window": r["window"]})
+        c = r["comp"]
+        self._write_provenance(out / "erp.txt", {
+            "component": f"{c.name} {c.tmin:g}–{c.tmax:g} s, polarity {c.polarity:+d}",
+            "channels": ", ".join(c.channels), "baseline": r["baseline"]})
 
     def _write_provenance(self, path: Path, extra: dict):
         lines = [f"preprocessing: {self.pl.params.describe()}",

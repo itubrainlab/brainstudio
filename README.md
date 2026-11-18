@@ -36,6 +36,32 @@ opens it. `uv run brainstudio-demo OUTDIR` writes it to a folder of your choice.
 
 You can attach a separate eye-tracking file to a loaded recording (**File ▸ Attach eye-tracking file**).
 
+**Several files at once**:
+* What you can load: select several XDF files, several EDF/BDF/… files, or several runs
+  in the BIDS tree (**Load selected runs together**).
+* How they are joined: end to end into one recording.
+  * EEG is joined with `mne.concatenate_raws` on the channels all files share.
+  * Sampling rates of the same amplifier that differ by under 0.1 % are aligned;
+    others are resampled.
+  * `BAD boundary` annotations keep epochs from spanning two files.
+  * Gaze and markers are shifted accordingly.
+* Tags: every event carries the `subject`, `session`, `bids_task`, `acq`, `run` and
+  `file` of its file. They come from the BIDS dataset, or are parsed from BIDS-style file
+  names such as `sub-01_ses-2_task-x_run-003_eeg.xdf`. They are kept as text, so filter
+  with `run == "003"`.
+
+**Trigger channel** (Dataset dock, for any recording with EEG; opened automatically for
+EDF/BDF files when a channel looks like a trigger):
+* Pick the channel: `TRIG`, BioSemi `Status`, …
+* Choose the mode:
+  * *integer codes*: the reader's unit scaling is undone, values are rounded, and
+    `mne.find_events` is run, with an optional bit mask;
+  * *pulses*: for analog channels such as a photodiode.
+* **Find events**, then tick the codes and name them; codes with the same name are
+  pooled.
+* **Add as events** puts them into the event table, and optionally re-types the channel
+  as `stim` so it leaves the EEG.
+
 ### Time alignment
 Everything lives on one time base: t = 0 is the first EEG sample.
 
@@ -100,8 +126,9 @@ Three main tabs:
          robust-z outlier. Tick or untick channels by hand. Bad channels are left out of
          ICA, the average reference, epochs and statistics, or interpolated with
          spherical splines.
-       * *Filtering & reference*: high-pass, low-pass, notch; keep, average, one
-         channel, or the mean of several (`M1, M2`).
+       * *Filtering & reference*: high-pass (down to 0 Hz = off; below 0.5 Hz a
+         zero-phase 4th-order Butterworth), low-pass, notch; reference: keep, average,
+         one channel, or the mean of several (`M1, M2`).
        * *ICA blink removal* (`mne.preprocessing.ICA`, picard):
          * Fitted on a ≥ 1 Hz copy of the good channels.
          * Components are scored against the eye tracker's blinks, using a
@@ -118,18 +145,32 @@ Three main tabs:
        * Set the epoch start and end around each event, peak-to-peak and flat
          rejection, optionally drop epochs containing an eye-tracker blink, and cap the
          epochs per group.
-       * Shows a summary (selected, outside, rejected, kept) and a timeline of where
-         each group's events fall.
+       * **EEG delay** (±500 ms) corrects a recording lag between events and EEG.
+       * **Recordings**: tick the subjects, sessions, runs, tasks or files whose events
+         are used. Events from files without an entity are listed as *(none)*.
+       * Shows a summary (selected, outside, rejected, kept, and *which channels caused
+         rejections*), a timeline of where each group's events fall, and the current
+         group's events with every column.
        * Save one `-epo.fif` per group.
        * Epochs are *not* baseline-corrected here. Each analysis picks its own baseline.
     3. **Analysis** of the ticked groups:
-       * *ERP*:
+       * *ERP* (component analysis as in the lab's Rhino ERP):
          * Baseline = a window **before the event** (e.g. −0.2…0 s).
-         * ROI waveforms ± SEM; with two groups, the A − B difference and a cluster
-           permutation test, on the ROI or spatio-temporal (`mne.stats`).
-         * Mean and peak amplitude and peak latency in a measurement window, compared
-           across groups.
-         * MNE compare-evokeds, joint plots and topomaps.
+         * **Component** presets (P1, N1, N170, P2, N2, MMN, P300, N400, LPP) set the
+           time window, polarity and channel cluster. These are conventional starting
+           points; any edit makes it *Custom*.
+         * Component statistics per group:
+           * window mean amplitude ± SEM on the cluster mean;
+           * peak amplitude and latency of the average ERP (`Evoked.get_peak`);
+           * with two groups: a two-sided Welch t-test (t, df, p), Mann-Whitney U,
+             Hedges' g and the peak-latency difference;
+           * with more groups: a one-way ANOVA.
+         * Trials are the observations: these are single-subject statistics.
+         * Plots: cluster mean ± SEM with peaks marked, single channel, GFP or
+           butterfly. With two groups, the A − B difference and a cluster permutation
+           test (`mne.stats`), on the cluster mean or spatio-temporal.
+         * Click the plot to set a latency for the topomaps and joint plot.
+         * MNE compare-evokeds, joint plots and topomaps; CSV/FIF export.
        * *Band power*:
          * Editable bands. Power in a window of the epoch from `Epochs.compute_psd`
            (Welch or multitaper).

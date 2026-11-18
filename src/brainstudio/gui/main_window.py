@@ -264,8 +264,17 @@ class MainWindow(QtWidgets.QMainWindow):
         lay = inner
         self.tree = QtWidgets.QTreeWidget()
         self.tree.setHeaderLabels(["Recording"])
+        self.tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.tree.itemActivated.connect(self._tree_activated)
+        self.tree.itemSelectionChanged.connect(self._tree_selection)
         lay.addWidget(self.tree, 2)
+        self.btn_runs = QtWidgets.QPushButton("Load selected runs together")
+        self.btn_runs.setToolTip("Select several BIDS runs (⌘/Ctrl- or Shift-click) and load "
+                                 "them as one recording; events keep their subject, session "
+                                 "and run")
+        self.btn_runs.clicked.connect(self._load_selected_runs)
+        self.btn_runs.setVisible(False)
+        lay.addWidget(self.btn_runs)
 
         # --- streams of a multi-stream file (XDF) and the role each one plays
         self.streams_box = QtWidgets.QGroupBox("Streams")
@@ -302,6 +311,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sv.addLayout(row)
         self.streams_box.setVisible(False)
         lay.addWidget(self.streams_box, 2)
+        lay.addWidget(self._build_trigger_box())
         self.info = QtWidgets.QPlainTextEdit()
         self.info.setReadOnly(True)
         self.info.setMaximumHeight(150)
@@ -461,11 +471,38 @@ class MainWindow(QtWidgets.QMainWindow):
             self.open_bids(d)
 
     def action_open_file(self):
-        fn, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open recording", "",
+        fns, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Open recording(s) — select several files to combine them", "",
             "Recordings (*.xdf *.xdfz *.vhdr *.edf *.bdf *.set *.fif *.asc);;All files (*)")
-        if fn:
-            self.open_file(fn)
+        if len(fns) == 1:
+            self.open_file(fns[0])
+        elif fns:
+            self.open_files(fns)
+
+    def open_files(self, paths, roles_by_name=None, options_by_name=None):
+        """Several files joined into one recording (one segment per file)."""
+        paths = [Path(p) for p in paths]
+        if self.worker.busy:
+            QtWidgets.QMessageBox.information(self, "Busy", "Wait for the running "
+                                              "computation to finish.")
+            return
+        try:
+            with self._busy(f"Loading {len(paths)} files…"):
+                rec = bio.load_many(paths, self.screen_size(), roles_by_name, options_by_name)
+        except Exception as e:
+            self._error("Could not load the files", e)
+            return
+        self.tree.clear()
+        self.bids_root = None
+        self.btn_runs.setVisible(False)
+        top = QtWidgets.QTreeWidgetItem(self.tree, [f"{len(paths)} files combined"])
+        for seg in rec.segments:
+            ent = "  ".join(f"{k}-{seg[k]}" for k in ("subject", "session", "run") if seg.get(k))
+            it = QtWidgets.QTreeWidgetItem(top, [f"{seg.get('file', '')}"
+                                                 + (f"   ({ent})" if ent else "")])
+            it.setToolTip(0, f"starts at {seg['start']:.1f} s on the combined time base")
+        self.tree.expandAll()
+        self.set_recording(rec)
 
     def action_attach_gaze(self):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -515,7 +552,9 @@ class MainWindow(QtWidgets.QMainWindow):
             item.setToolTip(0, "\n".join(str(p) for p in [run.eeg, *run.gaze] if p))
         self.tree.expandAll()
         self.left_dock.show()
-        self.statusBar().showMessage(f"{len(runs)} runs found in {root}. Double-click to load.")
+        self._tree_selection()
+        self.statusBar().showMessage(f"{len(runs)} runs found in {root}. Double-click a run to "
+                                     "load it, or select several and load them together.")
         if len(runs) == 1:
             self.load_run(runs[0])
 
@@ -524,10 +563,44 @@ class MainWindow(QtWidgets.QMainWindow):
         if run is not None:
             self.load_run(run)
 
+    def _selected_runs(self):
+        runs = []
+        for it in self.tree.selectedItems():
+            stack = [it]
+            while stack:  # a subject/session node selects all its runs
+                node = stack.pop()
+                run = node.data(0, QtCore.Qt.UserRole)
+                if run is not None and run not in runs:
+                    runs.append(run)
+                stack.extend(node.child(i) for i in range(node.childCount()))
+        return runs
+
+    def _tree_selection(self):
+        n = len(self._selected_runs()) if self.bids_root is not None else 0
+        self.btn_runs.setVisible(self.bids_root is not None)
+        self.btn_runs.setEnabled(n >= 1)
+        self.btn_runs.setText(f"Load {n} selected runs together" if n > 1
+                              else "Load selected run")
+
+    def _load_selected_runs(self):
+        runs = self._selected_runs()
+        if not runs:
+            return
+        if len(runs) == 1:
+            self.load_run(runs[0])
+            return
+        try:
+            with self._busy(f"Loading {len(runs)} runs…"):
+                rec = bio.load_bids_runs(self.bids_root, runs, self.screen_size_or_none())
+        except Exception as e:
+            self._error("Could not load the runs", e)
+            return
+        self.set_recording(rec)
+
     def load_run(self, run):
         try:
             with self._busy(f"Loading {run.label}…"):
-                rec = bio.load_bids_run(self.bids_root, run, self.screen_size_or_none())
+                rec = bio.load_bids_runs(self.bids_root, [run], self.screen_size_or_none())
         except Exception as e:
             self._error("Could not load run", e)
             return
@@ -549,6 +622,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._error("Could not load file", e)
             return
         self.tree.clear()
+        self.bids_root = None
+        self.btn_runs.setVisible(False)
         QtWidgets.QTreeWidgetItem(self.tree, [path.name])
         self.set_recording(rec)
 
@@ -588,6 +663,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.detect_gaze_events()
         self.info.setPlainText(rec.summary() + ("\n" + rec.description if rec.description else ""))
         self._fill_streams()
+        self._fill_trigger_channels()
         self._refresh_events()
         self._rebuild_event_table()
         self.gaze_tab.update_gaze_stats()
@@ -618,6 +694,157 @@ class MainWindow(QtWidgets.QMainWindow):
         self.eeg_plot.set_data(data, raw.times, names, types, raw.info["bads"])
         self.n_chan.setMaximum(max(len(names), 1))
         self.eeg_plot.set_visible_channels(min(self.n_chan.value(), len(names)))
+
+    # ================================================================== trigger channel
+    def _build_trigger_box(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("Trigger channel → events")
+        box.setCheckable(True)
+        box.setChecked(False)
+        box.setToolTip("Turn the codes on a trigger channel (EDF/BDF TRIG, Status, …) "
+                       "into events")
+        v = QtWidgets.QVBoxLayout(box)
+        inner = QtWidgets.QWidget()
+        iv = QtWidgets.QVBoxLayout(inner)
+        iv.setContentsMargins(0, 0, 0, 0)
+        box.toggled.connect(inner.setVisible)
+        inner.setVisible(False)
+        g = QtWidgets.QGridLayout()
+        self.trig_ch = QtWidgets.QComboBox()
+        self.trig_mode = QtWidgets.QComboBox()
+        self.trig_mode.addItem("integer codes", "codes")
+        self.trig_mode.addItem("pulses (threshold)", "threshold")
+        self.trig_mode.setToolTip("codes: the channel holds trigger values (EDF/BDF); pulses: "
+                                  "an analog channel such as a photodiode, each pulse = 1")
+        self.trig_mask = QtWidgets.QSpinBox()
+        self.trig_mask.setRange(0, 0xFFFFFF)
+        self.trig_mask.setSpecialValueText("all bits")
+        self.trig_mask.setToolTip("Bit mask applied to the codes (e.g. 255 keeps the lower "
+                                  "8 bits of a BioSemi Status channel)")
+        g.addWidget(QtWidgets.QLabel("channel"), 0, 0)
+        g.addWidget(self.trig_ch, 0, 1, 1, 3)
+        g.addWidget(QtWidgets.QLabel("mode"), 1, 0)
+        g.addWidget(self.trig_mode, 1, 1)
+        g.addWidget(QtWidgets.QLabel("mask"), 1, 2)
+        g.addWidget(self.trig_mask, 1, 3)
+        iv.addLayout(g)
+        find = QtWidgets.QPushButton("Find events")
+        find.clicked.connect(self._find_trigger_events)
+        iv.addWidget(find)
+        self.trig_table = QtWidgets.QTableWidget(0, 3)
+        self.trig_table.setHorizontalHeaderLabels(["code", "count", "name (editable)"])
+        self.trig_table.verticalHeader().setVisible(False)
+        self.trig_table.horizontalHeader().setStretchLastSection(True)
+        self.trig_table.setMaximumHeight(150)
+        iv.addWidget(self.trig_table)
+        self.trig_stim = QtWidgets.QCheckBox("Leave the trigger channel out of the EEG "
+                                             "(type stim)")
+        self.trig_stim.setChecked(True)
+        iv.addWidget(self.trig_stim)
+        row = QtWidgets.QHBoxLayout()
+        add = QtWidgets.QPushButton("Add as events")
+        add.setObjectName("Primary")
+        add.setToolTip("Ticked codes become events named as in the table (codes with the same "
+                       "name are pooled); replaces earlier trigger events")
+        add.clicked.connect(self._add_trigger_events)
+        rm = QtWidgets.QPushButton("Remove")
+        rm.setToolTip("Remove the events made from the trigger channel")
+        rm.clicked.connect(lambda: self._set_trigger_events(None))
+        row.addWidget(add, 1)
+        row.addWidget(rm)
+        iv.addLayout(row)
+        v.addWidget(inner)
+        self.trigger_box = box
+        self._trig_found = None
+        return box
+
+    def _fill_trigger_channels(self):
+        raw = self.rec.raw if self.rec is not None else None
+        self.trigger_box.setVisible(raw is not None)
+        self.trig_ch.clear()
+        self.trig_table.setRowCount(0)
+        self._trig_found = None
+        if raw is None:
+            return
+        self.trig_ch.addItems(raw.ch_names)
+        guess = E.guess_trigger_channel(raw)
+        if guess:
+            self.trig_ch.setCurrentText(guess)
+            if not self.rec.streams:  # EDF/BDF/…: open the box when a trigger is likely
+                self.trigger_box.setChecked(True)
+
+    def _find_trigger_events(self):
+        if self.rec is None or self.rec.raw is None:
+            return
+        ch = self.trig_ch.currentText()
+        try:
+            found = E.trigger_codes(self.rec.raw, ch, self.trig_mask.value() or None,
+                                    self.trig_mode.currentData())
+        except Exception as e:
+            self._error("Trigger channel", e)
+            return
+        self._trig_found = (ch, found)
+        counts = found["code"].value_counts().sort_index()
+        t = self.trig_table
+        t.setRowCount(len(counts))
+        for i, (code, n) in enumerate(counts.items()):
+            c = QtWidgets.QTableWidgetItem(str(code))
+            c.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
+            c.setCheckState(QtCore.Qt.Checked)
+            c.setData(QtCore.Qt.UserRole, int(code))
+            t.setItem(i, 0, c)
+            k = QtWidgets.QTableWidgetItem(str(n))
+            k.setFlags(QtCore.Qt.ItemIsEnabled)
+            t.setItem(i, 1, k)
+            t.setItem(i, 2, QtWidgets.QTableWidgetItem(f"trigger_{code}"))
+        t.resizeColumnsToContents()
+        self.statusBar().showMessage(f"{len(found)} trigger events, {len(counts)} codes on "
+                                     f"{ch}", 8000)
+
+    def _add_trigger_events(self):
+        if self._trig_found is None:
+            self._find_trigger_events()
+        if self._trig_found is None:
+            return
+        ch, found = self._trig_found
+        names = {}
+        for i in range(self.trig_table.rowCount()):
+            it = self.trig_table.item(i, 0)
+            if it.checkState() == QtCore.Qt.Checked:
+                names[it.data(QtCore.Qt.UserRole)] = \
+                    self.trig_table.item(i, 2).text().strip() or f"trigger_{it.text()}"
+        sel = found[found["code"].isin(names)]
+        ev = pd.DataFrame({"onset": sel["onset"].to_numpy(float), "duration": 0.0,
+                           "description": [f"{names[c]}|trigger_code={c}|trigger_channel={ch}"
+                                           for c in sel["code"]]})
+        self._set_trigger_events(ev)
+        if self.trig_stim.isChecked() and \
+                self.rec.raw.get_channel_types([ch])[0] != "stim":
+            self.rec.raw.set_channel_types({ch: "stim"}, verbose="error")
+            self.pipeline.params.bads = [b for b in self.pipeline.params.bads if b != ch]
+            self.pipeline.invalidate_ica()
+            self.pre_tab._stats = None
+            self.pre_tab.refresh_channels()
+            self.pre_tab.refresh_reference_choices()
+            self.pre_tab._fill_ica_table()
+            self.display_raw = self.rec.raw
+            self._load_eeg_plot()
+            self.pipeline.mark_stale("preprocessing")
+            self.pre_tab.run()
+
+    def _set_trigger_events(self, ev):
+        if self.rec is None:
+            return
+        old = self.rec.events
+        keep = ~old["description"].astype(str).str.contains("|trigger_code=", regex=False)
+        parts = [old[keep]] + ([ev] if ev is not None and len(ev) else [])
+        self.rec.events = pd.concat(parts, ignore_index=True).sort_values(
+            "onset", ignore_index=True)
+        self._refresh_events()
+        self._rebuild_event_table()
+        self.info.setPlainText(self.rec.summary() + ("\n" + self.rec.description
+                                                     if self.rec.description else ""))
+        n = 0 if ev is None else len(ev)
+        self.statusBar().showMessage(f"{n} trigger events in the event table", 6000)
 
     # ================================================================== streams
     def _fill_streams(self):
@@ -726,6 +953,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
         # options only apply to the role they were made for
         opts = {k: o for k, o in self._stream_opts.items() if o}
+        if len(self.rec.sources) > 1:  # several files: the same settings by stream name
+            name = {s["key"]: s["name"] for s in self.rec.streams}
+            self.open_files(self.rec.sources, {name[k]: r for k, r in roles.items()},
+                            {name[k]: o for k, o in opts.items()} or None)
+            return
         self.open_file(self.rec.source, roles=roles, options=opts or None)
 
     # ================================================================== pipeline

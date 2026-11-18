@@ -1,6 +1,7 @@
 """Tests on synthetic data (BIDS + XDF round trips, gaze detection, FRPs)."""
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from brainstudio import eeg as E
@@ -347,3 +348,103 @@ def test_multicolumn_markers_pair_and_keep_every_column(tmp_path):
     assert "emotion" in tab2 and "response" not in tab2 and "trials_end" not in set(tab2.name)
     # phase inheritance from events with a duration; "fixation" is not a *_ON phase
     assert EV._START.match("fixation") is None
+
+
+def test_load_many_xdf_with_entities(demo, tmp_path):
+    """Several files → one recording; events carry subject/session/run from file names."""
+    import shutil
+
+    from brainstudio import events as EV
+    from brainstudio.io import entities_from_path, load_many
+    a = tmp_path / "sub-01_ses-1_task-free_run-01_eeg.xdf"
+    b = tmp_path / "sub-01_ses-2_task-free_run-02_eeg.xdf"
+    shutil.copy(demo / "demo.xdf", a)
+    shutil.copy(demo / "demo.xdf", b)
+    assert entities_from_path(b) == {"subject": "01", "session": "2", "bids_task": "free",
+                                     "run": "02", "file": b.name}
+    one = load_xdf(a)
+    rec = load_many([a, b])
+    assert rec.raw.n_times == 2 * one.raw.n_times
+    assert "BAD boundary" in set(rec.raw.annotations.description)
+    assert len(rec.segments) == 2 and rec.segments[1]["start"] == pytest.approx(
+        one.raw.n_times / one.raw.info["sfreq"])
+    tab = EV.build_event_table(rec)
+    stim = tab[tab.name == "stimulus"]
+    assert set(stim.session) == {"1", "2"} and set(stim.run) == {"01", "02"}  # text kept
+    assert (stim.session == "2").sum() == (stim.session == "1").sum()
+    assert rec.gaze.times[-1] > rec.segments[1]["start"]
+
+
+def test_trigger_channel_codes_and_mask():
+    import mne
+    sf = 250
+    n = sf * 20
+    data = np.random.default_rng(0).normal(0, 1e-5, (2, n))
+    trig = np.zeros(n)
+    for t, c in [(2, 1), (5, 2), (8, 1), (11, 3), (14, 258)]:
+        trig[int(t * sf):int(t * sf) + 5] = c
+    raw = mne.io.RawArray(np.vstack([data, trig * 1e-6]),
+                          mne.create_info(["Fz", "Cz", "TRIG"], sf, "eeg"), verbose="error")
+    raw._orig_units = {"TRIG": "uV"}        # as EDF readers keep it
+    assert E.guess_trigger_channel(raw) == "TRIG"
+    ev = E.trigger_codes(raw, "TRIG")
+    assert ev.code.tolist() == [1, 2, 1, 3, 258]
+    assert ev.onset.tolist() == pytest.approx([2, 5, 8, 11, 14])
+    assert E.trigger_codes(raw, "TRIG", mask=255).code.tolist() == [1, 2, 1, 3, 2]
+    assert E.trigger_codes(raw, "TRIG", mode="threshold").onset.tolist() == pytest.approx([14])
+
+
+def test_component_statistics_p300(demo):
+    """Rhino-style component analysis finds the simulated P300 (stimulus vs fixation)."""
+    from brainstudio import epoching as EP
+    from brainstudio import events as EV
+    rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
+    ev = G.detect_events(rec.gaze)
+    raw = E.preprocess(rec.raw, E.FilterParams(0.1, 30))
+    tab = EV.build_event_table(rec, ev)
+    eps, summ = EP.build_group_epochs(
+        raw, {"stim": tab[tab.name == "stimulus"], "fix": tab[tab.name == "fixation"].iloc[::4]},
+        EP.EpochSettings(-0.2, 0.8, None, delay_ms=0))
+    assert "rejected by" in summ
+    eps = {g: e.copy().apply_baseline((-0.2, 0)) for g, e in eps.items()}
+    comp = E.COMPONENT_PRESETS["P300"]
+    s, per = E.component_analysis(eps, comp)
+    stim = s[s.group == "stim"].iloc[0]
+    assert 250 <= stim["peak latency ms"] <= 500 and stim["peak µV"] > 0
+    diff = s.iloc[-1]
+    assert diff["group"] == "stim − fix" and diff["p"] < 0.01 and diff["window mean µV"] > 0
+    assert set(per.group) == {"stim", "fix"} and len(per) == sum(len(e) for e in eps.values())
+    with pytest.raises(ValueError, match="None of"):
+        E.component_analysis(eps, E.Component("x", 0.1, 0.2, ("Nope",), 1))
+
+
+def test_two_edfs_with_trigger_channel(tmp_path):
+    """EDF files joined; a trigger channel becomes events with session/run columns."""
+    import mne
+
+    from brainstudio import events as EV
+    from brainstudio.io import load_many
+    sf = 256
+    paths = []
+    for ses in ("1", "2"):
+        n = sf * 30
+        data = np.random.default_rng(int(ses)).normal(0, 5e-6, (3, n))
+        trig = np.zeros(n)
+        for k, t in enumerate(np.arange(2, 28, 3)):
+            trig[int(t * sf):int(t * sf) + 10] = 1 + k % 2
+        raw = mne.io.RawArray(np.vstack([data, trig]),
+                              mne.create_info(["Fz", "Cz", "Pz", "TRIG"], sf,
+                                              ["eeg", "eeg", "eeg", "misc"]), verbose="error")
+        p = tmp_path / f"sub-07_ses-{ses}_task-odd_run-1_eeg.edf"
+        mne.export.export_raw(p, raw, fmt="edf", physical_range=(-1, 3), overwrite=True,
+                              verbose="error")
+        paths.append(p)
+    rec = load_many(paths)
+    assert rec.raw.times[-1] == pytest.approx(60, abs=0.1)
+    ev = E.trigger_codes(rec.raw, "TRIG")
+    assert len(ev) == 18 and set(ev.code) == {1, 2}
+    rec.events = pd.DataFrame({"onset": ev.onset, "duration": 0.0,
+                               "description": [f"code{c}|trigger_code={c}" for c in ev.code]})
+    tab = EV.build_event_table(rec)
+    t1 = tab[tab.name == "code1"]
+    assert sorted(set(t1.session)) == ["1", "2"] and len(t1) == 10

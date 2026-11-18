@@ -31,6 +31,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "edfio" },
     { name = "pyflakes" },
     { name = "pytest" },
 ]
@@ -53,6 +54,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "edfio", specifier = ">=0.4.18" },
     { name = "pyflakes", specifier = ">=4.1.0" },
     { name = "pytest", specifier = ">=9.2.0" },
 ]
@@ -311,6 +313,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/60/8b/32f9823da46cde7df2087faa08cd98d01b908f8dcab982cdba9c84e85355/decorator-5.3.1.tar.gz", hash = "sha256:4cbcdd55a6efadb9dbea26b858f4fb3264567b52d69ca0d25b721b553f60ea82", size = 58084, upload-time = "2026-05-18T06:03:28.057Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/05/7f/798705f5296a58ca505d600456748d1be48078eac8a7050d8a98bc9edb89/decorator-5.3.1-py3-none-any.whl", hash = "sha256:f47fe6fdbd2edd623ecfe36875d37aba411624e2670dd395dddae1358689bb3c", size = 10365, upload-time = "2026-05-18T06:03:26.517Z" },
+]
+
+[[package]]
+name = "edfio"
+version = "0.4.18"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/70/a7/a17605d671d18f45d274235e4d5ae04d8a7c4298817079a3cd75aadc095b/edfio-0.4.18.tar.gz", hash = "sha256:d3bb8bf44966b38499646d4fcd37d8edbfa174ce14f92b6389e6f1fbb101968e", size = 28793, upload-time = "2026-10-01T07:40:35.938Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/01/90/e5c48bbc186630d2a925a2507b60b66fb2efd33fb28254babb43f75b73b1/edfio-0.4.18-py3-none-any.whl", hash = "sha256:6987fcb8d58314ef0d9716bc042bceb005abd4730cdd6ef2d3307d4191a8c6ab", size = 31865, upload-time = "2026-10-01T07:40:34.874Z" },
 ]
 
 [[package]]

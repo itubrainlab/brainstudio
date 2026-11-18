@@ -427,3 +427,157 @@ def evoked_peak(evoked: mne.Evoked, roi: list[str], window: tuple[float, float],
     i = int(np.argmax(y) if polarity == "pos" else np.argmin(y) if polarity == "neg"
             else np.argmax(np.abs(y)))
     return float(t[i]), float(y[i])
+
+
+# =========================================================================== trigger channel
+TRIGGER_WORDS = ("trig", "status", "marker", "event", "stim", "sti ")
+_UNIT_BACK = {"uV": 1e6, "µV": 1e6, "μV": 1e6, "mV": 1e3, "nV": 1e9, "V": 1.0}
+
+
+def guess_trigger_channel(raw: mne.io.BaseRaw) -> str | None:
+    """A stim channel, else one named like a trigger (TRIG, Status, …), else None."""
+    stims = [raw.ch_names[i] for i in mne.pick_types(raw.info, stim=True)]
+    if stims:
+        return stims[0]
+    return next((c for c in raw.ch_names if any(w in c.lower() + " " for w in TRIGGER_WORDS)),
+                None)
+
+
+def trigger_codes(raw: mne.io.BaseRaw, channel: str, mask: int | None = None,
+                  mode: str = "codes") -> pd.DataFrame:
+    """Events on a trigger channel: onset (s) and code.
+
+    ``mode="codes"``: the channel holds integer codes (EDF/BDF trigger or
+    Status channels). The reader's unit scaling is undone and values rounded,
+    then ``mne.find_events`` reports every change to a non-zero code (an
+    optional bit ``mask`` keeps only some bits). ``mode="threshold"``: an
+    analog pulse channel (e.g. photodiode) is binarised half-way between its
+    resting level (median) and its pulse extreme, and each pulse onset is code 1.
+    """
+    if channel not in raw.ch_names:
+        raise ValueError(f"No channel named {channel!r}")
+    x = raw.get_data(picks=[channel])[0]
+    if mode == "threshold":
+        base = float(np.median(x))  # pulses are rare: the median is the resting level
+        up, down = float(x.max()) - base, base - float(x.min())
+        if max(up, down) <= 0:
+            raise ValueError(f"{channel} is flat")
+        thr = base + up / 2 if up >= down else base - down / 2  # positive or negative pulses
+        data = ((x > thr) if up >= down else (x < thr)).astype(float)
+    else:
+        is_stim = raw.get_channel_types([channel])[0] == "stim"
+        unit = getattr(raw, "_orig_units", {}).get(channel, "V")
+        data = np.round(x * (1.0 if is_stim else _UNIT_BACK.get(unit, 1.0)))
+    info = mne.create_info(["TRIG"], raw.info["sfreq"], "stim")
+    trig = mne.io.RawArray(data[None], info, first_samp=raw.first_samp, verbose="error")
+    ev = mne.find_events(trig, stim_channel="TRIG", shortest_event=1, consecutive=True,
+                         initial_event=True, mask=mask or None, mask_type="and",
+                         verbose="error")
+    onsets = (ev[:, 0] - raw.first_samp) / raw.info["sfreq"]
+    return pd.DataFrame({"onset": onsets, "code": ev[:, 2].astype(int)})
+
+
+# =========================================================================== ERP components
+@dataclass
+class Component:
+    """An ERP component: time window, channel cluster and polarity."""
+    name: str
+    tmin: float
+    tmax: float
+    channels: tuple[str, ...]
+    polarity: int  # +1 positive-going (peak = maximum), -1 negative-going
+
+
+#: Conventional windows and sites (starting points: they depend on paradigm and
+#: population). The same set as the lab's Rhino ERP.
+COMPONENT_PRESETS = {
+    "P1": Component("P1", 0.08, 0.13, ("O1", "O2", "Oz", "PO7", "PO8"), +1),
+    "N1": Component("N1", 0.08, 0.15, ("Fz", "FCz", "Cz"), -1),
+    "N170": Component("N170", 0.13, 0.20, ("PO7", "PO8", "P7", "P8"), -1),
+    "P2": Component("P2", 0.15, 0.25, ("Fz", "FCz", "Cz"), +1),
+    "N2": Component("N2", 0.20, 0.35, ("Fz", "FCz", "Cz"), -1),
+    "MMN": Component("MMN", 0.10, 0.25, ("Fz", "FCz", "Cz"), -1),
+    "P300": Component("P300", 0.25, 0.50, ("Pz", "CPz", "Cz"), +1),
+    "N400": Component("N400", 0.30, 0.50, ("Cz", "CPz", "Pz"), -1),
+    "LPP": Component("LPP", 0.40, 0.80, ("Pz", "CPz", "Cz"), +1),
+}
+
+
+def component_analysis(groups: dict[str, mne.BaseEpochs], comp: Component
+                       ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Measure ``comp`` in every group (epochs already baseline-corrected).
+
+    Per epoch: mean amplitude in the window on the channel-cluster mean (µV).
+    Per group: n, window mean ± SEM, and peak amplitude/latency of the average
+    ERP (``Evoked.get_peak`` on the cluster mean, in the component's polarity).
+    With two groups the window means are compared with a two-sided Welch t-test
+    (plus Mann-Whitney U and Hedges' g) and the peak latencies are subtracted.
+
+    Returns (summary table, per-epoch table).
+    """
+    from scipy import stats as sst
+
+    from . import stats as ST
+
+    if comp.tmin >= comp.tmax:
+        raise ValueError("The component window must start before it ends")
+    first = next(iter(groups.values()))
+    chans = [c for c in comp.channels if c in first.ch_names]
+    if not chans:
+        raise ValueError(f"None of {', '.join(comp.channels)} are among the epoch channels "
+                         "(renamed, or marked bad?)")
+    rows, per = [], []
+    vals = {}
+    for g, ep in groups.items():
+        m = (ep.times >= comp.tmin) & (ep.times <= comp.tmax)
+        if not m.any():
+            raise ValueError("The component window lies outside the epochs")
+        x = ep.get_data(picks=chans).mean(1) * 1e6
+        amps = x[:, m].mean(1)
+        vals[g] = amps
+        roi = mne.channels.combine_channels(
+            ep.average(), {"roi": [ep.ch_names.index(c) for c in chans]}, method="mean",
+            verbose="error")
+        _, lat, amp = roi.get_peak(tmin=comp.tmin, tmax=comp.tmax,
+                                   mode="neg" if comp.polarity < 0 else "pos",
+                                   return_amplitude=True, strict=False)
+        n = len(amps)
+        rows.append({"group": g, "n": n, "window mean µV": float(amps.mean()),
+                     "sem": float(amps.std(ddof=1) / np.sqrt(n)) if n > 1 else np.nan,
+                     "peak µV": float(amp) * 1e6, "peak latency ms": float(lat) * 1000})
+        per.append(pd.DataFrame({"group": g, "onset": ep.metadata["onset"].to_numpy(float)
+                                 if ep.metadata is not None and "onset" in ep.metadata
+                                 else np.nan, "window mean µV": amps}))
+    summary = pd.DataFrame(rows)
+    if len(groups) == 2:
+        (ga, a), (gb, b) = vals.items()
+        if min(len(a), len(b)) >= 2:
+            w = sst.ttest_ind(a, b, equal_var=False)
+            u = sst.mannwhitneyu(a, b, alternative="two-sided")
+            la, lb = summary["peak latency ms"]
+            pa, pb = summary["peak µV"]
+            summary = pd.concat([summary, pd.DataFrame([{
+                "group": f"{ga} − {gb}", "n": np.nan,
+                "window mean µV": float(a.mean() - b.mean()), "sem": np.nan,
+                "peak µV": pa - pb, "peak latency ms": la - lb,
+                "Welch t": float(w.statistic), "df": float(w.df), "p": float(w.pvalue),
+                "p (Mann-Whitney)": float(u.pvalue), "hedges g": ST.hedges_g(a, b)}])],
+                ignore_index=True)
+    elif len(groups) > 2:
+        f = sst.f_oneway(*[v for v in vals.values() if len(v) >= 2])
+        summary = pd.concat([summary, pd.DataFrame([{
+            "group": "all groups", "ANOVA F": float(f.statistic), "p": float(f.pvalue)}])],
+            ignore_index=True)
+    summary.insert(0, "component", f"{comp.name} {comp.tmin * 1000:.0f}–{comp.tmax * 1000:.0f} ms "
+                   f"{'+' if comp.polarity > 0 else '−'} @ {'+'.join(chans)}")
+    return summary, pd.concat(per, ignore_index=True)
+
+
+def rejection_causes(epochs: mne.BaseEpochs) -> dict[str, int]:
+    """How many epochs each channel caused to be rejected, worst first."""
+    counts: dict[str, int] = {}
+    for reasons in epochs.drop_log:
+        for r in reasons:
+            if r in epochs.ch_names:
+                counts[r] = counts.get(r, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: -kv[1]))

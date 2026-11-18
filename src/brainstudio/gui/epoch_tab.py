@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
@@ -72,9 +73,13 @@ class EpochTab(QtWidgets.QWidget):
         self.max_ep.setRange(10, 1_000_000)
         self.max_ep.setValue(st.max_epochs)
         self.max_ep.setToolTip("Random, reproducible subsample above this many events per group")
+        self.delay = _spin(-500, 500, 0, 1, 0, " ms")
+        self.delay.setToolTip("EEG recording delay: a positive value means the EEG lags the "
+                              "events (e.g. wireless amplifiers), so epochs are cut later")
         for i, (lab, w) in enumerate((("start", self.tmin), ("end", self.tmax),
                                       ("reject ptp >", self.reject), ("flat <", self.flat),
-                                      ("max epochs / group", self.max_ep))):
+                                      ("max epochs / group", self.max_ep),
+                                      ("EEG delay", self.delay))):
             g.addWidget(QtWidgets.QLabel(lab), i // 2, 2 * (i % 2))
             g.addWidget(w, i // 2, 2 * (i % 2) + 1)
         g.addWidget(self.blinks, 3, 0, 1, 4)
@@ -82,6 +87,15 @@ class EpochTab(QtWidgets.QWidget):
                          "band-power baseline are chosen in Analysis. Make epochs long "
                          "enough for both (e.g. −0.5…2 s for band power)."), 4, 0, 1, 4)
         rv.addWidget(box)
+
+        # recordings: subject / session / run / task / file of each event
+        self.rec_box = QtWidgets.QGroupBox("Recordings — use events from")
+        rl = QtWidgets.QHBoxLayout(self.rec_box)
+        rl.setContentsMargins(6, 4, 6, 4)
+        self._rec_lists: dict[str, QtWidgets.QListWidget] = {}
+        self._rec_layout = rl
+        self.rec_box.setVisible(False)
+        rv.addWidget(self.rec_box)
         row = QtWidgets.QHBoxLayout()
         for label, fn in (("Drop log (MNE)…", self.plot_drop_log),
                           ("Browse epochs (MNE)…", self.plot_epochs),
@@ -123,6 +137,7 @@ class EpochTab(QtWidgets.QWidget):
         for w in (self.tmin, self.tmax, self.reject, self.flat):
             w.valueChanged.connect(lambda *_: self.pl.mark_stale("epoching"))
         self.max_ep.valueChanged.connect(lambda *_: self.pl.mark_stale("epoching"))
+        self.delay.valueChanged.connect(lambda *_: self.pl.mark_stale("epoching"))
         self.blinks.toggled.connect(lambda *_: self.pl.mark_stale("epoching"))
         self.pl.changed.connect(self._on_pipeline)
         self.pl.stateChanged.connect(self._on_state)
@@ -177,7 +192,7 @@ class EpochTab(QtWidgets.QWidget):
         if sel is None:
             return
         try:
-            df = sel.selected()
+            df = self.rows_for(sel)
         except ValueError as e:
             self.rows.clear()
             self.rows.setRowCount(0)
@@ -200,7 +215,7 @@ class EpochTab(QtWidgets.QWidget):
             return
         i = self._selectors.index(sel)
         try:
-            n = len(sel.selected())
+            n = len(self.rows_for(sel))
         except ValueError:
             n = "?"
         item = self.groups.item(i)
@@ -219,10 +234,81 @@ class EpochTab(QtWidgets.QWidget):
         return [s.label() for s in self._selectors]
 
     # ================================================================== pipeline
+    # ================================================================== recordings
+    REC_COLUMNS = (("subject", "subject"), ("session", "session"), ("run", "run"),
+                   ("bids_task", "task"), ("file", "file"))
+
+    def _fill_recordings(self):
+        t = self.pl.event_table
+        # remember what was unticked: values that appear later start ticked
+        unticked = {k: {lst.item(i).data(QtCore.Qt.UserRole) for i in range(lst.count())
+                        if lst.item(i).checkState() != QtCore.Qt.Checked}
+                    for k, lst in self._rec_lists.items()}
+        while self._rec_layout.count():
+            it = self._rec_layout.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        self._rec_lists = {}
+        shown = 0
+        for col, label in self.REC_COLUMNS:
+            if col not in t or not len(t):
+                continue
+            vals = t[col].fillna("").astype(str)
+            counts = vals[vals != ""].value_counts().sort_index()
+            if not len(counts):
+                continue
+            n_none = int((vals == "").sum())
+            if n_none:  # events from files without this entity
+                counts = pd.concat([counts, pd.Series({"": n_none})])
+            w = QtWidgets.QWidget()
+            v = QtWidgets.QVBoxLayout(w)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.addWidget(QtWidgets.QLabel(f"<b>{label}</b>"))
+            lst = QtWidgets.QListWidget()
+            lst.setMaximumHeight(90)
+            for val, n in counts.items():
+                it = QtWidgets.QListWidgetItem(f"{val or '(none)'}  ({n})")
+                it.setData(QtCore.Qt.UserRole, val)
+                it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+                it.setCheckState(QtCore.Qt.Unchecked if val in unticked.get(col, set())
+                                 else QtCore.Qt.Checked)
+                lst.addItem(it)
+            lst.itemChanged.connect(self._recordings_changed)
+            v.addWidget(lst)
+            self._rec_layout.addWidget(w, 1)
+            self._rec_lists[col] = lst
+            shown += 1
+        self.rec_box.setVisible(shown > 0)
+
+    def rec_selection(self, col) -> set[str] | None:
+        lst = self._rec_lists.get(col)
+        if lst is None:
+            return None
+        return {lst.item(i).data(QtCore.Qt.UserRole) for i in range(lst.count())
+                if lst.item(i).checkState() == QtCore.Qt.Checked}
+
+    def rows_for(self, sel: EventSelector):
+        """A group's events, limited to the ticked subjects/sessions/runs/files
+        (raises ValueError for invalid filters)."""
+        df = sel.selected()
+        for col, lst in self._rec_lists.items():
+            keep = self.rec_selection(col)
+            if col in df and keep is not None and lst.count():
+                df = df[df[col].fillna("").astype(str).isin(keep)]
+        return df
+
+    def _recordings_changed(self, *_):
+        for s in self._selectors:
+            self._group_changed(s)
+        self._show_rows()
+
     def _on_pipeline(self, what):
         if what in ("events", "recording"):
             for s in self._selectors:
                 s.set_table(self.pl.event_table)
+            self._fill_recordings()
+            for s in self._selectors:
+                self._group_changed(s)
         if what in ("epoching", "recording"):
             self._show_results()
         self._on_state()
@@ -242,7 +328,8 @@ class EpochTab(QtWidgets.QWidget):
                              reject_uv=self.reject.value() or None,
                              flat_uv=self.flat.value() or None,
                              drop_blinks=self.blinks.isChecked(),
-                             max_epochs=self.max_ep.value())
+                             max_epochs=self.max_ep.value(),
+                             delay_ms=self.delay.value())
 
     def run(self, then=None) -> bool:
         raw = self.pl.eeg_input()
@@ -259,7 +346,7 @@ class EpochTab(QtWidgets.QWidget):
         groups, desc = {}, {}
         for s in self._selectors:
             try:
-                rows = s.selected()
+                rows = self.rows_for(s)
             except ValueError as e:
                 QtWidgets.QMessageBox.warning(self, "Event filter", f"{s.label()}: {e}")
                 return False

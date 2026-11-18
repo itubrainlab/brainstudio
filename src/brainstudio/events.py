@@ -157,7 +157,19 @@ def build_event_table(rec: Recording, gaze_events: GazeEvents | None = None,
         df["phase"] = phase
         for k, arr in cols.items():
             df[k] = arr
-    df = _to_numeric_columns(df, set(attr_cols))
+    # ---- which file / subject / session / run each event comes from
+    seg_cols: list[str] = []
+    if rec is not None and getattr(rec, "segments", None):
+        from .io.multi import segment_columns
+        for k, v in segment_columns(df["onset"].to_numpy(float), rec.segments).items():
+            if k in df:  # an event's own value wins
+                own = df[k]
+                empty = own.isna() | (own.astype(str) == "")
+                df.loc[empty, k] = v[empty.to_numpy()]
+            else:
+                df[k] = v
+            seg_cols.append(k)
+    df = _to_numeric_columns(df, set(attr_cols) - set(seg_cols))  # entities stay text
     order = BASE_COLUMNS + ["phase"] + [c for c in df.columns
                                         if c not in BASE_COLUMNS and c != "phase"]
     return df[order]

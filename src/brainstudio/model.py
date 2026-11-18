@@ -102,6 +102,10 @@ class Recording:
     # Streams of a multi-stream source (XDF): dicts with key, name, type, channels,
     # srate, format, samples, labels, auto_role and role (EEG/gaze/markers/ignore)
     streams: list = field(default_factory=list)
+    # Files the recording is made of: dicts with start/end (s) and BIDS entities
+    # (subject, session, task, acq, run) and file; see brainstudio.io.multi
+    segments: list = field(default_factory=list)
+    sources: list = field(default_factory=list)
 
     @property
     def has_eeg(self) -> bool:

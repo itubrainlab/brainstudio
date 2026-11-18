@@ -23,6 +23,7 @@ class EpochSettings:
     flat_uv: float | None = None      # reject epochs flatter than this
     drop_blinks: bool = False         # drop epochs overlapping an eye-tracker blink
     max_epochs: int | None = 2000     # per group, reproducible random subsample
+    delay_ms: float = 0.0             # EEG recording delay: + moves events later
 
     def describe(self) -> str:
         s = f"{self.tmin:g} … {self.tmax:g} s"
@@ -32,6 +33,8 @@ class EpochSettings:
             s += f", flat < {self.flat_uv:g} µV"
         if self.drop_blinks:
             s += ", no blinks"
+        if self.delay_ms:
+            s += f", EEG delay {self.delay_ms:+g} ms"
         return s
 
 
@@ -63,6 +66,8 @@ def build_group_epochs(raw: mne.io.BaseRaw, groups: dict[str, pd.DataFrame],
     out, rows = {}, []
     for name, table in groups.items():
         tab = table.copy()
+        if settings.delay_ms:  # the EEG lags the events: cut epochs later
+            tab["onset"] = tab["onset"] + settings.delay_ms / 1000.0
         n_sel = len(tab)
         n_blink = 0
         if settings.drop_blinks and blinks is not None and len(tab):
@@ -70,7 +75,7 @@ def build_group_epochs(raw: mne.io.BaseRaw, groups: dict[str, pd.DataFrame],
             n_blink = int(hit.sum())
             tab = tab[~hit]
         row = {"group": name, "selected": n_sel, "blink": n_blink, "outside/dup": 0,
-               "rejected": 0, "kept": 0}
+               "rejected": 0, "kept": 0, "rejected by": ""}
         if len(tab):
             tab = tab.assign(group=name)
             try:
@@ -86,6 +91,8 @@ def build_group_epochs(raw: mne.io.BaseRaw, groups: dict[str, pd.DataFrame],
                 row["outside/dup"] = len(tab) - n_in
                 row["rejected"] = n_in - len(ep)
                 row["kept"] = len(ep)
+                causes = E.rejection_causes(ep)
+                row["rejected by"] = ", ".join(f"{c} ({n})" for c, n in list(causes.items())[:6])
                 if len(ep):
                     out[name] = ep
             else:
