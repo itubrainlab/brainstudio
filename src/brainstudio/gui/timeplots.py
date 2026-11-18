@@ -125,6 +125,7 @@ class EEGPlot(pg.PlotWidget, TimeCursorMixin, EventLinesMixin, GazeOverlayMixin)
         self._init_overlays(self.plotItem)
         self.plotItem.sigXRangeChanged.connect(self._on_xrange)
         self._busy = False
+        self._redraw_pending = False
 
     # ------------------------------------------------------------------ data
     def set_data(self, data: np.ndarray, times: np.ndarray, names, types, bads=()):
@@ -181,6 +182,13 @@ class EEGPlot(pg.PlotWidget, TimeCursorMixin, EventLinesMixin, GazeOverlayMixin)
 
     # ------------------------------------------------------------------ drawing
     def _on_xrange(self, *_):
+        # range changes come in bursts (layout, linked views): redraw once per burst
+        if not self._redraw_pending:
+            self._redraw_pending = True
+            QtCore.QTimer.singleShot(0, self._apply_xrange)
+
+    def _apply_xrange(self):
+        self._redraw_pending = False
         if self._busy:
             return
         self._busy = True

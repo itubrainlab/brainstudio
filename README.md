@@ -205,7 +205,10 @@ Everything lives on one time base: t = 0 is the first EEG sample.
     **WARNING**.
   - Every step is listed in the info panel.
 - **BIDS**: gaze uses the sidecar `StartTime`. Tracker timestamps define the sample times.
-- **Gaze offset** (Controls panel) shifts gaze relative to the EEG by hand.
+- **Gaze offset** (Controls panel) shifts gaze relative to the EEG by hand. Blinks,
+  fixations and saccades are re-detected, and a fitted ICA is rescored against the
+  shifted blinks: the scores, the component view and the blink check all update. Your
+  ticked components stay as they are.
 
 Gaze coordinates are in screen pixels:
 

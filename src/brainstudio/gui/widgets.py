@@ -10,23 +10,46 @@ from PySide6 import QtCore, QtWidgets
 from .theme import THEME
 
 
+def _cell_texts(col: pd.Series, fmt: str) -> list[str]:
+    """One column as display strings (vectorised for numbers and flags)."""
+    v = col.to_numpy()
+    if v.dtype.kind == "b":
+        return np.where(v, "✓", "").tolist()
+    if v.dtype.kind == "f":
+        ok = np.isfinite(v)
+        return [fmt.format(x) if k else "" for x, k in zip(v.tolist(), ok.tolist())]
+    out = []
+    for x in v.tolist():
+        if isinstance(x, (bool, np.bool_)):
+            out.append("✓" if x else "")
+        elif isinstance(x, float):
+            out.append("" if not np.isfinite(x) else fmt.format(x))
+        else:
+            out.append(str(x))
+    return out
+
+
 def fill_table(table: QtWidgets.QTableWidget, df: pd.DataFrame, fmt="{:.3g}"):
-    table.clear()
-    table.setRowCount(len(df))
-    table.setColumnCount(len(df.columns))
-    table.setHorizontalHeaderLabels([str(c) for c in df.columns])
-    for i, row in enumerate(df.itertuples(index=False)):
-        for j, v in enumerate(row):
-            if isinstance(v, (bool, np.bool_)):
-                txt = "✓" if v else ""
-            elif isinstance(v, (float, np.floating)):
-                txt = "" if not np.isfinite(v) else fmt.format(v)
-            else:
-                txt = str(v)
-            item = QtWidgets.QTableWidgetItem(txt)
-            item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
-            table.setItem(i, j, item)
-    table.resizeColumnsToContents()
+    table.setUpdatesEnabled(False)
+    sorting = table.isSortingEnabled()
+    table.setSortingEnabled(False)
+    try:
+        table.clear()
+        table.setRowCount(len(df))
+        table.setColumnCount(len(df.columns))
+        table.setHorizontalHeaderLabels([str(c) for c in df.columns])
+        flags = QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled
+        for j, c in enumerate(df.columns):
+            for i, txt in enumerate(_cell_texts(df.iloc[:, j], fmt)):
+                item = QtWidgets.QTableWidgetItem(txt)
+                item.setFlags(flags)
+                table.setItem(i, j, item)
+        # column widths from the first rows only: measuring thousands of rows is slow
+        table.horizontalHeader().setResizeContentsPrecision(200)
+        table.resizeColumnsToContents()
+    finally:
+        table.setSortingEnabled(sorting)
+        table.setUpdatesEnabled(True)
 
 
 def has_positions(inst) -> bool:

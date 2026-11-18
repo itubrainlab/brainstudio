@@ -187,7 +187,8 @@ class PreprocessTab(QtWidgets.QWidget):
         self.notch.currentTextChanged.connect(stale)
         for w in (self.interp, self.ica_on):
             w.toggled.connect(stale)
-        self.ica_table.itemChanged.connect(stale)
+        self._refilling = False  # rescoring refills the table without changing the choice
+        self.ica_table.itemChanged.connect(lambda *_: None if self._refilling else stale())
         self.ica_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.ica_table.currentCellChanged.connect(lambda r, *_: self.show_component(r))
         self.ica_table.cellClicked.connect(lambda r, *_: self.show_component(r))
@@ -439,7 +440,59 @@ class PreprocessTab(QtWidgets.QWidget):
 
         self.worker.run(f"Fitting ICA ({ip.method}, {ip.n_components} components)…", job, done)
 
-    def _fill_ica_table(self, use_suggested=False):
+    def gaze_events_changed(self):
+        """New eye-tracker blinks (gaze offset or detection settings changed): rescore the
+        ICA components, redo the blink check and redraw the selected component. The
+        ticked components stay as they are."""
+        pl = self.pl
+        if pl.raw is None or (pl.ica is None and pl.clean is None):
+            return
+        if self.worker.busy:  # once the running job is done
+            if not getattr(self, "_rescore_pending", False):
+                self._rescore_pending = True
+
+                def later(busy):
+                    if not busy:
+                        self.worker.busyChanged.disconnect(later)
+                        self._rescore_pending = False
+                        self.gaze_events_changed()
+                self.worker.busyChanged.connect(later)
+            return
+        blinks = pl.gaze_events.blinks if pl.gaze_events is not None else None
+        raw, clean, p, ica, fit_raw = pl.raw, pl.clean, pl.params, pl.ica, pl.ica_fit_raw
+        eog = [raw.ch_names[i] for i in mne.pick_types(raw.info, eog=True)]
+        fp = self._frontal(raw, p.bads)
+
+        def job():
+            scores = (P.score_blink_components(ica, fit_raw, blinks, eog)
+                      if ica is not None and fit_raw is not None else None)
+            bb = ba = None
+            if clean is not None:
+                bb = P.blink_locked_average(P._filtered(raw, p.l_freq, p.h_freq, p.notch,
+                                                        picks=fp) if fp else raw, blinks, fp)
+                ba = P.blink_locked_average(clean, blinks, fp)
+            return scores, bb, ba
+
+        def done(res):
+            scores, bb, ba = res
+            if pl.ica is ica and scores is not None:
+                pl.ica_scores = scores
+                row, ticked = self.ica_table.currentRow(), self.ica_excluded()
+                self._refilling = True
+                try:
+                    self._fill_ica_table(keep=ticked)
+                finally:
+                    self._refilling = False
+                if 0 <= row < self.ica_table.rowCount():
+                    self.ica_table.selectRow(row)
+                    self.show_component(row)
+            if pl.clean is clean and clean is not None:
+                self._blink_before, self._blink_after = bb, ba
+                self._plot_blink()
+
+        self.worker.run("Rescoring ICA against the shifted blinks…", job, done)
+
+    def _fill_ica_table(self, use_suggested=False, keep=None):
         sc = self.pl.ica_scores
         self.ica_table.blockSignals(True)
         self.ica_table.clear()
@@ -453,7 +506,8 @@ class PreprocessTab(QtWidgets.QWidget):
         self.ica_table.setColumnCount(len(cols))
         self.ica_table.setHorizontalHeaderLabels(cols)
         self.ica_table.setRowCount(len(sc))
-        prev = set(self.pl.ica.exclude or []) if self.pl.ica is not None else set()
+        prev = set(keep) if keep is not None else (
+            set(self.pl.ica.exclude or []) if self.pl.ica is not None else set())
         for i, r in enumerate(sc.itertuples()):
             ex = QtWidgets.QTableWidgetItem("")
             ex.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)

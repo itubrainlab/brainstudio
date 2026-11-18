@@ -58,6 +58,28 @@ def _is_marker(stream: dict) -> bool:
     return fmt == "string" or (srate == 0 and int(_info(stream, "channel_count", 1)) == 1)
 
 
+def _numeric_strings_fast(ts, n_ch: int):
+    """Vectorised conversion for the common case (rectangular rows of clean numbers or
+    empty strings): the array, "markers" when the stream is mostly empty, or None when
+    the slower, tolerant conversion is needed."""
+    try:
+        s = np.asarray(ts, dtype=str)
+    except (ValueError, TypeError):
+        return None
+    if s.ndim != 2:
+        return None
+    empty = (s == "") | (s == "None")
+    if not (~empty).any() or (~empty).any(axis=1).mean() < 0.5:
+        return "markers"           # mostly empty: occasional codes = markers
+    try:
+        arr = np.where(empty, "nan", s).astype(np.float64)
+    except ValueError:
+        return None                # some text: let the tolerant path decide
+    n = n_ch or arr.shape[1]
+    return arr[:, :n] if arr.shape[1] >= n else np.pad(arr, ((0, 0), (0, n - arr.shape[1])),
+                                                        constant_values=np.nan)
+
+
 def _numeric_strings(stream: dict, min_fraction: float = 0.9) -> np.ndarray | None:
     """Samples of a string-typed stream as floats, if they are numbers.
 
@@ -69,6 +91,10 @@ def _numeric_strings(stream: dict, min_fraction: float = 0.9) -> np.ndarray | No
     ts = stream["time_series"]
     if not len(ts):
         return None
+    n_ch = int(_info(stream, "channel_count", 0) or 0)
+    fast = _numeric_strings_fast(ts, n_ch)
+    if fast is not None:
+        return fast if not isinstance(fast, str) else None   # "markers" → None
     df = pd.DataFrame(list(ts))
     filled = df.astype(str).apply(lambda c: c.str.strip()).replace({"": np.nan, "None": np.nan})
     num = filled.apply(pd.to_numeric, errors="coerce")

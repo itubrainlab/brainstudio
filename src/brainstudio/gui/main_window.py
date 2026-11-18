@@ -421,7 +421,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_pupil_clean.setChecked(True)
         f.addRow(self.cb_pupil_clean)
         b = QtWidgets.QPushButton("Detect events")
-        b.clicked.connect(self.detect_gaze_events)
+        b.clicked.connect(lambda: self.detect_gaze_events())
         f.addRow(b)
         self.offset = _spin(-10000, 10000, 0, 1, 1, " ms")
         self.offset.setToolTip("Shift gaze relative to EEG (sync correction)")
@@ -491,19 +491,28 @@ class MainWindow(QtWidgets.QMainWindow):
         elif fns:
             self.open_files(fns)
 
-    def open_files(self, paths, roles_by_name=None, options_by_name=None):
-        """Several files joined into one recording (one segment per file)."""
-        paths = [Path(p) for p in paths]
+    def _load_async(self, label: str, load, on_loaded, error_title: str) -> bool:
+        """Read a recording in the background (the window stays responsive and the
+        status bar shows the elapsed time), then show it on the GUI thread."""
         if self.worker.busy:
             QtWidgets.QMessageBox.information(self, "Busy", "Wait for the running "
                                               "computation to finish.")
-            return
-        try:
-            with self._busy(f"Loading {len(paths)} files…"):
-                rec = bio.load_many(paths, self.screen_size(), roles_by_name, options_by_name)
-        except Exception as e:
-            self._error("Could not load the files", e)
-            return
+            return False
+
+        def failed(msg):
+            QtWidgets.QMessageBox.critical(self, error_title, msg)
+
+        return self.worker.run(label, load, on_loaded, failed)
+
+    def open_files(self, paths, roles_by_name=None, options_by_name=None):
+        """Several files joined into one recording (one segment per file)."""
+        paths = [Path(p) for p in paths]
+        size = self.screen_size()
+        self._load_async(f"Loading {len(paths)} files…",
+                         lambda: bio.load_many(paths, size, roles_by_name, options_by_name),
+                         lambda rec: self._show_files(paths, rec), "Could not load the files")
+
+    def _show_files(self, paths, rec):
         self.tree.clear()
         self.bids_root = None
         self.btn_runs.setVisible(False)
@@ -600,43 +609,33 @@ class MainWindow(QtWidgets.QMainWindow):
         if len(runs) == 1:
             self.load_run(runs[0])
             return
-        try:
-            with self._busy(f"Loading {len(runs)} runs…"):
-                rec = bio.load_bids_runs(self.bids_root, runs, self.screen_size_or_none())
-        except Exception as e:
-            self._error("Could not load the runs", e)
-            return
-        self.set_recording(rec)
+        root, size = self.bids_root, self.screen_size_or_none()
+        self._load_async(f"Loading {len(runs)} runs…",
+                         lambda: bio.load_bids_runs(root, runs, size), self.set_recording,
+                         "Could not load the runs")
 
     def load_run(self, run):
-        try:
-            with self._busy(f"Loading {run.label}…"):
-                rec = bio.load_bids_runs(self.bids_root, [run], self.screen_size_or_none())
-        except Exception as e:
-            self._error("Could not load run", e)
-            return
-        self.set_recording(rec)
+        root, size = self.bids_root, self.screen_size_or_none()
+        self._load_async(f"Loading {run.label}…", lambda: bio.load_bids_runs(root, [run], size),
+                         self.set_recording, "Could not load run")
 
     def open_file(self, path, roles=None, options=None):
         path = Path(path)
         if path.is_dir():
             self.open_bids(path)
             return
-        if self.worker.busy:
-            QtWidgets.QMessageBox.information(self, "Busy", "Wait for the running "
-                                              "computation to finish.")
-            return
-        try:
-            with self._busy(f"Loading {path.name}…"):
-                rec = bio.load(path, self.screen_size(), roles=roles, options=options)
-        except Exception as e:
-            self._error("Could not load file", e)
-            return
-        self.tree.clear()
-        self.bids_root = None
-        self.btn_runs.setVisible(False)
-        QtWidgets.QTreeWidgetItem(self.tree, [path.name])
-        self.set_recording(rec)
+        size = self.screen_size()
+
+        def show(rec):
+            self.tree.clear()
+            self.bids_root = None
+            self.btn_runs.setVisible(False)
+            QtWidgets.QTreeWidgetItem(self.tree, [path.name])
+            self.set_recording(rec)
+
+        self._load_async(f"Loading {path.name}…",
+                         lambda: bio.load(path, size, roles=roles, options=options), show,
+                         "Could not load file")
 
     def screen_size(self):
         return (self.scr_w.value(), self.scr_h.value())
@@ -646,6 +645,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ================================================================== state
     def set_recording(self, rec: Recording):
+        # one repaint at the end instead of one per table/plot/layout change
+        self.setUpdatesEnabled(False)
+        try:
+            self._set_recording(rec)
+        finally:
+            self.setUpdatesEnabled(True)
+
+    def _set_recording(self, rec: Recording):
         self.stop_play()
         self.rec = rec
         self._raw_gaze = rec.gaze
@@ -671,8 +678,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.topo.set_raw(self.display_raw)
         self.gaze_plot.set_gaze(rec.gaze)
         self._update_gaze_visibility()
-        if rec.has_gaze:
-            self.detect_gaze_events()
+        if rec.has_gaze:  # the event table is built once, below
+            self.detect_gaze_events(rebuild=False)
         self.info.setPlainText(rec.summary() + ("\n" + rec.description if rec.description else ""))
         self._fill_streams()
         self._fill_trigger_channels()
@@ -1054,7 +1061,7 @@ class MainWindow(QtWidgets.QMainWindow):
             fix_max_dist=self.p_fix_dist.value(), fix_min_dur=self.p_fix_dur.value(),
             sac_vel_thresh=self.p_sac_vel.value(), sac_min_dur=self.p_sac_dur.value())
 
-    def detect_gaze_events(self):
+    def detect_gaze_events(self, rebuild: bool = True):
         if self.rec is None or not self.rec.has_gaze:
             return
         with self._busy("Detecting fixations, saccades and blinks…"):
@@ -1068,8 +1075,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gaze_plot.gaze_events = self.gaze_events
         self._overlay_toggled()
         self._heat_toggled()
-        self.gaze_tab.update_gaze_stats()
-        self._rebuild_event_table()
+        if rebuild:
+            self.gaze_tab.update_gaze_stats()
+            self._rebuild_event_table()
+            self.pre_tab.gaze_events_changed()  # ICA scores and blink check use the blinks
         self._update_screen()
         self._update_ribbon()
 
@@ -1367,7 +1376,6 @@ class MainWindow(QtWidgets.QMainWindow):
         def __enter__(self):
             self.win.statusBar().showMessage(self.msg)
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-            QtWidgets.QApplication.processEvents()
 
         def __exit__(self, *exc):
             QtWidgets.QApplication.restoreOverrideCursor()
