@@ -167,6 +167,13 @@ QScrollArea, QScrollArea > QWidget > QWidget {{ background: transparent; }}
 #BrandSub {{ color: {MUTED}; font-size: 16px; }}
 #Toolbar QLabel#ProjectName {{ color: {TEXT}; font-weight: 600; }}
 #Divider {{ background: rgba(255,255,255,40); }}
+#SidePanel {{ background: {WINDOW}; }}
+QLabel#PanelTitle {{
+    padding: 5px 8px; color: {TEXT};
+    background-color: qlineargradient(x1:0, y1:1, x2:0, y2:0,
+        stop:0 rgba(10,10,10,220), stop:1 rgba(25,25,25,200));
+    border: 1px solid rgba(0,0,0,230); border-bottom: 2px solid rgba(0,0,0,255);
+}}
 #Ribbon {{ background: {DARK}; border-bottom: 1px solid rgba(0,0,0,200); }}
 #Ribbon QToolButton {{ color: #d0d0d0; padding: 4px 2px; font-size: 11px; }}
 #Ribbon QToolButton:hover {{ background: rgba(255,255,255,24); color: {TEXT}; }}

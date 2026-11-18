@@ -54,8 +54,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._build_toolbar()
         self._build_central()
-        self._build_left_dock()
-        self._build_right_dock()
+        self._build_dataset_panel()
+        self._build_controls_panel()
         self._build_menu()
         self.play_timer = QtCore.QTimer(self)
         self.play_timer.setInterval(40)
@@ -65,7 +65,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline.changed.connect(self._on_pipeline)
         self.pipeline.stateChanged.connect(self._update_pipeline_titles)
         self._update_pipeline_titles()
-        self._docks_shown = None  # dock visibility saved while away from the Viewer
         self._apply_theme()
         hints = QtGui.QGuiApplication.styleHints()
         if hasattr(hints, "colorSchemeChanged"):  # Qt >= 6.5: follow system light/dark
@@ -112,13 +111,6 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addWidget(w)
         self.addToolBar(QtCore.Qt.TopToolBarArea, bar)
         self.toolbar = bar
-
-    @staticmethod
-    def _fix_dock(dock: QtWidgets.QDockWidget):
-        """Viewer docks cannot be closed (they still move, float and resize)."""
-        dock.setFeatures(QtWidgets.QDockWidget.DockWidgetMovable |
-                         QtWidgets.QDockWidget.DockWidgetFloatable)
-        dock.toggleViewAction().setVisible(False)
 
     def _show_shortcuts(self):
         QtWidgets.QMessageBox.information(
@@ -193,6 +185,7 @@ class MainWindow(QtWidgets.QMainWindow):
         right.addWidget(self.topo)
         right.setSizes([420, 380])
         h = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.data_split = h  # Dataset panel | viewer | screen & topomap | Controls panel
         h.addWidget(left)
         h.addWidget(right)
         h.setSizes([1000, 560])
@@ -221,7 +214,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.gaze_tab = GazeTab(self)
         self.tabs = QtWidgets.QTabWidget()
-        self.tabs.addTab(h, "Viewer")
+        self.tabs.addTab(h, "Data")
         self.tabs.addTab(eeg, "EEG")
         self.tabs.addTab(self.gaze_tab, "Gaze")
         self.tabs.currentChanged.connect(self._on_tab)
@@ -260,9 +253,21 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addStretch()
         return row
 
-    def _build_left_dock(self):
-        dock = QtWidgets.QDockWidget("Dataset", self)
-        dock.setObjectName("dataset")
+    def _side_panel(self, title: str, body: QtWidgets.QWidget, min_width: int) -> QtWidgets.QWidget:
+        """A titled side panel of the Data tab (part of its splitter, cannot be closed)."""
+        panel = QtWidgets.QFrame()
+        panel.setObjectName("SidePanel")
+        v = QtWidgets.QVBoxLayout(panel)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        head = QtWidgets.QLabel(title)
+        head.setObjectName("PanelTitle")
+        v.addWidget(head)
+        v.addWidget(body, 1)
+        panel.setMinimumWidth(min_width)
+        return panel
+
+    def _build_dataset_panel(self):
         w = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(w)
         lay.setContentsMargins(0, 0, 0, 4)
@@ -306,7 +311,7 @@ class MainWindow(QtWidgets.QMainWindow):
                        "or columns is used (double-click a stream)")
         det.clicked.connect(lambda: self._stream_details(self.stream_table.currentRow()))
         row.addWidget(det)
-        self.btn_roles = QtWidgets.QPushButton("Reload with these settings")
+        self.btn_roles = QtWidgets.QPushButton("Reload")
         self.btn_roles.setObjectName("Primary")
         self.btn_roles.setToolTip("Reload the file with the roles and stream settings chosen "
                                   "here (resets montage and pipeline results)")
@@ -329,16 +334,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.event_table = QtWidgets.QTableWidget()
         self.event_table.cellDoubleClicked.connect(self._event_jump)
         lay.addWidget(self.event_table, 2)
-        dock.setWidget(w)
-        w.setMinimumWidth(330)
-        self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, dock)
-        self.left_dock = dock
-        self._fix_dock(dock)
+        self.left_panel = self._side_panel("Dataset", w, 330)
+        self.data_split.insertWidget(0, self.left_panel)
         self._update_ribbon()
 
-    def _build_right_dock(self):
-        dock = QtWidgets.QDockWidget("Controls", self)
-        dock.setObjectName("controls")
+    def _build_controls_panel(self):
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         w = QtWidgets.QWidget()
@@ -441,10 +441,12 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(box)
         lay.addStretch()
         scroll.setWidget(w)
-        dock.setWidget(scroll)
-        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
-        self.right_dock = dock
-        self._fix_dock(dock)
+        self.right_panel = self._side_panel("Controls", scroll, 280)
+        self.data_split.addWidget(self.right_panel)
+        self.data_split.setStretchFactor(1, 1)
+        self.data_split.setSizes([360, 820, 470, 300])
+        for k in range(self.data_split.count()):
+            self.data_split.setCollapsible(k, False)
 
     def _build_menu(self):
         m = self.menuBar().addMenu("&File")
@@ -561,7 +563,6 @@ class MainWindow(QtWidgets.QMainWindow):
             item.setData(0, QtCore.Qt.UserRole, run)
             item.setToolTip(0, "\n".join(str(p) for p in [run.eeg, *run.gaze] if p))
         self.tree.expandAll()
-        self.left_dock.show()
         self._tree_selection()
         self.statusBar().showMessage(f"{len(runs)} runs found in {root}. Double-click a run to "
                                      "load it, or select several and load them together.")
@@ -946,8 +947,8 @@ class MainWindow(QtWidgets.QMainWindow):
         combo.blockSignals(False)
         self._roles_edited()
         if self.btn_roles.isEnabled():
-            self.statusBar().showMessage("Stream settings changed — press “Reload with these "
-                                         "settings” to apply them.", 8000)
+            self.statusBar().showMessage("Stream settings changed — press “Reload” in the "
+                                         "Streams box to apply them.", 8000)
 
     def _auto_stream_roles(self):
         if self.rec is None:
@@ -1067,7 +1068,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fill_event_list()
 
     def _fill_event_list(self):
-        """Dataset dock: the markers with every column they carry."""
+        """Dataset panel: the markers with every column they carry."""
         df = self.event_df
         m = df[df["kind"] == "marker"] if len(df) else df
         cols = ["onset", "name", "duration", "phase"] + [
@@ -1259,16 +1260,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_tab(self, i):
         if self.tabs.widget(i) is self.gaze_tab:
             self.gaze_tab.update_aoi_stats()
-        # the Dataset and Controls docks belong to the Viewer tab
-        viewer = i == 0
-        if not viewer and self._docks_shown is None:
-            self._docks_shown = {d: d.isVisible() for d in (self.left_dock, self.right_dock)}
-            for d in self._docks_shown:
-                d.hide()
-        elif viewer and self._docks_shown is not None:
-            for d, was in self._docks_shown.items():
-                d.setVisible(was)
-            self._docks_shown = None
+
 
     def _event_jump(self, row, _col):
         try:

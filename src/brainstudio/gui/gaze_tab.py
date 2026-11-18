@@ -42,7 +42,7 @@ class GazeTab(QtWidgets.QWidget):
         b2.addLayout(row)
         self.aoi_table = QtWidgets.QTableWidget()
         b2.addWidget(self.aoi_table)
-        b2.addWidget(hint("AOIs are drawn in the Viewer's screen view: drag/resize them there, "
+        b2.addWidget(hint("AOIs are drawn in the Data tab's screen view: drag/resize them there, "
                           "right-click to remove. Fixations get an ‘aoi’ column usable in "
                           "event filters (EEG ▸ Epoching)."))
         top.addWidget(box2, 1)

@@ -50,7 +50,7 @@ You can attach a separate eye-tracking file to a loaded recording (**File ▸ At
   names such as `sub-01_ses-2_task-x_run-003_eeg.xdf`. They are kept as text, so filter
   with `run == "003"`.
 
-**Trigger channel** (Dataset dock, for any recording with EEG; opened automatically for
+**Trigger channel** (Dataset panel, for any recording with EEG; opened automatically for
 EDF/BDF files when a channel looks like a trigger):
 * Pick the channel: `TRIG`, BioSemi `Status`, …
 * Choose the mode:
@@ -91,24 +91,23 @@ BrainStudio is styled like the lab's other app, brAInStream:
 
 The style sheet is BrainStudio's own; no g.Pype files are used.
 
-The **Dataset** and **Controls** docks belong to the Viewer tab: they are hidden on the
-EEG and Gaze tabs and cannot be closed (they can be moved, floated and resized).
+The **Data** tab holds the **Dataset** panel (left), the viewer, and the **Controls**
+panel (right); the panels are resizable parts of the tab, not separate windows.
 
-**Dataset dock** (left):
+**Dataset panel** (left of the Data tab):
 * a **ribbon** of buttons for the File menu's functions: BIDS, File, Eye data, Montage,
   Stimulus, Export, Snapshot;
 * the recording tree;
 * for XDF files, a **Streams** table. It lists every stream with its channels and rate
   and the **role** it plays: *EEG*, *gaze*, *markers* or *ignore*. Roles are picked
-  automatically. To change them, pick another role and press **Reload with these
-  roles**. **Automatic** goes back to the automatic roles. At most one stream can be
+  automatically. To change them, pick another role and press **Reload**. **Automatic** goes back to the automatic roles. At most one stream can be
   EEG and one gaze; hover a stream to see its channel labels.
 
 Three main tabs:
 
-* **Viewer**
+* **Data** (Dataset panel, viewer, Controls panel)
   * It shows the preprocessed EEG by default: only EEG-type channels, without the
-    channels marked bad in ① Preprocessing. Switch to raw in the Controls dock to see all
+    channels marked bad in ① Preprocessing. Switch to raw in the Controls panel to see all
     EEG channels, with bad ones greyed. EOG/ECG/EMG/misc/stim channels are not drawn.
   * Without gaze data the eye-tracking views (gaze/pupil plots, screen view, Gaze tab,
     gaze controls) are hidden.
@@ -202,7 +201,7 @@ Three main tabs:
   * fixation-duration and amplitude histograms, main sequence
   * per-AOI fixation count, dwell time and time to first fixation, computed with
     `pygaze.plugins.aoi.AOI` (CSV export)
-* **Controls dock**: viewer options, which EEG to display (preprocessed or raw),
+* **Controls panel** (right of the Data tab): viewer options, which EEG to display (preprocessed or raw),
   gaze-detection parameters, gaze offset, screen size. "Open in MNE browser" adds blinks
   and saccades as annotations.
 
