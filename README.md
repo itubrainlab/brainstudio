@@ -1,4 +1,4 @@
-# BrainStudio
+# brAInStudio
 
 <img src="src/brainstudio/resources/brainstudio.svg" alt="BrainStudio icon" width="96" align="right">
 
