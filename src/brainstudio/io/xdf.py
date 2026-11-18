@@ -62,8 +62,9 @@ def _numeric_strings(stream: dict, min_fraction: float = 0.9) -> np.ndarray | No
     """Samples of a string-typed stream as floats, if they are numbers.
 
     Some LSL apps (e.g. Gazepoint's) send numeric samples as text. Returns a
-    (samples, channels) float array when at least ``min_fraction`` of the
-    non-empty values parse as numbers, else None.
+    (samples, channels) float array when at least half the samples carry values
+    and at least ``min_fraction`` of the non-empty values parse as numbers, else
+    None (a mostly empty stream with occasional codes stays a marker stream).
     """
     ts = stream["time_series"]
     if not len(ts):
@@ -73,6 +74,8 @@ def _numeric_strings(stream: dict, min_fraction: float = 0.9) -> np.ndarray | No
     num = filled.apply(pd.to_numeric, errors="coerce")
     n_filled = int(filled.notna().to_numpy().sum())
     if not n_filled or num.notna().to_numpy().sum() < min_fraction * n_filled:
+        return None
+    if filled.notna().any(axis=1).mean() < 0.5:  # mostly empty: occasional codes = markers
         return None
     arr = num.to_numpy(float)
     n = int(_info(stream, "channel_count", arr.shape[1]) or arr.shape[1])

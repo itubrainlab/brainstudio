@@ -1,18 +1,54 @@
 # BrainStudio
 
-Analysis and visualisation of simultaneous **EEG + eye-tracking** recordings, built on
-[MNE-Python](https://mne.tools) / [MNE-BIDS](https://mne.tools/mne-bids) for EEG and
-[PyGaze](https://www.pygaze.org) for gaze (AOIs), with a PySide6 + pyqtgraph GUI.
+<img src="src/brainstudio/resources/brainstudio.svg" alt="BrainStudio icon" width="96" align="right">
 
-## Install & run
+BrainStudio is a desktop app and Python library for analysing **simultaneous EEG and
+eye-tracking recordings**. It loads XDF (Lab Streaming Layer), EDF/BDF and other EEG
+files, and BIDS datasets. It shows EEG and gaze on one time base, and takes the EEG
+through a **preprocessing → epoching → analysis** pipeline: ERP components, band power
+and cognitive-state indices, compared between groups of events.
+
+- [MNE-Python](https://mne.tools) and [MNE-BIDS](https://mne.tools/mne-bids) do the EEG
+  work: reading, filtering, ICA, epochs, evokeds, spectra and statistics.
+- [PyGaze](https://www.pygaze.org) provides the areas of interest (AOIs). BrainStudio
+  reimplements the PyGazeAnalyser event detectors.
+- The interface is PySide6 and pyqtgraph, in the dark style of the ITU brAIn lab's
+  other apps.
+
+![The Data tab](docs/data.png)
+
+## Contents
+
+- [Install and run](#install-and-run)
+- [Loading data](#loading-data)
+- [The Data tab](#the-data-tab)
+- [The EEG pipeline](#the-eeg-pipeline)
+- [The Gaze tab](#the-gaze-tab)
+- [Events, groups and filters](#events-groups-and-filters)
+- [Montages and channel layouts](#montages-and-channel-layouts)
+- [Using the library](#using-the-library)
+- [Project layout](#project-layout)
+- [Development](#development)
+- [Notes and limitations](#notes-and-limitations)
+- [Acknowledgements](#acknowledgements)
+
+## Install and run
+
+You need Python 3.12 or newer and [uv](https://docs.astral.sh/uv/). It runs on macOS,
+Linux and Windows.
 
 ```bash
 uv sync
 ```
 
+Open the app with a synthetic EEG and eye-tracking dataset (BIDS and XDF, written to a
+temporary folder):
+
 ```bash
 uv run brainstudio --demo
 ```
+
+Open your own data: a BIDS dataset folder, or a file.
 
 ```bash
 uv run brainstudio /path/to/bids_root
@@ -22,250 +58,365 @@ uv run brainstudio /path/to/bids_root
 uv run brainstudio /path/to/recording.xdf --screen 1920x1080
 ```
 
-`--demo` writes a synthetic free-viewing dataset (BIDS + XDF) to a temp folder and
-opens it. `uv run brainstudio-demo OUTDIR` writes it to a folder of your choice.
+`--screen` sets the stimulus screen size in pixels, used for normalised gaze
+coordinates. `uv run brainstudio-demo OUTDIR` writes the demo dataset to a folder.
 
-## Supported inputs
+## Loading data
 
 | Input | EEG | Gaze | Events |
 |---|---|---|---|
-| **BIDS dataset** (folder) | `*_eeg.{vhdr,edf,bdf,set,fif}` via `mne_bids.read_raw_bids` | BIDS eye tracking (`*_recording-<eye>_physio.tsv.gz` + JSON, `PhysioType: eyetrack`), legacy `*_eyetrack.tsv`, or MNE `eyegaze`/`pupil` channels | `events.tsv`, `*_physioevents.tsv.gz` messages |
-| **XDF** (LSL) | stream of type EEG/ExG (else the largest numeric stream) | stream scored by type/name/labels (gaze, eye, pupil, POG…) | string marker streams |
-| EEG file | any MNE-readable file | MNE eyetrack channels | annotations |
-| EyeLink `.asc` | – | via `mne.io.read_raw_eyelink` | messages |
+| **XDF** (LSL) | stream of type EEG/ExG, else the largest numeric stream | stream scored on type, name and channel labels (gaze, eye, pupil, POG…) | marker streams: single or multi-column, see below |
+| **EDF/BDF, BrainVision, EEGLAB, FIF** | any MNE-readable file | MNE eye-tracking channels | annotations; a trigger channel (see below) |
+| **BIDS dataset** (folder) | `*_eeg.{vhdr,edf,bdf,set,fif}` via `mne_bids.read_raw_bids` | BIDS eye tracking (`*_recording-<eye>_physio.tsv.gz` + JSON), legacy `*_eyetrack.tsv`, MNE eye-tracking channels | `events.tsv`, `*_physioevents.tsv.gz` messages |
+| **EyeLink `.asc`** | – | `mne.io.read_raw_eyelink` | messages |
 
-You can attach a separate eye-tracking file to a loaded recording (**File ▸ Attach eye-tracking file**).
+Use the ribbon at the top of the Dataset panel, or the **File** menu:
 
-**Several files at once**:
-* What you can load: select several XDF files, several EDF/BDF/… files, or several runs
-  in the BIDS tree (**Load selected runs together**).
-* How they are joined: end to end into one recording.
-  * EEG is joined with `mne.concatenate_raws` on the channels all files share.
-  * Sampling rates of the same amplifier that differ by under 0.1 % are aligned;
-    others are resampled.
-  * `BAD boundary` annotations keep epochs from spanning two files.
-  * Gaze and markers are shifted accordingly.
-* Tags: every event carries the `subject`, `session`, `bids_task`, `acq`, `run` and
-  `file` of its file. They come from the BIDS dataset, or are parsed from BIDS-style file
-  names such as `sub-01_ses-2_task-x_run-003_eeg.xdf`. They are kept as text, so filter
-  with `run == "003"`.
+- **BIDS** opens a dataset folder. Its runs are listed in a tree.
+- **File** opens one file, or **several at once** (see *Several files* below).
+- **Eye data** attaches a separate eye-tracking file to the loaded recording.
 
-**Trigger channel** (Dataset panel, for any recording with EEG; opened automatically for
-EDF/BDF files when a channel looks like a trigger):
-* Pick the channel: `TRIG`, BioSemi `Status`, …
-* Choose the mode:
-  * *integer codes*: the reader's unit scaling is undone, values are rounded, and
-    `mne.find_events` is run, with an optional bit mask;
-  * *pulses*: for analog channels such as a photodiode.
-* **Find events**, then tick the codes and name them; codes with the same name are
-  pooled.
-* **Add as events** puts them into the event table, and optionally re-types the channel
-  as `stim` so it leaves the EEG.
+### XDF streams and their roles
+
+The **Streams** table lists every stream with its channel count, sampling rate, and the
+role it plays: **EEG**, **gaze**, **markers** or **ignore**.
+
+- Roles are chosen automatically.
+- To change them, pick a role and press **Reload**. **Automatic** restores the automatic
+  roles.
+- At most one stream can be EEG and one gaze.
+
+Some LSL apps send numeric samples as text (Gazepoint, for example). Text streams with a
+regular rate and numeric values are read as numbers.
+
+**Details…** (or a double-click) opens the stream dialog. It shows:
+
+- **stream information**: format, channels, nominal and effective rate, samples,
+  duration, first timestamp, source id, host, manufacturer and clock notes;
+- **per-channel settings**, with a preview of each channel's values:
+  - **EEG**: include or exclude channels, rename them, set their type
+    (eeg/eog/ecg/emg/misc/stim);
+  - **gaze**: which channels are x, y, pupil and validity. Several channels are averaged,
+    for example the left and right eye. Gazepoint `BPOGX/BPOGY`, `BPOGV` and
+    `LPD/RPD` are found automatically.
+  - **markers**: the role of each column (*name*, *start/stop flag*, *attribute*,
+    *ignore*) and its name.
+
+### Multi-column marker streams
+
+Marker streams often carry several text columns per sample, for example
+`['start', 'trials', 'clip.mp4', 'sad', …]`. BrainStudio loads **every column**:
+
+- **Start/stop flag**: a `start` row and the next `stop`/`end` row with the same name
+  become one event with a duration. The stop row fills in values the start row left
+  empty, such as a response. An instant `<name>_end` event can be added as well.
+- **Name** columns form the event name.
+- **Attribute** columns become filterable event columns. Unlabelled columns are named
+  `<stream>_<k>`, so two streams never collide; rename them in the stream dialog.
+- Events with a duration also act as **phases**: gaze fixations inside a trial inherit
+  the trial's name and attributes.
+
+### Several files
+
+Several XDF files, several EDF/BDF/… files, or several BIDS runs can be loaded together.
+In the BIDS tree, select runs, a subject or a session, then use **Load selected runs
+together**. The files are joined end to end into one recording:
+
+- EEG is joined with `mne.concatenate_raws` on the channels all files share.
+- Sampling rates that differ by less than 0.1 % are aligned (the same amplifier's
+  effective rate varies by a few ppm); others are resampled.
+- `BAD boundary` annotations keep epochs from spanning two files.
+- Gaze and markers are shifted onto the joined time base.
+
+Every event carries the `subject`, `session`, `bids_task`, `acq`, `run` and `file` of its
+file:
+
+- They come from the BIDS dataset, or are parsed from BIDS-style file names such as
+  `sub-01_ses-2_task-x_run-003_eeg.xdf`.
+- They are kept as text, so filter with `run == "003"`.
+
+### Trigger channels (EDF/BDF and others)
+
+The **Trigger channel → events** panel turns the codes on a channel into events. It opens
+by itself when a channel looks like a trigger (`TRIG`, BioSemi `Status`, `STI…`).
+
+1. Pick the channel and a mode:
+   - *integer codes*: the reader's unit scaling is undone, values are rounded, and
+     `mne.find_events` reports every change, with an optional bit mask;
+   - *pulses*: for analog channels such as a photodiode. A pulse is a crossing of the
+     level half-way between rest and the largest pulse.
+2. **Find events** lists the codes and their counts. Tick the codes to use and name
+   them; codes with the same name are pooled.
+3. **Add as events** puts them into the event table, and can re-type the channel as
+   `stim` so it is left out of the EEG.
+
+When a file is loaded, channels that a reader typed as EEG but whose names say otherwise
+are re-typed:
+
+- TRIG and Status → stim;
+- EOG, ECG and EMG → their own types;
+- the accelerometer, gyroscope, battery, counter and validation channels of the g.tec
+  Unicorn → misc.
 
 ### Time alignment
+
 Everything lives on one time base: t = 0 is the first EEG sample.
 
-* **BIDS**: gaze uses the sidecar `StartTime` (seconds relative to the EEG). Tracker
-  timestamps (`timestamp` column, unit from the sidecar or inferred from
-  `SamplingFrequency`) define the sample times.
-* **XDF**: pyxdf applies the LSL clock offsets stored in the file. BrainStudio then
-  de-jitters each regular stream itself, one linear fit per gap-free segment, and uses
-  the *effective* sampling rate. Some recordings have samples stamped on another clock,
-  as in Gazepoint streams where a few samples carry the LSL clock instead of the
-  tracker clock. BrainStudio detects these, removes them, and uses them to estimate the
-  offset between clocks. A stream that doesn't overlap the EEG is then mapped onto the
-  EEG clock with that offset. If no offset can be found, stream starts are aligned and
-  the info panel shows a **WARNING**. Every step is listed in the info panel.
-* **Gaze offset** (Controls panel) shifts gaze relative to the EEG by hand.
+- **XDF**:
+  - pyxdf applies the LSL clock offsets stored in the file.
+  - BrainStudio then removes jitter from each regular stream with one linear fit per
+    gap-free segment, and uses the *effective* sampling rate.
+  - Some devices stamp a few samples on another clock (Gazepoint, for example).
+    BrainStudio detects and removes these samples, and uses them to estimate the offset
+    between the clocks. A stream that does not overlap the EEG is moved onto the EEG
+    clock with that offset.
+  - If no offset can be found, the stream starts are aligned and the info panel shows a
+    **WARNING**.
+  - Every step is listed in the info panel.
+- **BIDS**: gaze uses the sidecar `StartTime`. Tracker timestamps define the sample times.
+- **Gaze offset** (Controls panel) shifts gaze relative to the EEG by hand.
 
-Gaze coordinates are in screen pixels. Normalised coordinates (Gazepoint, Tobii, Pupil
-Labs) are scaled to the screen size. Validity flags (e.g. `FPOGV`) and 0/0 samples count
-as missing.
+Gaze coordinates are in screen pixels:
 
-## GUI
+- Normalised coordinates (Gazepoint, Tobii, Pupil Labs) are scaled to the screen size.
+- Samples are treated as missing when a validity flag (e.g. `FPOGV`) marks them invalid,
+  or when x and y are both 0.
+- Pupil size is blanked where gaze is lost.
 
-BrainStudio is styled like the lab's other app, brAInStream:
-* the dark style with blue highlights and the brAIn lab red;
-* a top bar with the br**AI**n studio wordmark;
-* icons drawn in code.
+## The Data tab
 
-The style sheet is BrainStudio's own; no g.Pype files are used.
+Three main tabs: **Data**, **EEG** and **Gaze**. The Data tab holds:
 
-The **Data** tab holds the **Dataset** panel (left), the viewer, and the **Controls**
-panel (right); the panels are resizable parts of the tab, not separate windows.
+- the **Dataset** panel (left);
+- the viewer;
+- the screen view and topomap;
+- the **Controls** panel (right).
 
-**Dataset panel** (left of the Data tab):
-* a **ribbon** of buttons for the File menu's functions: BIDS, File, Eye data, Montage,
-  Stimulus, Export, Snapshot;
-* the recording tree;
-* for XDF files, a **Streams** table. It lists every stream with its channels and rate
-  and the **role** it plays: *EEG*, *gaze*, *markers* or *ignore*. Roles are picked
-  automatically. To change them, pick another role and press **Reload**. **Automatic** goes back to the automatic roles. At most one stream can be
-  EEG and one gaze; hover a stream to see its channel labels.
+The two panels are fixed, resizable parts of the tab.
 
-Three main tabs:
+**Viewer**
 
-* **Data** (Dataset panel, viewer, Controls panel)
-  * It shows the preprocessed EEG by default: only EEG-type channels, without the
-    channels marked bad in ① Preprocessing. Switch to raw in the Controls panel to see all
-    EEG channels, with bad ones greyed. EOG/ECG/EMG/misc/stim channels are not drawn.
-  * Without gaze data the eye-tracking views (gaze/pupil plots, screen view, Gaze tab,
-    gaze controls) are hidden.
-  * Stacked EEG traces with event markers and shaded saccades, blinks and fixations.
-  * Gaze x/y and pupil traces, linked on the same time axis.
-  * Overview bar showing gaze validity and events.
-  * Playback controls.
-  * Screen view: live gaze point and trail, numbered scanpath, fixation heatmap,
-    optional stimulus image, and draggable **AOIs**.
-  * **Live topomap** of the EEG around the cursor (needs channel positions).
-* **EEG** is a three-stage pipeline. Every analysis runs in MNE.
-  * Each stage takes its input from the stage before. A banner at the top of each stage
-    says what that input is and whether the stage's results are up to date (●), out of
-    date (▲) or not run yet (○).
-  * Changing a setting marks that stage, and every stage after it, out of date.
-  * **Run pipeline ▶▶** runs everything from the first stage that is out of date.
-  * Long computations run in the background.
-  * The stages:
-    1. **Preprocessing**
-       * *Channels*: automated peak-to-peak rejection. The data are cut into windows and
-         band-passed/notched like the output will be. A channel is bad when too many of
-         its windows are noisy (ptp above a threshold) or flat, or when it is a
-         robust-z outlier. Tick or untick channels by hand. Bad channels are left out of
-         ICA, the average reference, epochs and statistics, or interpolated with
-         spherical splines.
-       * *Filtering & reference*: high-pass (down to 0 Hz = off; below 0.5 Hz a
-         zero-phase 4th-order Butterworth), low-pass, notch; reference: keep, average,
-         one channel, or the mean of several (`M1, M2`).
-       * *ICA blink removal* (`mne.preprocessing.ICA`, picard):
-         * Fitted on a ≥ 1 Hz copy of the good channels.
-         * Components are scored against the eye tracker's blinks, using a
-           blink-locked t-score.
-         * They are also scored against EOG channels or, without EOG, the frontal
-           electrodes (`find_bads_eog`).
-         * Suggested components are pre-ticked.
-         * MNE component, source and property plots are available.
-       * Checks: spectrum before/after, per-channel noisy/flat %, and the
-         blink-locked frontal EEG before/after.
-    2. **Epoching**
-       * Map events into named **groups** (conditions). Each group has its own
-         checklist and filters (see *Selecting events*).
-       * Set the epoch start and end around each event, peak-to-peak and flat
-         rejection, optionally drop epochs containing an eye-tracker blink, and cap the
-         epochs per group.
-       * **EEG delay** (±500 ms) corrects a recording lag between events and EEG.
-       * **Recordings**: tick the subjects, sessions, runs, tasks or files whose events
-         are used. Events from files without an entity are listed as *(none)*.
-       * Shows a summary (selected, outside, rejected, kept, and *which channels caused
-         rejections*), a timeline of where each group's events fall, and the current
-         group's events with every column.
-       * Save one `-epo.fif` per group.
-       * Epochs are *not* baseline-corrected here. Each analysis picks its own baseline.
-    3. **Analysis** of the ticked groups:
-       * *ERP* (component analysis as in the lab's Rhino ERP):
-         * Baseline = a window **before the event** (e.g. −0.2…0 s).
-         * **Component** presets (P1, N1, N170, P2, N2, MMN, P300, N400, LPP) set the
-           time window, polarity and channel cluster. These are conventional starting
-           points; any edit makes it *Custom*.
-         * Component statistics per group:
-           * window mean amplitude ± SEM on the cluster mean;
-           * peak amplitude and latency of the average ERP (`Evoked.get_peak`);
-           * with two groups: a two-sided Welch t-test (t, df, p), Mann-Whitney U,
-             Hedges' g and the peak-latency difference;
-           * with more groups: a one-way ANOVA.
-         * Trials are the observations: these are single-subject statistics.
-         * Plots: cluster mean ± SEM with peaks marked, single channel, GFP or
-           butterfly; with two groups, the A − B difference wave.
-         * Click the plot to set a latency for the topomaps and joint plot.
-         * MNE compare-evokeds, joint plots and topomaps; CSV/FIF export.
-       * *Band power*:
-         * Editable bands. Power in a window of the epoch from `Epochs.compute_psd`
-           (Welch or multitaper).
-         * Baseline = a window **after a baseline event**, e.g. 5…115 s after
-           `BASELINE_START`. It is cut into segments as long as the analysis window.
-           Either the mean of all baseline events or the nearest preceding one is
-           used, and results are expressed in dB, % change, ratio or z.
-         * Bar charts ± SEM, a Morlet ERD/ERS time course on the same baseline, and
-           MNE topomaps per band, group and difference.
-       * *Cognitive indices* per epoch, with editable regions:
-         * engagement β/(α+θ) (Pope 1995)
-         * workload = frontal-midline θ / parietal α (Gevins & Smith 2003)
-         * θ/α, frontal θ/β, frontal alpha asymmetry
-         * parietal α ERD % and frontal-midline θ ERS % relative to the baseline
-         * eye metrics: task-evoked pupil dilation, blink rate, mean fixation duration
-       * Groups are compared with a Welch t-test and Mann-Whitney test (two groups) or
-         ANOVA and Kruskal-Wallis (more), with Hedges' g and FDR q-values. These are
-         epoch-level statistics within one recording.
-       * Every result exports to CSV/FIF with a provenance text file.
-* **Gaze**:
-  * fixation, saccade and blink summary
-  * fixation-duration and amplitude histograms, main sequence
-  * per-AOI fixation count, dwell time and time to first fixation, computed with
-    `pygaze.plugins.aoi.AOI` (CSV export)
-* **Controls panel** (right of the Data tab): viewer options, which EEG to display (preprocessed or raw),
-  gaze-detection parameters, gaze offset, screen size. "Open in MNE browser" adds blinks
-  and saccades as annotations.
+- **EEG traces** with event markers and shaded saccades, blinks and fixations.
+- The traces show the **preprocessed** EEG by default, without the channels marked bad
+  in ① Preprocessing. Switch to *Raw* in the Controls panel to see every EEG channel,
+  with bad ones greyed.
+- Only EEG-type channels are drawn.
+- **Gaze** x/y and **pupil** traces on the same time axis, an overview bar (gaze
+  validity and events) and playback.
+- **Screen view**: live gaze point and trail, numbered scanpath, fixation heatmap,
+  optional stimulus image, and draggable **AOIs**.
+- **Live topomap** of the EEG around the cursor (needs electrode positions).
+- Without gaze data, the eye-tracking views, the Gaze tab and the gaze controls are
+  hidden.
 
-### Selecting events
+**Dataset panel**
+
+- The ribbon: BIDS, File, Eye data, Montage, Stimulus, Export, Snapshot.
+- The recording tree.
+- The Streams table (XDF) and the trigger panel.
+- The info panel.
+- The list of markers with all their columns. Double-click a marker to jump to it.
+
+**Controls panel**
+
+- View options: window length, EEG scale, number of channels, overlays.
+- EEG display: preprocessed or raw; *Open in MNE browser* adds blinks and saccades as
+  annotations.
+- Gaze-event detection parameters, gaze offset and screen size.
+
+Shortcuts:
+
+- ←/→ previous/next page
+- Space play/pause
+- +/− EEG scale
+- PgUp/PgDn scroll channels
+- click a time plot to move the cursor
+
+## The EEG pipeline
+
+The **EEG** tab is a three-stage pipeline:
+
+- Each stage reads the output of the stage before it.
+- A banner shows each stage's input, and whether its results are up to date (●), out of
+  date (▲) or not run (○).
+- Changing a setting marks that stage, and everything after it, out of date.
+- **Run pipeline ▶▶** runs everything from the first stage that is out of date.
+- Computations run in the background.
+
+### ① Preprocessing
+
+![Preprocessing with ICA](docs/preprocessing.png)
+
+- **Channels: automated peak-to-peak rejection.**
+  - The data are cut into windows, band-passed and notched like the output will be.
+  - A channel is bad when more than a set share of its windows are *noisy* (above a
+    peak-to-peak threshold) or *flat*, or when it is a robust-z outlier.
+  - Untick channels by hand to mark them bad.
+  - Bad channels are left out of ICA, the average reference, epochs and statistics, or
+    are interpolated with spherical splines.
+- **Filtering and reference.**
+  - High-pass from **0 Hz (off)** upwards. Below 0.5 Hz it is a zero-phase 4th-order
+    Butterworth (IIR); above that, MNE's FIR.
+  - Low-pass and notch.
+  - Reference: keep, average, one channel, or the mean of several (`M1, M2`).
+- **ICA blink removal** (`mne.preprocessing.ICA`, picard).
+  - It is fitted on a ≥ 1 Hz copy of the good, non-flat channels.
+  - Components are scored by how strongly they respond around the eye tracker's blinks
+    (a blink-locked t-score), and against EOG or, without EOG, the frontal electrodes
+    (`find_bads_eog`).
+  - Suggested components are pre-ticked.
+  - Clicking a component shows its scalp map, spectrum, blink-locked average and time
+    course. Double-click opens MNE's properties window.
+- **Checks**: the spectrum before and after, noisy and flat windows per channel, and the
+  blink-locked frontal EEG before and after.
+
+### ② Epoching
+
+![Epoching](docs/epoching.png)
+
+- **Event groups** are the conditions. Each group has its own checklist and filters (see
+  [Events, groups and filters](#events-groups-and-filters)), and a table of its events
+  with every column.
+- **Epoch window**:
+  - start and end around each event;
+  - peak-to-peak and flat rejection;
+  - an option to drop epochs that contain an eye-tracker blink;
+  - a cap on epochs per group;
+  - **EEG delay** (±500 ms) to correct a recording lag between events and EEG.
+- **Recordings**: tick the subjects, sessions, runs, tasks or files to use events from.
+- **Summary**: selected, outside the recording, rejected, kept, and the **channels that
+  caused rejections**; plus a timeline of each group's events.
+- Epochs are *not* baseline-corrected here: each analysis picks its own baseline.
+- Save one `-epo.fif` per group, with the event table as epochs metadata.
+
+### ③ Analysis
+
+**ERP**: component analysis, as in the lab's Rhino ERP.
+
+![ERP component analysis](docs/erp.png)
+
+- **Baseline**: a window before the event, e.g. −0.2…0 s.
+- **Component presets** set the time window, polarity and channel cluster: P1, N1,
+  N170, P2, N2, MMN, P300, N400, LPP. They are conventional starting points; any edit
+  makes the component *Custom*.
+- **Component statistics** per group:
+  - window mean amplitude ± SEM on the cluster mean;
+  - peak amplitude and latency of the average ERP (`Evoked.get_peak`).
+- **Comparing groups**:
+  - two groups: a two-sided Welch t-test (t, df, p), Mann-Whitney U, Hedges' g and the
+    peak-latency difference;
+  - more groups: a one-way ANOVA.
+- **Views**: cluster mean ± SEM with peaks marked, single channel, GFP, butterfly.
+  With two groups, the A − B difference wave.
+- Click the plot to set the latency used by the topomaps and the joint plot.
+- MNE compare-evokeds, joint plot and topomaps.
+- Export: evokeds (`-ave.fif`), component summary and per-epoch CSV.
+
+**Band power**
+
+![Band power](docs/bandpower.png)
+
+- Editable bands.
+- Power in a window of the epoch, from `Epochs.compute_psd` (Welch or multitaper).
+- **Baseline**: a window **after a baseline event**, e.g. 5…115 s after
+  `BASELINE_START`.
+  - It is cut into segments as long as the analysis window.
+  - Either all baseline events or the most recent one before each epoch is used.
+  - Results can be shown in dB, % change, ratio or z.
+- Bar charts ± SEM, a Morlet time course of the event-related change in a band
+  (ERD/ERS) on the same baseline, and MNE topomaps per band, group and difference.
+
+**Cognitive indices**, per epoch, with editable channel regions:
+
+- engagement β/(α+θ) (Pope et al., 1995);
+- workload: frontal-midline θ / parietal α (Gevins & Smith, 2003);
+- θ/α; frontal θ/β; frontal alpha asymmetry;
+- parietal α ERD % and frontal-midline θ ERS % relative to the band-power baseline;
+- eye metrics: task-evoked pupil dilation, blink rate and mean fixation duration.
+
+How groups are compared:
+
+- Band power and indices use a Welch t-test and Mann-Whitney test for two groups, or
+  ANOVA and Kruskal-Wallis for more.
+- They report Hedges' g and FDR-corrected q-values.
+- Trials are the observations, so these are **single-recording (within-subject)
+  statistics**.
+- Every result exports to CSV or FIF, with a text file recording the settings used.
+
+## The Gaze tab
+
+- Fixation, saccade and blink summary.
+- Fixation-duration and saccade-amplitude histograms, and the main sequence.
+- Per-AOI fixation count, dwell time and time to first fixation, computed with
+  `pygaze.plugins.aoi.AOI` (CSV export).
+- AOIs are drawn in the Data tab's screen view, and fixations get an `aoi` column for
+  event filters.
+
+## Events, groups and filters
+
 All markers and detected gaze events go into one table
 (`brainstudio.events.build_event_table`):
 
-* `name`, `kind` (marker, fixation, saccade or blink), `onset`, `duration`.
-* Structured markers like `READING_PAGE|page=2|task=JF|cond=AI` are split into
-  `name=READING_PAGE` plus columns `page`, `task`, `cond` (numeric where possible).
-* Gaze events have `x`, `y`, `amplitude`, `peak_velocity` and `aoi`, the AOI drawn in
-  the screen view.
-* Every event inherits a `phase`, the innermost `X_START`…`X_END` span it falls in,
-  together with that span's attributes. That makes queries like "fixations while
-  reading in the AI condition" possible.
+- `onset`, `duration`, `name`, `kind` (marker, fixation, saccade or blink) and
+  `description`.
+- Structured markers `NAME|key=value|…` are split into a name and one column per key.
+  Values are numeric where possible.
+- Multi-column marker streams contribute their columns (see above).
+- Gaze events have `x`, `y`, `amplitude`, `peak_velocity` and `aoi`.
+- Every event inherits a `phase` and that phase's attributes. The phase is the innermost
+  span it falls in: an `X_START`…`X_END` marker pair, or a marker with a duration.
+- Every event carries the `subject`/`session`/`bids_task`/`run`/`file` of its file.
+- Markers named like gaze events get a suffix, e.g. `fixation_marker` for a
+  fixation-cross marker.
 
-Each selector combines:
-* a **checklist** of event types, with live counts after filtering;
-* a **text filter**: a regex on the raw description;
-* a **metadata filter**: a pandas `query`, the same syntax as MNE's
-  `epochs['…']`. Examples: `phase == "READING" and cond == "AI"`,
-  `duration > 0.2 and aoi == "TOP"`, `page in [1, 2]`.
+Each event selector combines:
 
-The *Columns* menu lists the available columns with example values.
+- a **checklist** of event names, with live counts;
+- a **text filter**: a regular expression on the description;
+- a **metadata filter**: a pandas `query`, the same syntax as MNE's `epochs['…']`.
+  Examples:
+  - `phase == "READING" and cond == "AI"`
+  - `duration > 0.2 and aoi == "TOP"`
+  - `phase.str.startswith("trials") and emotion == "sad"`
+- The **Columns** menu lists every column with example values.
 
-### Montage
-**File ▸ Channel names & montage… (Ctrl+M)**:
-* Choose a built-in MNE montage or a montage file (`.elc .sfp .loc .bvef .csd .txt`,
+## Montages and channel layouts
+
+Use **Montage** in the ribbon (Ctrl+M):
+
+- Choose a built-in MNE montage or a montage file (`.elc .sfp .loc .bvef .csd .txt`,
   BIDS `*_electrodes.tsv`, …).
-* **Channel layouts** are listed first. A layout gives the electrode for each amplifier
-  input, so picking one also fills in the channel names. `gtec_64` is the g.tec 64-channel
-  extended 10-20 "standard" setup: 1 Fp1 … 60 O2, 61 F9, 62 F10, 63 A1, 64 A2, ground
-  at AFz. It is preselected for recordings with 64 unnamed channels. `gtec_unicorn` is
-  the g.tec Unicorn Hybrid Black: Fz, C3, Cz, C4, Pz, PO7, Oz, PO8. Extra channels keep
-  their names, and ACC/GYR/Battery/Counter/Validation become `misc`. Positions come from
-  MNE's 10-05 template. To add your own layout, put a text file with one
-  `<input> <name>` per line in `~/.brainstudio/montages/` (see
-  `src/brainstudio/montages/gtec_64.txt`).
-* Optionally rename channels in recording order. Edit the list, load names from a text
-  file, or fill them from the montage's file order. Channels named *EOG/ECG/EMG* get
-  those channel types.
-* *Check* reports how many EEG channels got positions. *Plot sensors* shows the layout
-  with MNE.
+- **Channel layouts** give the electrode for each amplifier input, so choosing one also
+  fills in the channel names. Positions come from MNE's 10-05 template.
+  - `gtec_64`: the g.tec 64-channel extended 10-20 standard setup.
+    - Inputs 1–60 run Fp1 … O2, then 61 F9, 62 F10, 63 A1, 64 A2.
+    - Ground is at AFz.
+    - It is preselected for recordings with 64 unnamed channels.
+  - `gtec_unicorn`: the g.tec Unicorn Hybrid Black (Fz, C3, Cz, C4, Pz, PO7, Oz, PO8).
+    Any further channels keep their names.
+  - Your own layout: put a text file with one `<input> <name>` per line in
+    `~/.brainstudio/montages/`, in the same format as
+    [`gtec_64.txt`](src/brainstudio/montages/gtec_64.txt).
+- Rename channels in recording order: edit the list, load names from a text file, or
+  fill them from the montage.
+- *Check* reports how many EEG channels got positions; *Plot sensors* shows the layout.
 
-Topomaps, joint plots and spatio-temporal tests need positions.
+Topomaps, joint plots and ICA scalp maps need electrode positions.
 
-### Colours
-Every chart follows the app's light or dark palette and updates when the system
-setting changes. That covers pyqtgraph plots, the topomap, and MNE's own matplotlib
-figures (through rcParams). A single colour-blind-safe series palette is shared, so
-group A and B have the same colours in the app and in MNE plots.
+## Using the library
 
-Shortcuts: ←/→ page, Space play, +/- EEG scale, PgUp/PgDn scroll channels, click a time
-plot to move the cursor.
-
-## Library use
+Everything the app does is available from Python.
 
 ```python
-from brainstudio.io import load_xdf
+import pandas as pd
+
+from brainstudio.io import load_xdf, load_many
 from brainstudio import gaze as G, events as EV, preprocessing as P, epoching as EP
 from brainstudio import bandpower as BP, stats as ST, eeg as E
 
-rec = load_xdf("recording.xdf")      # roles={"4": "ignore"} overrides a stream's role
-print([(st["name"], st["role"]) for st in rec.streams])
+rec = load_xdf("recording.xdf")      # roles={"4": "ignore"}, options={...} override streams
+# rec = load_many(["sub-01_ses-1_eeg.xdf", "sub-01_ses-2_eeg.xdf"])   # several files
+print([(s["name"], s["role"]) for s in rec.streams])
 gtec = E.montage_from_source("gtec_64")                         # names + positions
 E.apply_montage(rec.raw, gtec, gtec.ch_names)
 ev = G.detect_events(rec.gaze)                                  # fixations / saccades / blinks
@@ -276,7 +427,7 @@ bad = P.detect_bad_channels(rec.raw, P.BadChannelParams(ptp_max_uv=250, notch=50
 bads = bad.loc[bad.bad, "channel"].tolist()
 ica, fit_raw = P.fit_ica(rec.raw, bads, h_freq=40, notch=50)
 scores = P.score_blink_components(ica, fit_raw, ev.blinks)      # blink-locked + EOG/frontal
-pp = P.PreprocParams(bads=bads, l_freq=1, h_freq=40, notch=50, reference="average",
+pp = P.PreprocParams(bads=bads, l_freq=0.1, h_freq=40, notch=50, reference="average",
                      ica_exclude=scores.loc[scores.suggested, "component"].tolist())
 clean = P.run_preprocessing(rec.raw, pp, ica)
 
@@ -285,9 +436,11 @@ fx = EV.filter_events(table, query='phase == "READING"', names={"fixation"})
 groups = {"AI": fx[fx.cond == "AI"], "NoAI": fx[fx.cond == "NoAI"]}
 epochs, summary = EP.build_group_epochs(clean, groups, EP.EpochSettings(-0.5, 1.5, 150))
 
-# 3 analysis: ERP (pre-event baseline) and band power (baseline after a baseline event)
+# 3a ERP component (pre-event baseline), as in Rhino ERP
 erp = {g: e.copy().apply_baseline((-0.2, 0)) for g, e in epochs.items()}
-stats = E.cluster_contrast(erp["AI"], erp["NoAI"], roi=["Pz", "P3", "P4"])
+comp_summary, per_epoch = E.component_analysis(erp, E.COMPONENT_PRESETS["P300"])
+
+# 3b band power and indices (baseline: 5–115 s after BASELINE_START)
 s = BP.BandSettings(tmin=0, tmax=1.5)
 base = BP.BandBaseline(table.loc[table.name == "BASELINE_START", "onset"].values, 5, 115)
 per = []
@@ -297,27 +450,83 @@ for g, ep in epochs.items():
     ref, sd = BP.reference_for(ep.metadata.onset.values, base, bb, owner)
     idx, notes = BP.eeg_indices(bp, ep.ch_names, s.bands, ref=ref)  # engagement, workload…
     per.append(idx.assign(group=g))
-import pandas as pd
 print(ST.comparison_table(pd.concat(per), ["engagement β/(α+θ)", "α ERD % (parietal)"],
                           ["AI", "NoAI"]))
+
+# trigger channel → events (EDF/BDF): onset and code of every trigger
+# codes = E.trigger_codes(raw, "TRIG", mask=255)
 ```
 
-## Notes on the gaze algorithms
-The pip release of PyGaze (`python-pygaze`) contains the experiment runtime and the
-`AOI` plugin, but not the offline event detectors. Those live in PyGazeAnalyser, which
-isn't on PyPI. BrainStudio reimplements the same algorithms in vectorised form:
-* blinks: runs of missing samples (`blink_min`–`blink_max`)
-* fixations: dispersion-based, staying within *radius* of the fixation start for at
-  least *min fixation*
-* saccades: velocity threshold
+## Project layout
 
-Thresholds are in pixels; tune them for your screen and tracker. Some trackers export a
-fixation-filtered point of gaze (e.g. Gazepoint `FPOG*`) rather than raw gaze. With
-that data the trace is step-like, so velocity-based saccade counts come out low;
-fixation and blink detection still work.
+```
+src/brainstudio/
+  model.py           Recording, GazeData, GazeEvents (one time base, segments per file)
+  io/                loaders
+    xdf.py           XDF: stream roles/options, clock alignment, de-jitter, stream info
+    markers.py       multi-column marker streams → events (start/stop pairing)
+    multi.py         several files as one; BIDS entities from file names
+    bids.py          BIDS EEG + eye tracking (MNE-BIDS)
+    xdf_writer.py    minimal XDF writer (demo data, tests)
+  gaze.py            blink / fixation / saccade detection, AOIs (PyGaze), heatmaps
+  events.py          unified event table, phases, filters
+  eeg.py             filtering, references, montages and layouts, epochs, trigger codes,
+                     ERP components, cluster tests
+  preprocessing.py   bad channels (peak-to-peak), filters, ICA blink scoring
+  epoching.py        event groups → mne.Epochs, EEG delay, rejection report
+  bandpower.py       band power, baselines, cognitive indices, gaze metrics
+  stats.py           group comparisons (Welch, Mann-Whitney, ANOVA, Hedges g, FDR)
+  montages/          channel layouts (gtec_64, gtec_unicorn)
+  demo.py            synthetic EEG + gaze dataset (BIDS and XDF)
+  gui/               PySide6 app: main window, Data/EEG/Gaze tabs, pipeline state,
+                     background worker, dialogs, brAIn lab style and drawn icons
+tests/               pytest suite on synthetic data
+docs/                screenshots (made from the synthetic demo)
+```
 
-## Tests
+## Development
 
 ```bash
 uv run pytest
 ```
+
+The tests run on synthetic data. They cover:
+
+- BIDS and XDF loading;
+- clock recovery and stream roles;
+- multi-column markers;
+- joining several files;
+- EDF trigger channels;
+- gaze detection and AOIs;
+- bad channels, ICA, epochs, band power and indices;
+- ERP components and contrasts;
+- channel layouts.
+
+Lint with `uv run python -m pyflakes src`.
+
+## Notes and limitations
+
+- **Statistics are within one recording**: epochs are the observations. For group
+  studies, export the per-epoch or per-group values and model subjects outside
+  BrainStudio.
+- **Gaze algorithms**: the PyPI release of PyGaze has the AOI plugin, but not the
+  offline detectors from PyGaze Analyser. BrainStudio reimplements those:
+  - blinks: runs of missing samples;
+  - fixations: dispersion-based;
+  - saccades: a velocity threshold.
+
+  Thresholds are in pixels. Trackers that export a fixation-filtered point of gaze
+  (e.g. Gazepoint `FPOG*`) give step-like traces, so saccade counts come out low.
+- **ICA and blinks** depend on blinks being visible in the EEG. When no component is
+  blink-locked, none is suggested, and removing nothing is the right call.
+- Component presets are conventional windows; choose the window before looking at the
+  data.
+
+## Acknowledgements
+
+- [MNE-Python](https://mne.tools), [MNE-BIDS](https://mne.tools/mne-bids),
+  [pyxdf](https://github.com/xdf-modules/pyxdf), [PyGaze](https://www.pygaze.org) and
+  [python-picard](https://pierreablin.github.io/picard/).
+- The ERP component analysis follows the lab's Rhino ERP.
+- The look follows brAInStream. The style sheet and icons are BrainStudio's own; the app
+  icon uses the brAIn lab brain from brAInStream (MIT, ITU brAIn lab).

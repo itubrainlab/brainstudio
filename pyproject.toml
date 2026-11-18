@@ -1,7 +1,8 @@
 [project]
 name = "brainstudio"
 version = "0.1.0"
-description = "EEG + eye-tracking analysis and visualisation for BIDS and XDF data (MNE + PyGaze)"
+description = "EEG + eye-tracking analysis: XDF/EDF/BIDS loading, preprocessing, epoching, ERP components and band power (MNE + PyGaze)"
+keywords = ["eeg", "eye tracking", "erp", "xdf", "bids", "mne", "pygaze", "lsl"]
 readme = "README.md"
 authors = [
     { name = "Paolo Burelli", email = "burelli@gmail.com" }
