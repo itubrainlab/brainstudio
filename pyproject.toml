@@ -1,6 +1,6 @@
 [project]
 name = "brainstudio"
-version = "0.1.0"
+version = "0.1.1"
 description = "EEG + eye-tracking analysis: XDF/EDF/BIDS loading, preprocessing, epoching, ERP components and band power (MNE + PyGaze)"
 keywords = ["eeg", "eye tracking", "erp", "xdf", "bids", "mne", "pygaze", "lsl"]
 readme = "README.md"
