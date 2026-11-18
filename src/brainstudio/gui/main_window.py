@@ -325,7 +325,6 @@ class MainWindow(QtWidgets.QMainWindow):
         sv.addLayout(row)
         self.streams_box.setVisible(False)
         lay.addWidget(self.streams_box, 2)
-        lay.addWidget(self._build_timing_box())
         lay.addWidget(self._build_trigger_box())
         self.info = QtWidgets.QPlainTextEdit()
         self.info.setReadOnly(True)
@@ -661,9 +660,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.scr_h.setValue(rec.gaze.screen_size[1])
             self.screen.set_screen(rec.gaze.screen_size)
         self.display_raw = rec.raw
-        self.event_delay.blockSignals(True)  # a new recording starts without a shift
-        self.event_delay.setValue(rec.event_delay * 1000.0)
-        self.event_delay.blockSignals(False)
         self.screen.reset_view()
         self.pipeline.set_recording(rec)
         if rec.raw is not None:
@@ -732,39 +728,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.eeg_plot.set_data(data, raw.times, names, types, raw.info["bads"])
         self.n_chan.setMaximum(max(len(names), 1))
         self.eeg_plot.set_visible_channels(min(self.n_chan.value(), len(names)))
-
-    # ================================================================== event timing
-    def _build_timing_box(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("Event timing")
-        row = QtWidgets.QHBoxLayout(box)
-        row.setContentsMargins(6, 4, 6, 4)
-        row.addWidget(QtWidgets.QLabel("Event delay"))
-        self.event_delay = _spin(-60000, 60000, 0, 1, 1, " ms")
-        self.event_delay.setToolTip(
-            "Shift every marker event relative to the EEG and gaze, to correct a recording "
-            "misalignment: + = the events really happened later than their timestamps, "
-            "− = earlier. Affects the markers shown, the event table, phases, epochs and "
-            "analyses. Gaze events (fixations, blinks…) and BAD_/boundary annotations "
-            "keep their times.")
-        self.event_delay.setKeyboardTracking(False)  # apply on Enter / arrows, not per key
-        self.event_delay.valueChanged.connect(self._event_delay_changed)
-        row.addWidget(self.event_delay, 1)
-        reset = QtWidgets.QToolButton()
-        reset.setText("0")
-        reset.setToolTip("No delay")
-        reset.clicked.connect(lambda: self.event_delay.setValue(0))
-        row.addWidget(reset)
-        return box
-
-    def _event_delay_changed(self, ms: float):
-        if self.rec is None:
-            return
-        self.rec.event_delay = ms / 1000.0
-        self._refresh_events()
-        self._rebuild_event_table()
-        self.statusBar().showMessage(
-            f"Events shifted by {ms:+g} ms relative to the data" if ms else
-            "Events at their recorded times", 6000)
 
     # ================================================================== trigger channel
     def _build_trigger_box(self) -> QtWidgets.QGroupBox:
