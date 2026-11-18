@@ -381,7 +381,7 @@ The **EEG** tab is a three-stage pipeline:
 
   - Mastoids are the first good pair present: M1/M2, TP9/TP10, A1/A2 (earlobes), or
     P9/P10 (ERP CORE's mastoid substitute).
-  - Without one, the average reference is used, and the note next to the choice says so.
+  - Without one, the data stay **as recorded**, and the note next to the choice says so.
   - You can also choose *average*, *mastoids*, *as recorded*, or channel names.
   - The reference is applied to copies of the epochs, before the baseline.
 - **Component statistics** per group:

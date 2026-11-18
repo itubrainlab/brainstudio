@@ -632,7 +632,7 @@ def test_epoch_summary_counts_each_reason():
 
 
 def test_erp_reference_from_the_literature(demo):
-    """Each component gets its conventional reference; mastoids fall back to average."""
+    """Each component gets its conventional reference; without mastoids: as recorded."""
     import mne
     from brainstudio import epoching as EP
     from brainstudio import events as EV
@@ -640,7 +640,7 @@ def test_erp_reference_from_the_literature(demo):
         ["TP9", "TP10"]
     assert E.resolve_erp_reference("literature", ["Cz", "TP9", "TP10"], "N170")[0] == "average"
     ref, label = E.resolve_erp_reference("literature", ["Fz", "Cz", "Pz"], "N400")
-    assert ref == "average" and "no good mastoid pair" in label
+    assert ref is None and label.startswith("as recorded") and "no good mastoid" in label
     assert E.resolve_erp_reference("recorded", ["Cz"])[0] is None
     with pytest.raises(ValueError, match="not among"):
         E.resolve_erp_reference("M1, M2", ["Cz", "Pz"])

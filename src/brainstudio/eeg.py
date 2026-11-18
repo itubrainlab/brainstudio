@@ -662,7 +662,7 @@ def resolve_erp_reference(spec: str, ch_names: list[str], component: str = ""
     ``spec``: "literature" (the component's conventional reference), "recorded",
     "average", "mastoids", or channel name(s) "Cz" / "M1, M2". The data are the
     epochs' (good) channels, so a bad mastoid is simply not found. Without a
-    mastoid pair, mastoids fall back to the average reference (said in the label).
+    mastoid pair, the data stay as recorded (said in the label).
     """
     s = (spec or "").strip()
     why = ""
@@ -677,10 +677,10 @@ def resolve_erp_reference(spec: str, ch_names: list[str], component: str = ""
         return "average", why or "average reference"
     if low == "mastoids":
         pair = mastoid_channels(ch_names)
-        if pair is None:
-            return "average", ("average reference — no good mastoid pair (M1/M2, TP9/TP10, "
-                               "A1/A2, P9/P10) among the channels"
-                               + (f"; the literature uses {why}" if why else ""))
+        if pair is None:  # keep the recorded reference rather than switch scheme
+            return None, ("as recorded — no good mastoid pair (M1/M2, TP9/TP10, A1/A2, "
+                          "P9/P10) among the channels"
+                          + (f"; the literature uses {why}" if why else ""))
         return pair, f"mean of {'+'.join(pair)}" + (f" — {why}" if why else "")
     names = [n for n in s.replace(";", ",").replace(",", " ").split() if n]
     lower = {c.lower(): c for c in ch_names}
