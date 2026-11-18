@@ -448,3 +448,15 @@ def test_two_edfs_with_trigger_channel(tmp_path):
     tab = EV.build_event_table(rec)
     t1 = tab[tab.name == "code1"]
     assert sorted(set(t1.session)) == ["1", "2"] and len(t1) == 10
+
+
+def test_gtec_unicorn_layout():
+    import mne
+    m = E.montage_from_source("gtec_unicorn")
+    assert m.ch_names == ["Fz", "C3", "Cz", "C4", "Pz", "PO7", "Oz", "PO8"]
+    extra = ["ACC X", "GYR Z", "Battery", "Counter", "Validation"]
+    raw = mne.io.RawArray(np.zeros((13, 10)), mne.create_info(
+        [f"EEG {i}" for i in range(1, 9)] + extra, 250.0, "eeg"), verbose="error")
+    rep = E.apply_montage(raw, m, list(m.ch_names) + extra)
+    assert rep["n_positioned"] == 8 and not rep["missing"]
+    assert set(raw.get_channel_types(extra)) == {"misc"}

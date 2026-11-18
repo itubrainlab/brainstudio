@@ -1,0 +1,12 @@
+# g.tec Unicorn Hybrid Black: 8 EEG electrodes, amplifier input order.
+# Any further channels in a recording (accelerometer, gyroscope, battery, counter,
+# validation) keep their own names.
+# positions: standard_1005
+1 Fz
+2 C3
+3 Cz
+4 C4
+5 Pz
+6 PO7
+7 Oz
+8 PO8

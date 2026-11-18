@@ -68,7 +68,8 @@ class MontageDialog(QtWidgets.QDialog):
         v.addLayout(row)
         hint = QtWidgets.QLabel(
             "Names are matched to the montage case-insensitively. Channels named "
-            "*EOG*/*ECG*/*EMG* get that channel type. Leave a line unchanged to keep a name.")
+            "*EOG*/*ECG*/*EMG* get that channel type; ACC/GYR/Battery/Counter/Validation "
+            "become misc. Leave a line unchanged to keep a name.")
         hint.setWordWrap(True)
         hint.setEnabled(False)
         v.addWidget(hint)

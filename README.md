@@ -228,7 +228,9 @@ The *Columns* menu lists the available columns with example values.
 * **Channel layouts** are listed first. A layout gives the electrode for each amplifier
   input, so picking one also fills in the channel names. `gtec_64` is the g.tec 64-channel
   extended 10-20 "standard" setup: 1 Fp1 … 60 O2, 61 F9, 62 F10, 63 A1, 64 A2, ground
-  at AFz. It is preselected for recordings with 64 unnamed channels. Positions come from
+  at AFz. It is preselected for recordings with 64 unnamed channels. `gtec_unicorn` is
+  the g.tec Unicorn Hybrid Black: Fz, C3, Cz, C4, Pz, PO7, Oz, PO8. Extra channels keep
+  their names, and ACC/GYR/Battery/Counter/Validation become `misc`. Positions come from
   MNE's 10-05 template. To add your own layout, put a text file with one
   `<input> <name>` per line in `~/.brainstudio/montages/` (see
   `src/brainstudio/montages/gtec_64.txt`).

@@ -237,7 +237,10 @@ def montage_from_source(source: str) -> mne.channels.DigMontage:
 def guess_channel_type(name: str) -> str:
     n = name.upper()
     for key, kind in (("EOG", "eog"), ("ECG", "ecg"), ("EKG", "ecg"), ("EMG", "emg"),
-                      ("TRIG", "stim"), ("STI", "stim")):
+                      ("TRIG", "stim"), ("STI", "stim"),
+                      # g.tec Unicorn and similar: motion and housekeeping channels
+                      ("ACC", "misc"), ("GYR", "misc"), ("BATT", "misc"), ("COUNTER", "misc"),
+                      ("VALID", "misc")):
         if key in n:
             return kind
     return "eeg"
