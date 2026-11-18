@@ -509,7 +509,9 @@ class PreprocessTab(QtWidgets.QWidget):
         n_sug = int(sc["suggested"].sum())
         proxy = sc.attrs.get("proxy")
         eog = ", ".join(sc.attrs.get("eog_channels") or []) or "none"
+        note = getattr(self.pl.ica_fit_raw, "fit_note", "")
         self.ica_info.setText(
+            (f"⚠ {note}. " if note else "") +
             f"{len(sc)} components on {len(self.pl.ica.ch_names)} channels. "
             f"{n_sug} suggested as blink components "
             f"({'frontal proxies' if proxy else 'EOG'}: {eog}; eye-tracker blinks: "

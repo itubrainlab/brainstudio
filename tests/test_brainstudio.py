@@ -556,3 +556,14 @@ def test_event_delay_shifts_markers_not_data_annotations(demo):
                        after[after.name == "fixation"].onset)     # gaze events unchanged
     bad = rec.all_events()
     assert bad.loc[bad.description == "BAD_acq_gap", "onset"].iloc[0] == pytest.approx(10.0)
+
+
+def test_ica_uses_the_kept_channels_not_the_file_bad_list(demo):
+    """Channels the file marks bad but the user keeps must be in the ICA fit."""
+    from brainstudio import preprocessing as P
+    rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
+    raw = rec.raw.copy().load_data()
+    raw.info["bads"] = raw.ch_names[:20]          # e.g. from channels.tsv
+    ica, fit_raw = P.fit_ica(raw, bads=[], h_freq=40.0, p=P.ICAParams(n_components=20))
+    assert ica.n_components_ == 20 and len(ica.ch_names) > 20
+    assert fit_raw.info["bads"] == []

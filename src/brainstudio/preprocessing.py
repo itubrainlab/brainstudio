@@ -198,6 +198,9 @@ def fit_ica(raw: mne.io.BaseRaw, bads=(), h_freq=None, notch=None,
     if len(chans) < 3:
         raise ValueError("ICA needs at least 3 good EEG channels")
     fit_raw = _filtered(raw, max(p.l_freq, 0.1), h_freq, notch, picks=chans, tmin=tmin)
+    # ``chans`` are the channels the user kept: the file's own bad list (e.g. BIDS
+    # channels.tsv) must not drop any of them again inside ICA.fit
+    fit_raw.info["bads"] = []
     fit_raw.recording_t0 = _start_sample(raw, tmin) / raw.info["sfreq"]
     decim = max(1, int(fit_raw.info["sfreq"] // p.target_sfreq))
     if decim > 1:
@@ -213,8 +216,18 @@ def fit_ica(raw: mne.io.BaseRaw, bads=(), h_freq=None, notch=None,
                                 max_iter="auto",
                                 fit_params=dict(ortho=False, extended=True)
                                 if method == "picard" else None)
-    ica.fit(fit_raw, reject=dict(eeg=p.reject_uv * 1e-6) if p.reject_uv else None,
-            tstep=2.0, verbose="error")
+    fit_raw.fit_note = ""
+    try:
+        ica.fit(fit_raw, reject=dict(eeg=p.reject_uv * 1e-6) if p.reject_uv else None,
+                tstep=2.0, verbose="error")
+    except RuntimeError as e:
+        if "No clean segment" not in str(e):
+            raise
+        # every 2 s segment exceeds the rejection threshold, usually because noisy
+        # channels were kept: fit on all the data and say so
+        ica.fit(fit_raw, tstep=2.0, verbose="error")
+        fit_raw.fit_note = (f"every 2 s segment exceeded the {p.reject_uv:g} µV fit rejection "
+                            "(noisy channels kept?), so ICA was fitted without rejection")
     return ica, fit_raw
 
 
