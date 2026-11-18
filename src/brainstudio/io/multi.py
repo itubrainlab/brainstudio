@@ -76,9 +76,15 @@ def concatenate(recs: list[Recording], gap: float = 1.0) -> Recording:
                          f"{' …' if len(dropped) > 12 else ''}")
         sf = raws[0].info["sfreq"]
         types = dict(zip(raws[0].ch_names, raws[0].get_channel_types()))
+        # a channel bad in any file is bad in the joined recording (MNE needs one list)
+        bads = sorted({b for r in raws for b in r.info["bads"] if b in common},
+                      key=common.index)
+        if any(set(r.info["bads"]) & set(common) != set(bads) for r in raws):
+            notes.append(f"bad channels combined from all files: {', '.join(bads)}")
         prepared = []
         for r in raws:
             r = r.copy().load_data().pick(common)
+            r.info["bads"] = list(bads)
             ann = _relative_annotations(r)
             r.set_annotations(None)
             r.set_meas_date(None)

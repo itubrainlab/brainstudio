@@ -482,3 +482,35 @@ def test_bad_channels_and_ica_ignore_data_before_first_event(demo):
     ica, fit_raw = P.fit_ica(raw, [], 40.0, None, P.ICAParams(n_components=8), tmin=t0)
     assert P.fit_times(fit_raw)[0] == pytest.approx(t0, abs=0.01)
     assert P.score_blink_components(ica, fit_raw, ev.blinks).suggested.any()
+
+
+def test_iir_highpass_with_boundary_at_data_edge():
+    """A boundary annotation at the very start/end used to crash MNE's IIR path
+    (0-sample stretch); the result must equal MNE's filter without the annotation."""
+    import mne
+
+    from brainstudio import preprocessing as P
+    sf = 250
+    x = np.random.default_rng(0).normal(0, 1e-5, (3, sf * 20))
+    raw = mne.io.RawArray(x, mne.create_info(["Fz", "Cz", "Pz"], sf, "eeg"), verbose="error")
+    ref = raw.copy().filter(0.1, None, method="iir", iir_params=P.IIR_PARAMS,
+                            verbose="error").filter(None, 40, verbose="error")
+    for onset in (0.0, raw.times[-1] + 1 / sf):
+        r = raw.copy()
+        r.set_annotations(mne.Annotations([onset], [0], ["EDGE boundary"]))
+        out = P.run_preprocessing(r, P.PreprocParams(l_freq=0.1, h_freq=40))
+        assert np.allclose(out.get_data(), ref.get_data(), atol=1e-12)
+
+
+def test_join_recordings_with_different_bad_channels():
+    import mne
+
+    from brainstudio.io.multi import concatenate
+    from brainstudio.model import Recording
+    info = mne.create_info(["Fz", "Cz", "Pz"], 100.0, "eeg")
+    a = mne.io.RawArray(np.zeros((3, 500)), info, verbose="error")
+    b = a.copy()
+    a.info["bads"], b.info["bads"] = ["Cz"], ["Pz"]
+    joined = concatenate([Recording(raw=a), Recording(raw=b)])
+    assert joined.raw.info["bads"] == ["Cz", "Pz"] and joined.raw.n_times == 1000
+    assert "bad channels combined" in joined.description

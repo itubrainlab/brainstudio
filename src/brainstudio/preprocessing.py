@@ -121,6 +121,24 @@ def highpass_method(l_freq) -> dict:
     return {}
 
 
+def _iir_highpass(raw: mne.io.BaseRaw, l_freq: float, picks) -> None:
+    """Zero-phase Butterworth high-pass, in place, on each stretch between
+    ``edge``/``bad_acq_skip`` annotations (as ``Raw.filter`` does). Empty stretches are
+    skipped: MNE's IIR path divides by their length (a boundary annotation at the very
+    start or end of the data would crash it)."""
+    from mne.annotations import _annotations_starts_stops
+    starts, stops = _annotations_starts_stops(raw, ("edge", "bad_acq_skip"), invert=True)
+    if not len(starts):
+        starts, stops = np.array([0]), np.array([raw.n_times])
+    data = raw._data
+    for a, b in zip(starts, stops):
+        if b - a < 2:
+            continue
+        data[:, a:b] = mne.filter.filter_data(
+            data[:, a:b], raw.info["sfreq"], l_freq, None, picks=picks, method="iir",
+            iir_params=IIR_PARAMS, verbose="error")
+
+
 def _filtered(raw: mne.io.BaseRaw, l_freq, h_freq, notch, picks=None,
               tmin: float | None = None) -> mne.io.BaseRaw:
     out = raw.copy().load_data()
@@ -134,7 +152,7 @@ def _filtered(raw: mne.io.BaseRaw, l_freq, h_freq, notch, picks=None,
     h = h_freq if h_freq and h_freq < nyq else None
     l_freq = l_freq if l_freq and l_freq > 0 else None  # 0 Hz = no high-pass
     if len(fp) and l_freq and highpass_method(l_freq):
-        out.filter(l_freq, None, picks=fp, verbose="error", **highpass_method(l_freq))
+        _iir_highpass(out, l_freq, fp)
         if h:
             out.filter(None, h, picks=fp, verbose="error")
     elif len(fp) and (l_freq or h):
