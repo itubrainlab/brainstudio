@@ -567,3 +567,13 @@ def test_ica_uses_the_kept_channels_not_the_file_bad_list(demo):
     ica, fit_raw = P.fit_ica(raw, bads=[], h_freq=40.0, p=P.ICAParams(n_components=20))
     assert ica.n_components_ == 20 and len(ica.ch_names) > 20
     assert fit_raw.info["bads"] == []
+
+
+def test_ica_fit_is_bounded_on_long_data(demo):
+    from brainstudio import preprocessing as P
+    rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
+    ica, fit_raw = P.fit_ica(rec.raw, ["HEOG", "VEOG"], 40.0, None,
+                             P.ICAParams(n_components=8, max_samples=5000))
+    assert ica.n_components_ == 8
+    assert "fitted on every" in fit_raw.fit_note       # subsampled over the whole recording
+    assert fit_raw.n_times > 5000                        # scoring still sees all the data

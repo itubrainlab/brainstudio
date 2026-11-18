@@ -106,6 +106,8 @@ class ICAParams:
     l_freq: float = 1.0           # ICA is fitted on ≥ 1 Hz high-passed data
     reject_uv: float | None = 500.0  # skip 2 s segments above this ptp when fitting
     target_sfreq: float = 128.0   # decimate the fitting data to about this rate
+    max_samples: int = 300_000    # fit on at most this many samples (spread over the data)
+    max_iter: int = 500           # stop a fit that does not converge
     seed: int = 97
 
 
@@ -213,21 +215,32 @@ def fit_ica(raw: mne.io.BaseRaw, bads=(), h_freq=None, notch=None,
         except ImportError:
             method = "infomax"
     ica = mne.preprocessing.ICA(n_components=n, method=method, rng=p.seed,
-                                max_iter="auto",
+                                max_iter=p.max_iter,
                                 fit_params=dict(ortho=False, extended=True)
                                 if method == "picard" else None)
     fit_raw.fit_note = ""
+    # long recordings: fit on every k-th sample, spread over the whole recording, so the
+    # fit time stays bounded (ICA needs far fewer samples than hours of EEG give)
+    every = max(1, int(np.ceil(fit_raw.n_times / p.max_samples)))
+    notes = []
+    if every > 1:
+        notes.append(f"fitted on every {every}th sample ({fit_raw.n_times // every:,} of "
+                     f"{fit_raw.n_times:,})")
     try:
         ica.fit(fit_raw, reject=dict(eeg=p.reject_uv * 1e-6) if p.reject_uv else None,
-                tstep=2.0, verbose="error")
+                tstep=2.0, decim=every, verbose="error")
     except RuntimeError as e:
         if "No clean segment" not in str(e):
             raise
         # every 2 s segment exceeds the rejection threshold, usually because noisy
         # channels were kept: fit on all the data and say so
-        ica.fit(fit_raw, tstep=2.0, verbose="error")
-        fit_raw.fit_note = (f"every 2 s segment exceeded the {p.reject_uv:g} µV fit rejection "
-                            "(noisy channels kept?), so ICA was fitted without rejection")
+        ica.fit(fit_raw, tstep=2.0, decim=every, verbose="error")
+        notes.insert(0, f"every 2 s segment exceeded the {p.reject_uv:g} µV fit rejection "
+                        "(noisy channels kept?), so ICA was fitted without rejection")
+    if getattr(ica, "n_iter_", 0) >= p.max_iter:
+        notes.append(f"stopped after {p.max_iter} iterations without converging — fewer "
+                     "components or more bad channels may help")
+    fit_raw.fit_note = "; ".join(notes)
     return ica, fit_raw
 
 

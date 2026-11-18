@@ -44,7 +44,17 @@ class Worker(QtCore.QObject):
         self.progress.setVisible(False)
         self.label = QtWidgets.QLabel("")
         window.statusBar().addPermanentWidget(self.label)
+        # elapsed time of the running job, so long computations visibly progress
+        self._clock = QtCore.QElapsedTimer()
+        self._tick = QtCore.QTimer(self)
+        self._tick.setInterval(1000)
+        self._tick.timeout.connect(self._show_elapsed)
+        self._text = ""
         window.statusBar().addPermanentWidget(self.progress)
+
+    def _show_elapsed(self):
+        s = self._clock.elapsed() // 1000
+        self.label.setText(f"{self._text}  {s // 60}:{s % 60:02d}")
 
     def run(self, label: str, fn, done, failed=None) -> bool:
         if self.busy:
@@ -53,12 +63,16 @@ class Worker(QtCore.QObject):
             return False
         self.busy = True
         self.busyChanged.emit(True)
+        self._text = label
         self.label.setText(label)
+        self._clock.start()
+        self._tick.start()
         self.progress.setVisible(True)
         sig = _Signals()
         self._keep = sig
 
         def finish():
+            self._tick.stop()
             self.busy = False
             self.progress.setVisible(False)
             self.label.setText("")

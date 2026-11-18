@@ -306,7 +306,10 @@ The **EEG** tab is a three-stage pipeline:
   - Low-pass and notch.
   - Reference: keep, average, one channel, or the mean of several (`M1, M2`).
 - **ICA blink removal** (`mne.preprocessing.ICA`, picard).
-  - It is fitted on a ≥ 1 Hz copy of the good, non-flat channels.
+  - It is fitted on a ≥ 1 Hz copy of the good, non-flat channels, at most 300,000
+    samples spread over the whole recording (long or combined recordings are subsampled,
+    so the fit stays quick) and at most 500 iterations. The ICA panel says when either
+    limit was used.
   - Components are scored by how strongly they respond around the eye tracker's blinks
     (a blink-locked t-score), and against EOG or, without EOG, the frontal electrodes
     (`find_bads_eog`).
