@@ -91,8 +91,8 @@ BrainStudio is styled like the lab's other app, brAInStream:
 
 The style sheet is BrainStudio's own; no g.Pype files are used.
 
-The **Dataset** and **Controls** docks belong to the Viewer tab and are hidden on the
-EEG and Gaze tabs.
+The **Dataset** and **Controls** docks belong to the Viewer tab: they are hidden on the
+EEG and Gaze tabs and cannot be closed (they can be moved, floated and resized).
 
 **Dataset dock** (left):
 * a **ribbon** of buttons for the File menu's functions: BIDS, File, Eye data, Montage,

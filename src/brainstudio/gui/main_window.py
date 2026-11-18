@@ -113,6 +113,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addToolBar(QtCore.Qt.TopToolBarArea, bar)
         self.toolbar = bar
 
+    @staticmethod
+    def _fix_dock(dock: QtWidgets.QDockWidget):
+        """Viewer docks cannot be closed (they still move, float and resize)."""
+        dock.setFeatures(QtWidgets.QDockWidget.DockWidgetMovable |
+                         QtWidgets.QDockWidget.DockWidgetFloatable)
+        dock.toggleViewAction().setVisible(False)
+
     def _show_shortcuts(self):
         QtWidgets.QMessageBox.information(
             self, "Shortcuts", "←/→  previous/next page\nSpace  play/pause\n"
@@ -326,6 +333,7 @@ class MainWindow(QtWidgets.QMainWindow):
         w.setMinimumWidth(330)
         self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, dock)
         self.left_dock = dock
+        self._fix_dock(dock)
         self._update_ribbon()
 
     def _build_right_dock(self):
@@ -436,6 +444,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dock.setWidget(scroll)
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
         self.right_dock = dock
+        self._fix_dock(dock)
 
     def _build_menu(self):
         m = self.menuBar().addMenu("&File")
@@ -459,9 +468,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if key:
                 a.setShortcut(QtGui.QKeySequence(key))
             a.triggered.connect(fn)
-        v = self.menuBar().addMenu("&View")
-        v.addAction(self.left_dock.toggleViewAction())
-        v.addAction(self.right_dock.toggleViewAction())
         h = self.menuBar().addMenu("&Help")
         h.addAction("Keyboard shortcuts", lambda: QtWidgets.QMessageBox.information(
             self, "Shortcuts", "←/→  previous/next page\nSpace  play/pause\n"
