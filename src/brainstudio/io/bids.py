@@ -355,6 +355,16 @@ def load_bids_run(root: str | Path, run: BidsRun, screen_size=None) -> Recording
                     raw.info["line_freq"] = float(pl)
         eeg_meta = _sidecar(run.eeg)
         rec.raw = raw
+        ev_file = _bids_file(run.eeg, "events.tsv")
+        if ev_file is not None:  # every column of events.tsv, not just trial_type
+            tsv = events_from_tsv(ev_file)
+            if len(tsv):
+                from ..model import is_data_annotation
+                a = raw.annotations
+                keep = is_data_annotation(pd.Series(a.description)).to_numpy()
+                raw.set_annotations(a[np.flatnonzero(keep)] if keep.any() else
+                                    mne.Annotations([], [], [], orig_time=a.orig_time))
+                rec.events = pd.concat([rec.events, tsv], ignore_index=True)
         if raw.get_montage() is not None and meta["electrodes_file"]:
             meta["montage_source"] = f"{meta['electrodes_file']} (from the dataset)"
         elif raw.get_montage() is None or not meta["electrodes_file"]:
@@ -388,6 +398,46 @@ def load_bids_run(root: str | Path, run: BidsRun, screen_size=None) -> Recording
     if rec.metadata:
         rec.description += "\n" + describe_metadata(rec.metadata)
     return rec
+
+
+#: events.tsv columns that are not attributes of an event
+_EVENT_SKIP = {"onset", "duration", "trial_type", "sample"}
+
+
+def events_from_tsv(path: Path) -> pd.DataFrame:
+    """All rows of a BIDS ``events.tsv`` as events, keeping every column.
+
+    The name is ``trial_type`` (else ``value``, else "event"); every other column
+    becomes an attribute (``NAME|column=value|…``), so it can be filtered on.
+    MNE-BIDS keeps only ``trial_type`` when it turns events into annotations.
+    """
+    df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
+    if "onset" not in df:
+        return pd.DataFrame(columns=["onset", "duration", "description"])
+    df = df[df["onset"].str.lower() != "n/a"]
+    onset = pd.to_numeric(df["onset"], errors="coerce")
+    dur = pd.to_numeric(df.get("duration", pd.Series("0", index=df.index)),
+                        errors="coerce").fillna(0.0)
+    if "trial_type" in df:
+        names = df["trial_type"]
+    elif "value" in df:
+        names = df["value"]
+    else:
+        names = pd.Series("event", index=df.index)
+    attrs = [c for c in df.columns if c not in _EVENT_SKIP and not
+             (c == "value" and "trial_type" not in df)]
+
+    def safe(v: str) -> str:
+        return str(v).replace("|", "/").replace("=", ":").strip()
+
+    desc = []
+    for i in df.index:
+        name = safe(names[i]) if names[i] not in ("", "n/a") else "event"
+        parts = [f"{c}={safe(df.at[i, c])}" for c in attrs if df.at[i, c] not in ("", "n/a")]
+        desc.append("|".join([name] + parts))
+    out = pd.DataFrame({"onset": onset.to_numpy(float), "duration": dur.to_numpy(float),
+                        "description": desc})
+    return out[np.isfinite(out["onset"])].reset_index(drop=True)
 
 
 def _apply_channels_tsv(raw: mne.io.BaseRaw, eeg: Path) -> None:

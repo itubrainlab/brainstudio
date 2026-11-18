@@ -577,3 +577,28 @@ def test_ica_fit_is_bounded_on_long_data(demo):
     assert ica.n_components_ == 8
     assert "fitted on every" in fit_raw.fit_note       # subsampled over the whole recording
     assert fit_raw.n_times > 5000                        # scoring still sees all the data
+
+
+def test_bids_events_tsv_columns_and_column_filters(tmp_path):
+    """Every events.tsv column becomes a filterable event column; column conditions."""
+    from brainstudio import events as EV
+    from brainstudio.io import bids as B
+    f = tmp_path / "sub-01_task-x_run-1_events.tsv"
+    f.write_text("onset\tduration\tSOA\tlabel\ttrial_type\tanswering_time\tsample\n"
+                 "1.0\t0.9\t0.5\thuman\teerie\t1.5\t256\n"
+                 "4.5\t1.0\t0.4\tanimated\tnot_eerie\t2.8\t1160\n"
+                 "8.3\t1.1\t0.5\thuman\tnot_eerie\tn/a\t2128\n")
+    ev = B.events_from_tsv(f)
+    assert list(ev.onset) == [1.0, 4.5, 8.3]
+    assert ev.description[0] == "eerie|SOA=0.5|label=human|answering_time=1.5"
+    rec = __import__("brainstudio.model", fromlist=["x"]).Recording(events=ev)
+    t = EV.build_event_table(rec)
+    assert {"soa", "label", "answering_time"} <= set(t.columns)
+    human = EV.filter_events(t, conditions=[("label", "=", "human")])
+    assert list(human.name) == ["eerie", "not_eerie"]
+    fast = EV.filter_events(t, conditions=[("label", "=", "human"),
+                                           ("answering_time", "<", "2")])
+    assert list(fast.name) == ["eerie"]
+    assert len(EV.filter_events(t, conditions=[("label", "one of", "human, animated")])) == 3
+    with pytest.raises(ValueError, match="compares numbers"):
+        EV.filter_events(t, conditions=[("label", "<", "x")])

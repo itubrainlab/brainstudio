@@ -175,13 +175,66 @@ def build_event_table(rec: Recording, gaze_events: GazeEvents | None = None,
     return df[order]
 
 
+#: operators of a filter condition (column, operator, value)
+OPERATORS = ("=", "≠", "<", "≤", ">", "≥", "contains", "one of")
+
+
+def _cond_mask(s: pd.Series, op: str, value: str, col: str) -> pd.Series:
+    value = str(value).strip()
+    if op == "contains":
+        return s.astype(str).str.contains(value, case=False, regex=False, na=False)
+    if op == "one of":
+        wanted = [v.strip() for v in value.split(",") if v.strip()]
+        if pd.api.types.is_numeric_dtype(s):
+            try:
+                return s.isin([float(v) for v in wanted])
+            except ValueError:
+                pass
+        return s.astype(str).isin(wanted)
+    num = pd.to_numeric(s, errors="coerce")
+    try:
+        v = float(value)
+        numeric = num.notna().any()
+    except ValueError:
+        v, numeric = value, False
+    if op in ("=", "≠"):
+        if numeric and pd.api.types.is_numeric_dtype(s):
+            m = num == v
+        else:
+            m = s.astype(str) == value
+        return m if op == "=" else ~m
+    if not numeric:
+        raise ValueError(f"“{col} {op} {value}” compares numbers: use a number "
+                         "(or =, ≠, contains, one of for text)")
+    return {"<": num < v, "≤": num <= v, ">": num > v, "≥": num >= v}[op].fillna(False)
+
+
+def apply_conditions(df: pd.DataFrame, conditions) -> pd.DataFrame:
+    """Keep rows matching every (column, operator, value) condition (see OPERATORS)."""
+    out = df
+    for col, op, value in conditions or ():
+        if not col or (value in (None, "") and op != "≠"):
+            continue
+        if col not in out:
+            raise ValueError(f"No column “{col}” in the event table")
+        if op not in OPERATORS:
+            raise ValueError(f"Unknown operator {op!r}")
+        out = out[_cond_mask(out[col], op, value, col).to_numpy()]
+    return out
+
+
+def describe_conditions(conditions) -> str:
+    return " and ".join(f"{c} {op} {v}" for c, op, v in conditions or () if c and v != "")
+
+
 def filter_events(df: pd.DataFrame, text: str = "", query: str = "",
-                  names: set[str] | None = None) -> pd.DataFrame:
-    """Apply a regex on ``description``, a pandas ``query`` and a name whitelist.
+                  names: set[str] | None = None, conditions=None) -> pd.DataFrame:
+    """Apply column ``conditions`` [(column, operator, value), …], a regex on
+    ``description``, a pandas ``query`` and a name whitelist.
 
     Raises ``ValueError`` with a readable message for invalid filters.
     """
-    out = df
+    out = apply_conditions(df, conditions)
     if text.strip():
         try:
             out = out[out["description"].astype(str).str.contains(text, case=False, regex=True)]

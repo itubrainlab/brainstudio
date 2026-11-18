@@ -64,7 +64,7 @@ class EpochTab(QtWidgets.QWidget):
         row.addStretch()
         bv.addLayout(row)
         bv.addWidget(hint("Each group is one condition: tick its event types and narrow them "
-                          "with filters (e.g. phase == \"READING\" and cond == \"AI\"). "
+                          "with “+ Filter by column” (e.g. label = human, answering_time < 2). "
                           "The label is used in all plots and tables."))
         lv.addWidget(box)
         self.stack = QtWidgets.QStackedWidget()
@@ -186,6 +186,7 @@ class EpochTab(QtWidgets.QWidget):
         sel = self.add_group(default=cur.checked_names(), label=cur.label() + " copy")
         sel.text.setText(cur.text.text())
         sel.query.setText(cur.query.text())
+        sel.set_conditions(cur.conditions())
 
     def remove_group(self):
         i = self.groups.currentRow()
@@ -248,7 +249,7 @@ class EpochTab(QtWidgets.QWidget):
         if sel is self.current():
             self._show_rows()
         sig = (sel.label(), tuple(sorted(sel.checked_names())), sel.text.text(),
-               sel.query.text(), n)
+               sel.query.text(), tuple(sel.conditions()), n)
         if self._sigs.get(id(sel)) != sig:  # only real changes make epochs out of date
             self._sigs[id(sel)] = sig
             self.pl.mark_stale("epoching")

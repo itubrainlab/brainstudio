@@ -129,6 +129,10 @@ Loading a BIDS run also reads the dataset's own information:
 - **Bad channels** from `channels.tsv` (`status` = bad, with `status_description`). They
   start unticked in ① Preprocessing, labelled *bad in the dataset* with the reason.
   **Detect bad channels** adds to them; you can re-tick any channel.
+- **Events with every column** of `events.tsv`. `trial_type` is the event name, and
+  every other column (e.g. `SOA`, `label`, `answering_time`) becomes a filterable column,
+  named in lower case (`soa`). MNE-BIDS alone keeps only `trial_type`. Data annotations
+  such as `BAD_ACQ_SKIP` are kept.
 - **Electrode positions** from the dataset's `electrodes.tsv` and `coordsystem.json`,
   including subject-level files such as `sub-01_space-CapTrak_electrodes.tsv`. Without
   one, the 10-05 template is matched by channel name.
@@ -425,8 +429,12 @@ All markers and detected gaze events go into one table
 Each event selector combines:
 
 - a **checklist** of event names, with live counts;
+- **column filters** (“+ Filter by column”, or pick a column in **Columns**). Each is
+  a column, an operator (=, ≠, <, ≤, >, ≥, *contains*, *one of*) and a value chosen
+  from that column's values or typed. All filters must match, e.g. `label = human` and
+  `answering_time < 2`;
 - a **text filter**: a regular expression on the description;
-- a **metadata filter**: a pandas `query`, the same syntax as MNE's `epochs['…']`.
+- an **advanced filter**: a pandas `query`, the same syntax as MNE's `epochs['…']`.
   Examples:
   - `phase == "READING" and cond == "AI"`
   - `duration > 0.2 and aoi == "TOP"`
