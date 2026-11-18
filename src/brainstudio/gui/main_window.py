@@ -65,6 +65,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline.changed.connect(self._on_pipeline)
         self.pipeline.stateChanged.connect(self._update_pipeline_titles)
         self._update_pipeline_titles()
+        self._docks_shown = None  # dock visibility saved while away from the Viewer
         self._apply_theme()
         hints = QtGui.QGuiApplication.styleHints()
         if hasattr(hints, "colorSchemeChanged"):  # Qt >= 6.5: follow system light/dark
@@ -1252,6 +1253,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_tab(self, i):
         if self.tabs.widget(i) is self.gaze_tab:
             self.gaze_tab.update_aoi_stats()
+        # the Dataset and Controls docks belong to the Viewer tab
+        viewer = i == 0
+        if not viewer and self._docks_shown is None:
+            self._docks_shown = {d: d.isVisible() for d in (self.left_dock, self.right_dock)}
+            for d in self._docks_shown:
+                d.hide()
+        elif viewer and self._docks_shown is not None:
+            for d, was in self._docks_shown.items():
+                d.setVisible(was)
+            self._docks_shown = None
 
     def _event_jump(self, row, _col):
         try:
