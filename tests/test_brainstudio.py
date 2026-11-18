@@ -514,3 +514,28 @@ def test_join_recordings_with_different_bad_channels():
     joined = concatenate([Recording(raw=a), Recording(raw=b)])
     assert joined.raw.info["bads"] == ["Cz", "Pz"] and joined.raw.n_times == 1000
     assert "bad channels combined" in joined.description
+
+
+def test_bids_dataset_info_bads_and_positions(tmp_path):
+    """BIDS: bad channels (with reasons) from channels.tsv, dataset/sidecar info, and the
+    subject-level space-…_electrodes.tsv found for every run."""
+    from brainstudio.io import bids as B
+    from brainstudio.io import load_bids_runs
+    root = tmp_path / "bids"
+    write_bids(root, subjects=("01",))
+    ch = next(root.rglob("*_channels.tsv"))
+    df = pd.read_csv(ch, sep="\t", dtype=str, keep_default_na=False)
+    df.loc[df.name == "Cz", ["status", "status_description"]] = ["bad", "broken lead"]
+    df.loc[df.name == "Pz", "status"] = "bad"
+    df.to_csv(ch, sep="\t", index=False)
+    run = scan_bids(root)[0]
+    rec = load_bids_runs(root, [run])
+    assert set(rec.raw.info["bads"]) == {"Cz", "Pz"}
+    assert rec.metadata["bad_channels"]["Cz"] == "broken lead"
+    assert rec.metadata["dataset"]["Name"] == "BrainStudio synthetic free-viewing"
+    assert "Bad channels (channels.tsv): Pz, Cz (broken lead)" in rec.description
+    assert rec.metadata["montage_source"]  # template or electrodes file
+    # electrodes.tsv at subject level with a space- entity (no task/run)
+    el = run.eeg.with_name("sub-01_space-CapTrak_electrodes.tsv")
+    el.write_text("name\tx\ty\tz\nCz\t0\t0\t0.1\n")
+    assert B._electrodes_file(run.eeg) == el

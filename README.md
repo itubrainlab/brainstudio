@@ -122,6 +122,27 @@ Marker streams often carry several text columns per sample, for example
 - Events with a duration also act as **phases**: gaze fixations inside a trial inherit
   the trial's name and attributes.
 
+### BIDS dataset information
+
+Loading a BIDS run also reads the dataset's own information:
+
+- **Bad channels** from `channels.tsv` (`status` = bad, with `status_description`). They
+  start unticked in ① Preprocessing, labelled *bad in the dataset* with the reason.
+  **Detect bad channels** adds to them; you can re-tick any channel.
+- **Electrode positions** from the dataset's `electrodes.tsv` and `coordsystem.json`,
+  including subject-level files such as `sub-01_space-CapTrak_electrodes.tsv`. Without
+  one, the 10-05 template is matched by channel name.
+- **Channel types** from `channels.tsv`, and the **power-line frequency**
+  (`PowerLineFrequency`), which sets the notch filter.
+- The **info panel** shows the dataset (name, authors, licence, DOI), the participant
+  (`participants.tsv`), and the device and cap. It also shows reference, ground and
+  placement, the online filters already applied, the recording timing, and where the
+  positions came from.
+
+MNE-BIDS reads the files. If it fails on broken sidecars, BrainStudio falls back to a
+plain reader and applies `channels.tsv` itself. When runs are combined, a channel bad in
+any run is bad in the combined recording.
+
 ### Several files
 
 Several XDF files, several EDF/BDF/… files, or several BIDS runs can be loaded together.

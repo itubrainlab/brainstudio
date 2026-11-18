@@ -106,6 +106,9 @@ class Recording:
     # (subject, session, task, acq, run) and file; see brainstudio.io.multi
     segments: list = field(default_factory=list)
     sources: list = field(default_factory=list)
+    # Dataset information (BIDS: dataset, participant, eeg.json fields, bad channels
+    # with reasons, where the electrode positions come from); see io.bids.bids_metadata
+    metadata: dict = field(default_factory=dict)
 
     @property
     def has_eeg(self) -> bool:

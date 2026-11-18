@@ -215,6 +215,15 @@ class PreprocessTab(QtWidgets.QWidget):
     def _on_pipeline(self, what):
         if what in ("events", "recording"):
             self._update_first_event_label()
+        if what == "recording" and self.pl.raw is not None:
+            raw = self.pl.raw
+            self.pl.params.bads = list(raw.info["bads"])  # e.g. from BIDS channels.tsv
+            lf = raw.info.get("line_freq")
+            if lf in (50.0, 60.0):  # the dataset's power-line frequency
+                self.notch.blockSignals(True)
+                self.notch.setCurrentText(f"{lf:g} Hz")
+                self.notch.blockSignals(False)
+                self.notch.setToolTip(f"Set from the dataset's power-line frequency ({lf:g} Hz)")
         if what == "recording":
             self._stats = None
             self._blink_before = self._blink_after = None
@@ -312,18 +321,23 @@ class PreprocessTab(QtWidgets.QWidget):
         self.ch_table.setHorizontalHeaderLabels(cols)
         self.ch_table.setRowCount(len(names))
         st = self._stats.set_index("channel") if self._stats is not None else None
-        bads = set(self.pl.params.bads) | set(raw.info["bads"])
+        bads = set(self.pl.params.bads)
+        dataset_bad = self.dataset_bads()
         for i, n in enumerate(names):
             use = QtWidgets.QTableWidgetItem("")
             use.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
             use.setCheckState(UNCHECKED if n in bads else CHECKED)
             use.setData(QtCore.Qt.UserRole, n)
             self.ch_table.setItem(i, 0, use)
-            vals = [n]
+            vals = [n, "", "", "", "", ""]
             if st is not None and n in st.index:
                 r = st.loc[n]
-                vals += [f"{r.median_ptp_uv:.1f}", f"{r.noisy_pct:.0f}", f"{r.flat_pct:.0f}",
-                         f"{r.z:+.1f}", r.reason]
+                vals = [n, f"{r.median_ptp_uv:.1f}", f"{r.noisy_pct:.0f}", f"{r.flat_pct:.0f}",
+                        f"{r.z:+.1f}", r.reason]
+            if n in dataset_bad:
+                why = dataset_bad[n]
+                why = "bad in the dataset" + ("" if why.startswith("status bad") else f": {why}")
+                vals[5] = "; ".join(x for x in (why, vals[5]) if x)
             for j, txt in enumerate(vals, start=1):
                 it = QtWidgets.QTableWidgetItem(str(txt))
                 it.setFlags(QtCore.Qt.ItemIsEnabled)
@@ -331,6 +345,11 @@ class PreprocessTab(QtWidgets.QWidget):
         self.ch_table.resizeColumnsToContents()
         self.ch_table.blockSignals(False)
         self._update_bad_count()
+
+    def dataset_bads(self) -> dict[str, str]:
+        """Channels the dataset marks bad (BIDS channels.tsv), with the reason given."""
+        rec = self.pl.rec
+        return dict(rec.metadata.get("bad_channels", {})) if rec is not None else {}
 
     def bads(self) -> list[str]:
         out = []
@@ -342,6 +361,7 @@ class PreprocessTab(QtWidgets.QWidget):
 
     def _ch_item_changed(self, item):
         if item.column() == 0:
+            self.pl.params.bads = self.bads()  # the table is what the user decided
             self._update_bad_count()
             self._plot_ptp()
             self.pl.mark_stale("preprocessing")
@@ -390,7 +410,9 @@ class PreprocessTab(QtWidgets.QWidget):
             bads = df.loc[df["bad"], "channel"].tolist()
             if isinstance(refs, list):
                 bads = [b for b in bads if b not in refs]
-            self.pl.params.bads = bads
+            # detection adds to the channels the dataset already marks bad
+            keep = [b for b in self.bads() if b in self.dataset_bads()]
+            self.pl.params.bads = keep + [b for b in bads if b not in keep]
             self.refresh_channels()
             self._plot_ptp()
             self.right.setCurrentIndex(1)

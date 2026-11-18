@@ -145,6 +145,10 @@ def concatenate(recs: list[Recording], gap: float = 1.0) -> Recording:
     out.segments = segments
     out.streams = recs[0].streams
     out.sources = [r.source for r in recs]
+    if any(r.metadata for r in recs):  # first file's info; bad channels from all files
+        out.metadata = dict(recs[0].metadata)
+        out.metadata["bad_channels"] = {c: why for r in recs
+                                        for c, why in r.metadata.get("bad_channels", {}).items()}
     desc = [f"{len(recs)} files combined" + (": " + "; ".join(notes) if notes else "")]
     for s, r in zip(segments, recs):
         desc.append(f"[{s.get('file', r.source)} @ {s['start']:.1f} s] {r.description}")

@@ -108,6 +108,138 @@ def dataset_description(root: str | Path) -> dict:
     return json.loads(f.read_text()) if f.exists() else {}
 
 
+# --------------------------------------------------------------------------- metadata
+#: eeg.json fields shown in the info panel (and kept in Recording.metadata)
+EEG_SIDECAR_KEYS = (
+    "TaskName", "TaskDescription", "PowerLineFrequency", "EEGReference", "EEGGround",
+    "EEGPlacementScheme", "CapManufacturer", "CapManufacturersModelName", "Manufacturer",
+    "ManufacturersModelName", "SoftwareVersions", "SoftwareFilters", "HardwareFilters",
+    "RecordingDuration", "RecordingType", "InstitutionName",
+    "InstitutionalDepartmentName", "RecordingTiming")
+
+
+def _bids_file(eeg: Path, suffix: str) -> Path | None:
+    """Sidecar of an EEG file: same entities, another suffix (inherits up the tree)."""
+    stem = eeg.name.rsplit("_", 1)[0]
+    cand = eeg.with_name(f"{stem}_{suffix}")
+    if cand.exists():
+        return cand
+    # BIDS inheritance: drop entities from the right (run, acq, task…)
+    parts = stem.split("_")
+    for k in range(len(parts) - 1, 0, -1):
+        c = eeg.with_name("_".join(parts[:k]) + f"_{suffix}")
+        if c.exists():
+            return c
+    return None
+
+
+def _electrodes_file(eeg: Path) -> Path | None:
+    """The subject's (session's) ``*_electrodes.tsv``: usually per subject/session with a
+    ``space-`` entity (e.g. ``sub-01_space-CapTrak_electrodes.tsv``), not per run."""
+    exact = _bids_file(eeg, "electrodes.tsv")
+    if exact is not None:
+        return exact
+    ent = get_entities_from_fname(eeg.name)
+    prefix = f"sub-{ent['subject']}" + (f"_ses-{ent['session']}" if ent.get("session") else "")
+    found = sorted(eeg.parent.glob(f"{prefix}*_electrodes.tsv"))
+    return found[0] if found else None
+
+
+def channel_status(eeg: Path) -> pd.DataFrame:
+    """``channels.tsv``: name, type, units, status, status_description (as text)."""
+    f = _bids_file(eeg, "channels.tsv")
+    if f is None:
+        return pd.DataFrame(columns=["name", "type", "status", "status_description"])
+    df = pd.read_csv(f, sep="\t", dtype=str, keep_default_na=False)
+    for c in ("status", "status_description", "type"):
+        if c not in df:
+            df[c] = ""
+    return df
+
+
+def bids_metadata(root: str | Path, run: BidsRun) -> dict:
+    """Dataset, participant, recording sidecar and channel information of a run."""
+    root = Path(root)
+    meta: dict = {"dataset": {}, "participant": {}, "eeg": {}, "bad_channels": {},
+                  "montage_source": "", "electrodes_file": ""}
+    desc = dataset_description(root)
+    meta["dataset"] = {k: desc[k] for k in ("Name", "BIDSVersion", "Authors", "License",
+                                            "DatasetDOI", "HowToAcknowledge")
+                       if desc.get(k) not in (None, "", "n/a", ["n/a"], [])}
+    sub = run.entities.get("subject")
+    part = root / "participants.tsv"
+    if sub and part.exists():
+        df = pd.read_csv(part, sep="\t", dtype=str, keep_default_na=False)
+        row = df[df.get("participant_id", pd.Series(dtype=str)) == f"sub-{sub}"]
+        if len(row):
+            meta["participant"] = {k: v for k, v in row.iloc[0].items()
+                                   if k != "participant_id" and v not in ("", "n/a")}
+    if run.eeg is not None:
+        side = _sidecar(run.eeg)
+        meta["eeg"] = {k: side[k] for k in EEG_SIDECAR_KEYS if k in side and side[k] != "n/a"}
+        ch = channel_status(run.eeg)
+        bad = ch[ch["status"].str.lower() == "bad"]
+        meta["bad_channels"] = {r.name: (r.status_description if r.status_description
+                                         not in ("", "n/a") else "status bad in channels.tsv")
+                                for r in bad.itertuples()}
+        el = _electrodes_file(run.eeg)
+        meta["electrodes_file"] = el.name if el is not None else ""
+    return meta
+
+
+def describe_metadata(meta: dict) -> str:
+    """Readable summary for the info panel."""
+    if not meta:
+        return ""
+    out = []
+    d = meta.get("dataset", {})
+    if d:
+        line = d.get("Name", "")
+        if d.get("Authors"):
+            a = d["Authors"]
+            line += f" — {', '.join(a) if isinstance(a, list) else a}"
+        if d.get("License"):
+            line += f" — licence {d['License']}"
+        if d.get("DatasetDOI"):
+            line += f" — {d['DatasetDOI']}"
+        out.append("Dataset: " + line.strip(" —"))
+    if meta.get("participant"):
+        out.append("Participant: " + ", ".join(f"{k} {v}" for k, v in meta["participant"].items()))
+    e = meta.get("eeg", {})
+    dev = " ".join(str(e[k]) for k in ("Manufacturer", "ManufacturersModelName") if k in e)
+    cap = " ".join(str(e[k]) for k in ("CapManufacturer", "CapManufacturersModelName") if k in e)
+    if dev or cap:
+        out.append("Device: " + dev + (f"; cap: {cap}" if cap and cap != dev else ""))
+    ref = [f"reference {e['EEGReference']}" if "EEGReference" in e else "",
+           f"ground {e['EEGGround']}" if "EEGGround" in e else "",
+           f"placement {e['EEGPlacementScheme']}" if "EEGPlacementScheme" in e else "",
+           f"power line {e['PowerLineFrequency']} Hz" if "PowerLineFrequency" in e else ""]
+    if any(ref):
+        out.append("Recording: " + ", ".join(r for r in ref if r))
+    sf = e.get("SoftwareFilters")
+    if isinstance(sf, dict) and sf:
+        parts = []
+        for name, f in sf.items():
+            if isinstance(f, dict):
+                cut = f.get("CutoffFrequency", f.get("Frequencies", ""))
+                parts.append(f"{name} {cut} Hz" + (" (causal)" if f.get("Causal") else ""))
+            else:
+                parts.append(f"{name}: {f}")
+        out.append("Online filters already applied: " + "; ".join(parts))
+    rt = e.get("RecordingTiming")
+    if isinstance(rt, dict) and "MeasuredSamplingFrequency" in rt:
+        out.append(f"Timing: measured rate {rt['MeasuredSamplingFrequency']} Hz"
+                   + (f", clock deviation {rt['ClockDeviationPPM']} ppm"
+                      if "ClockDeviationPPM" in rt else ""))
+    if meta.get("montage_source"):
+        out.append("Electrode positions: " + meta["montage_source"])
+    bad = meta.get("bad_channels", {})
+    plain = [c for c, why in bad.items() if why.startswith("status bad")]
+    told = [f"{c} ({why})" for c, why in bad.items() if not why.startswith("status bad")]
+    out.append("Bad channels (channels.tsv): " + (", ".join(plain + told) if bad else "none"))
+    return "\n".join(out)
+
+
 # --------------------------------------------------------------------------- gaze
 def _infer_time_scale(ts: np.ndarray, sfreq: float | None, units: str | None) -> float:
     """Factor converting the timestamp column to seconds."""
@@ -207,15 +339,32 @@ def load_bids_run(root: str | Path, run: BidsRun, screen_size=None) -> Recording
                       task=ent.get("task"), acquisition=ent.get("acquisition"),
                       run=ent.get("run"), datatype=run.eeg.parent.name, suffix="eeg",
                       extension=run.eeg.suffix)
+        meta = bids_metadata(root, run)
         try:
             raw = read_raw_bids(bp, verbose="error")
+            fallback = False
         except Exception:  # fall back to plain MNE reader if sidecars are broken
             raw = mne.io.read_raw(run.eeg, verbose="error")
+            fallback = True
         raw.load_data(verbose="error")
+        if fallback:  # apply channels.tsv ourselves: types and bad channels
+            _apply_channels_tsv(raw, run.eeg)
+            pl = _sidecar(run.eeg).get("PowerLineFrequency")
+            if isinstance(pl, (int, float)):
+                with raw.info._unlock():
+                    raw.info["line_freq"] = float(pl)
         eeg_meta = _sidecar(run.eeg)
         rec.raw = raw
-        if raw.get_montage() is None:
+        if raw.get_montage() is not None and meta["electrodes_file"]:
+            meta["montage_source"] = f"{meta['electrodes_file']} (from the dataset)"
+        elif raw.get_montage() is None or not meta["electrodes_file"]:
             set_standard_montage(raw)
+            n = sum(1 for ch in raw.info["chs"] if ch["kind"] == 2 and
+                    np.isfinite(ch["loc"][:3]).all() and np.abs(ch["loc"][:3]).sum() > 0)
+            meta["montage_source"] = (f"standard 10-05 template by channel name ({n} EEG "
+                                      "channels)" if n else "none (names do not match the "
+                                      "10-05 template: use Montage)")
+        rec.metadata = meta
         g = gaze_from_raw(raw, screen_size or (1920, 1080))
         if g is not None:
             rec.gaze = g
@@ -236,4 +385,22 @@ def load_bids_run(root: str | Path, run: BidsRun, screen_size=None) -> Recording
             rec.events = rec.events.assign(onset=rec.events.onset - t0)
     rec.description = f"BIDS {root.name}: " + " ".join(
         f"{k}-{v}" for k, v in run.entities.items() if v)
+    if rec.metadata:
+        rec.description += "\n" + describe_metadata(rec.metadata)
     return rec
+
+
+def _apply_channels_tsv(raw: mne.io.BaseRaw, eeg: Path) -> None:
+    """Channel types and bad channels from channels.tsv (when MNE-BIDS could not)."""
+    ch = channel_status(eeg)
+    if not len(ch):
+        return
+    bids_to_mne = {"EEG": "eeg", "EOG": "eog", "ECG": "ecg", "EMG": "emg", "MISC": "misc",
+                   "TRIG": "stim", "STIM": "stim", "RESP": "resp", "GSR": "gsr",
+                   "TEMP": "temperature", "PPG": "bio", "HEOG": "eog", "VEOG": "eog"}
+    types = {r.name: bids_to_mne[r.type.upper()] for r in ch.itertuples()
+             if r.name in raw.ch_names and r.type.upper() in bids_to_mne}
+    if types:
+        raw.set_channel_types(types, on_unit_change="ignore", verbose="error")
+    raw.info["bads"] = [r.name for r in ch.itertuples()
+                        if r.status.lower() == "bad" and r.name in raw.ch_names]
