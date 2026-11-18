@@ -147,8 +147,8 @@ class AnalysisTab(QtWidgets.QWidget):
         g = QtWidgets.QGridLayout()
         self.erp_bl_on = QtWidgets.QCheckBox("Baseline")
         self.erp_bl_on.setChecked(True)
-        self.erp_bl0 = _spin(-60, 0, -0.2, 0.05, 3, " s")
-        self.erp_bl1 = _spin(-60, 1, 0.0, 0.05, 3, " s")
+        self.erp_bl0 = _spin(-3600, 3600, -0.2, 0.05, 3, " s")
+        self.erp_bl1 = _spin(-3600, 3600, 0.0, 0.05, 3, " s")
         for x in (self.erp_bl0, self.erp_bl1):
             x.setToolTip("Pre-event baseline window, subtracted from every epoch")
         # ERP component (as in Rhino ERP): preset → window, polarity, channel cluster
@@ -164,8 +164,8 @@ class AnalysisTab(QtWidgets.QWidget):
         self.erp_roi = QtWidgets.QLineEdit()
         self.erp_roi.setPlaceholderText("channel cluster, e.g. Pz, CPz, Cz  (empty = all good "
                                         "channels)")
-        self.erp_m0 = _spin(-60, 120, 0.3, 0.01, 3, " s")
-        self.erp_m1 = _spin(-60, 120, 0.5, 0.01, 3, " s")
+        self.erp_m0 = _spin(-3600, 3600, 0.3, 0.01, 3, " s")
+        self.erp_m1 = _spin(-3600, 3600, 0.5, 0.01, 3, " s")
         g.addWidget(self.erp_bl_on, 0, 0)
         g.addWidget(self.erp_bl0, 0, 1)
         g.addWidget(QtWidgets.QLabel("to"), 0, 2)
@@ -257,11 +257,15 @@ class AnalysisTab(QtWidgets.QWidget):
                            int(self.erp_pol.currentData()))
 
     def _fix_baseline_range(self):
+        """Windows inside the epoch follow the epoch's length (any length)."""
         st = self.pl.epoch_settings
-        for x in (self.erp_bl0, self.erp_bl1, self.erp_m0, self.erp_m1):
+        for x in (self.erp_bl0, self.erp_bl1, self.erp_m0, self.erp_m1,
+                  self.bp_t0, self.bp_t1):
             x.setRange(st.tmin, st.tmax)
         if self.erp_bl0.value() < st.tmin:
             self.erp_bl0.setValue(st.tmin)
+        # a band-power window that no longer reaches the end of a longer epoch keeps its
+        # value; one that fell outside the new epoch is clamped by setRange above
 
     def compute_erp(self, then=None):
         groups = self._need_groups()
@@ -530,8 +534,8 @@ class AnalysisTab(QtWidgets.QWidget):
 
         box = QtWidgets.QGroupBox("Window and estimate")
         f = QtWidgets.QFormLayout(box)
-        self.bp_t0 = _spin(-60, 120, 0.0, 0.1, 3, " s")
-        self.bp_t1 = _spin(-60, 120, 0.8, 0.1, 3, " s")
+        self.bp_t0 = _spin(-3600, 3600, 0.0, 0.1, 3, " s")
+        self.bp_t1 = _spin(-3600, 3600, 0.8, 0.1, 3, " s")
         wr = QtWidgets.QHBoxLayout()
         wr.addWidget(self.bp_t0)
         wr.addWidget(QtWidgets.QLabel("to"))
@@ -556,8 +560,8 @@ class AnalysisTab(QtWidgets.QWidget):
         self.bl_query = QtWidgets.QLineEdit()
         self.bl_query.setPlaceholderText('optional filter, e.g. phase == "BASELINE"')
         f.addRow("Filter", self.bl_query)
-        self.bl_t0 = _spin(-600, 3600, 5.0, 1, 2, " s")
-        self.bl_t1 = _spin(-600, 3600, 60.0, 1, 2, " s")
+        self.bl_t0 = _spin(-86400, 86400, 5.0, 1, 2, " s")
+        self.bl_t1 = _spin(-86400, 86400, 60.0, 1, 2, " s")
         br = QtWidgets.QHBoxLayout()
         br.addWidget(self.bl_t0)
         br.addWidget(QtWidgets.QLabel("to"))

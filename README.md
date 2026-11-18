@@ -34,8 +34,14 @@ and cognitive-state indices, compared between groups of events.
 
 ## Install and run
 
-You need Python 3.12 or newer and [uv](https://docs.astral.sh/uv/). It runs on macOS,
-Linux and Windows.
+**Packages**: every [release](https://github.com/itubrainlab/brainstudio/releases) has a
+standalone app for macOS (`.dmg`), Windows (`.zip`, run `BrainStudio.exe`) and Linux
+(`.tar.gz`, run `BrainStudio/BrainStudio`), plus a wheel. The apps are not signed:
+- macOS: the first time, right-click the app and choose **Open**.
+- Windows: SmartScreen may ask you to confirm.
+
+**From source**: you need Python 3.12 or newer and [uv](https://docs.astral.sh/uv/). It
+runs on macOS, Linux and Windows.
 
 ```bash
 uv sync
@@ -278,7 +284,8 @@ The **EEG** tab is a three-stage pipeline:
   [Events, groups and filters](#events-groups-and-filters)), and a table of its events
   with every column.
 - **Epoch window**:
-  - start and end around each event;
+  - start and end around each event, of any length (up to an hour either side). Before
+    building, the memory the epochs need is estimated; above 2 GB you are asked first;
   - peak-to-peak and flat rejection;
   - an option to drop epochs that contain an eye-tracker blink;
   - a cap on epochs per group;
@@ -481,6 +488,8 @@ src/brainstudio/
   gui/               PySide6 app: main window, Data/EEG/Gaze tabs, pipeline state,
                      background worker, dialogs, brAIn lab style and drawn icons
 tests/               pytest suite on synthetic data
+packaging/           PyInstaller build script and entry point
+.github/workflows/   CI: tests on every push, packages on release
 docs/                screenshots (made from the synthetic demo)
 ```
 
@@ -503,6 +512,36 @@ The tests run on synthetic data. They cover:
 - channel layouts.
 
 Lint with `uv run python -m pyflakes src`.
+
+`brainstudio --version` prints the version. `brainstudio --self-test` opens the window,
+loads the synthetic demo, preprocesses it and exits with 0 or 1; it is how built
+packages are checked.
+
+**Continuous integration** (GitHub Actions):
+- [`tests.yml`](.github/workflows/tests.yml): runs the test suite once on Linux, macOS
+  and Windows (Python 3.12, locked dependencies), on pushes to `main`, pull requests,
+  and on demand.
+- [`release.yml`](.github/workflows/release.yml): runs **only when a GitHub release is
+  published** (or on demand). It builds the standalone app with PyInstaller on each
+  system (Linux on Ubuntu 22.04 for wider compatibility), checks it with
+  `--self-test`, builds the wheel and sdist, and attaches everything to the release.
+
+**Making a release**:
+1. Set `version` in `pyproject.toml` and `__version__` in `src/brainstudio/__init__.py`.
+2. Commit, then publish a GitHub release with a `v<version>` tag.
+
+**Building a package locally**:
+
+```bash
+uv sync --group build
+```
+
+```bash
+uv run --group build python packaging/build.py
+```
+
+This writes `dist/BrainStudio-<version>-<system>-<arch>.{dmg,zip,tar.gz}` for the
+system you are on.
 
 ## Notes and limitations
 

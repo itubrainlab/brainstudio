@@ -13,6 +13,27 @@ from .theme import THEME
 from .widgets import StageHeader, _spin, _themed_plot, fill_table, hint
 
 
+MAX_EPOCH_S = 3600.0
+#: ask before building epochs larger than this in memory
+MEMORY_WARN_BYTES = 2e9
+
+
+def epochs_memory(raw, groups: dict, settings) -> float:
+    """Bytes the epochs will take: events × EEG channels × samples × 8."""
+    import mne
+    n_ch = len(mne.pick_types(raw.info, eeg=True, exclude="bads")) or len(raw.ch_names)
+    n_samp = int((settings.tmax - settings.tmin) * raw.info["sfreq"]) + 1
+    n_ev = sum(min(len(t), settings.max_epochs or len(t)) for t in groups.values())
+    return float(n_ev) * n_ch * n_samp * 8
+
+
+def _human(nbytes: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if nbytes < 1024 or unit == "TB":
+            return f"{nbytes:.1f} {unit}"
+        nbytes /= 1024
+
+
 class EpochTab(QtWidgets.QWidget):
     def __init__(self, pipeline, worker, parent=None):
         super().__init__(parent)
@@ -58,8 +79,9 @@ class EpochTab(QtWidgets.QWidget):
         box = QtWidgets.QGroupBox("Epoch window and rejection")
         g = QtWidgets.QGridLayout(box)
         st = EpochSettings()
-        self.tmin = _spin(-60, 60, st.tmin, 0.05, 3, " s")
-        self.tmax = _spin(-60, 120, st.tmax, 0.05, 3, " s")
+        # any epoch length: up to an hour before/after the event
+        self.tmin = _spin(-MAX_EPOCH_S, MAX_EPOCH_S, st.tmin, 0.05, 3, " s")
+        self.tmax = _spin(-MAX_EPOCH_S, MAX_EPOCH_S, st.tmax, 0.05, 3, " s")
         self.tmin.setToolTip("Epoch start relative to the event (negative = before)")
         self.tmax.setToolTip("Epoch end relative to the event")
         self.reject = _spin(0, 1e5, st.reject_uv, 10, 0, " µV")
@@ -355,6 +377,18 @@ class EpochTab(QtWidgets.QWidget):
         if not any(len(r) for r in groups.values()):
             QtWidgets.QMessageBox.warning(self, "Epochs", "No events selected in any group.")
             return False
+        need = epochs_memory(raw, groups, st)
+        if need > MEMORY_WARN_BYTES:
+            ans = QtWidgets.QMessageBox.question(
+                self, "Large epochs",
+                f"These epochs need about {_human(need)} of memory "
+                f"({st.tmax - st.tmin:g} s × {sum(len(t) for t in groups.values())} events, "
+                f"capped at {st.max_epochs} per group).\n\nLower ‘max epochs / group’ or "
+                "shorten the window to use less. Build them anyway?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No)
+            if ans != QtWidgets.QMessageBox.Yes:
+                return False
         blinks = self.pl.gaze_events.blinks if self.pl.gaze_events is not None else None
         self._selected = groups
 
