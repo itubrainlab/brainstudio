@@ -61,7 +61,11 @@ def build_group_epochs(raw: mne.io.BaseRaw, groups: dict[str, pd.DataFrame],
                        ) -> tuple[dict[str, mne.Epochs], pd.DataFrame]:
     """One ``mne.Epochs`` per group (metadata = event rows + ``group`` column).
 
-    Returns the epochs and a summary table (selected / outside / blink / rejected / kept).
+    Returns the epochs and a summary table per group: selected; dropped before
+    epoching because of a blink, the window falling outside the recording, another
+    event on the same sample, or the max-epochs cap; rejected by amplitude
+    (peak-to-peak/flat) or by a BAD annotation; kept; and the channels behind
+    amplitude rejections.
     """
     out, rows = {}, []
     for name, table in groups.items():
@@ -74,28 +78,30 @@ def build_group_epochs(raw: mne.io.BaseRaw, groups: dict[str, pd.DataFrame],
             hit = overlaps(tab["onset"].to_numpy(float), settings.tmin, settings.tmax, blinks)
             n_blink = int(hit.sum())
             tab = tab[~hit]
-        row = {"group": name, "selected": n_sel, "blink": n_blink, "outside/dup": 0,
-               "rejected": 0, "kept": 0, "rejected by": ""}
+        row = {"group": name, "selected": n_sel, "blink": n_blink,
+               "outside recording": 0, "same sample": 0, "over cap": 0,
+               "rejected (amplitude)": 0, "rejected (BAD annotation)": 0, "kept": 0,
+               "rejected by": ""}
         if len(tab):
             tab = tab.assign(group=name)
             try:
                 ep = E.epochs_from_table(raw, tab, settings.tmin, settings.tmax, baseline=None,
                                          reject_uv=settings.reject_uv,
                                          max_epochs=settings.max_epochs)
-            except ValueError:
+            except ValueError as e:
                 ep = None
+                row.update(getattr(e, "counts", {"outside recording": len(tab)}))
             if ep is not None and settings.flat_uv:
                 ep.drop_bad(flat=dict(eeg=settings.flat_uv * 1e-6), verbose="error")
             if ep is not None:
-                n_in = len(ep.drop_log)
-                row["outside/dup"] = len(tab) - n_in
-                row["rejected"] = n_in - len(ep)
+                row.update(ep.selection_counts)
+                why = E.drop_reasons(ep)
+                row["rejected (amplitude)"] = why["amplitude"] + why["other"]
+                row["rejected (BAD annotation)"] = why["BAD annotation"]
                 row["kept"] = len(ep)
                 causes = E.rejection_causes(ep)
                 row["rejected by"] = ", ".join(f"{c} ({n})" for c, n in list(causes.items())[:6])
                 if len(ep):
                     out[name] = ep
-            else:
-                row["outside/dup"] = len(tab)
         rows.append(row)
     return out, pd.DataFrame(rows)

@@ -602,3 +602,30 @@ def test_bids_events_tsv_columns_and_column_filters(tmp_path):
     assert len(EV.filter_events(t, conditions=[("label", "one of", "human, animated")])) == 3
     with pytest.raises(ValueError, match="compares numbers"):
         EV.filter_events(t, conditions=[("label", "<", "x")])
+
+
+def test_epoch_summary_counts_each_reason():
+    import mne
+
+    from brainstudio import epoching as EP
+    sf = 100.0
+    x = np.random.default_rng(0).normal(0, 1e-6, (2, int(sf * 60)))
+    x[0, int(30.3 * sf)] = 1e-3                       # spike inside the epoch at 30 s
+    raw = mne.io.RawArray(x, mne.create_info(["Cz", "Pz"], sf, "eeg"), verbose="error")
+    raw.set_annotations(mne.Annotations([40.0], [1.0], ["BAD_acq_gap"]))
+    onsets = [0.05,                                    # window starts before the recording
+              10.0, 10.0,                              # two events on the same sample
+              30.0,                                    # amplitude (spike on Cz)
+              40.2,                                    # inside a BAD span
+              ] + [12.0 + k for k in range(8)]         # plain events
+    table = pd.DataFrame({"onset": onsets, "duration": 0.0, "name": "e", "kind": "marker",
+                          "description": "e"})
+    _, summ = EP.build_group_epochs(raw, {"g": table},
+                                    EP.EpochSettings(-0.2, 0.8, reject_uv=100, max_epochs=10))
+    r = summ.iloc[0]
+    assert r["selected"] == 13 and r["outside recording"] == 1 and r["same sample"] == 1
+    assert r["over cap"] == 1                          # 11 epochable events, cap 10
+    assert r["rejected (BAD annotation)"] + r["rejected (amplitude)"] + r["kept"] == 10
+    assert r["kept"] + r["outside recording"] + r["same sample"] + r["over cap"] \
+        + r["rejected (amplitude)"] + r["rejected (BAD annotation)"] == r["selected"]
+    assert "outside/dup" not in summ

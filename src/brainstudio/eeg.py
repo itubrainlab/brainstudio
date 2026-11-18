@@ -311,15 +311,21 @@ def epochs_from_table(raw: mne.io.BaseRaw, table, tmin: float = -0.2, tmax: floa
     lo = raw.first_samp + int(np.ceil(-tmin * sf))
     hi = raw.last_samp - int(np.ceil(tmax * sf))
     ok = (samples >= lo) & (samples <= hi)
+    counts = {"outside recording": int((~ok).sum())}
     tab, samples = tab[ok], samples[ok]
     _, first = np.unique(samples, return_index=True)  # MNE needs unique samples
     keep = np.sort(first)
+    counts["same sample"] = len(tab) - len(keep)
     tab, samples = tab.iloc[keep], samples[keep]
+    counts["over cap"] = 0
     if max_epochs and len(tab) > max_epochs:
+        counts["over cap"] = len(tab) - max_epochs
         sel = np.sort(np.random.default_rng(seed).choice(len(tab), max_epochs, replace=False))
         tab, samples = tab.iloc[sel], samples[sel]
     if not len(tab):
-        raise ValueError("No selected events fall inside the EEG recording")
+        err = ValueError("No selected events fall inside the EEG recording")
+        err.counts = counts
+        raise err
     names = sorted(tab["name"].astype(str).unique())
     event_id = {n: i + 1 for i, n in enumerate(names)}
     codes = tab["name"].astype(str).map(event_id).to_numpy()
@@ -331,9 +337,28 @@ def epochs_from_table(raw: mne.io.BaseRaw, table, tmin: float = -0.2, tmax: floa
     meta = tab.reset_index(drop=True)
     meta = meta.astype({c: object for c in meta.columns
                         if isinstance(meta[c].dtype, pd.StringDtype)})
-    return mne.Epochs(raw, events, event_id=event_id, tmin=tmin, tmax=tmax,
-                      baseline=baseline, picks=picks_idx, reject=reject, preload=True,
-                      metadata=meta, verbose="error")
+    epochs = mne.Epochs(raw, events, event_id=event_id, tmin=tmin, tmax=tmax,
+                        baseline=baseline, picks=picks_idx, reject=reject, preload=True,
+                        metadata=meta, verbose="error")
+    epochs.selection_counts = counts  # events never epoched, by reason
+    return epochs
+
+
+def drop_reasons(epochs: mne.BaseEpochs) -> dict[str, int]:
+    """Dropped epochs by kind: amplitude (peak-to-peak or flat, named by channels) and
+    BAD annotation (overlaps a BAD_… span or a file boundary); anything else is other."""
+    out = {"amplitude": 0, "BAD annotation": 0, "other": 0}
+    chans = set(epochs.ch_names)
+    for reasons in epochs.drop_log:
+        if not reasons:
+            continue
+        if any(str(r).upper().startswith(("BAD", "EDGE")) for r in reasons):
+            out["BAD annotation"] += 1
+        elif any(r in chans for r in reasons):
+            out["amplitude"] += 1
+        elif reasons != ("IGNORED",):
+            out["other"] += 1
+    return out
 
 
 # =========================================================================== contrasts

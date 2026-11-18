@@ -338,8 +338,17 @@ The **EEG** tab is a three-stage pipeline:
   - a cap on epochs per group;
   - **EEG delay** (±500 ms) to correct a recording lag between events and EEG.
 - **Recordings**: tick the subjects, sessions, runs, tasks or files to use events from.
-- **Summary**: selected, outside the recording, rejected, kept, and the **channels that
-  caused rejections**.
+- **Summary** per group. These add up to *selected*:
+  - **blink**: the window contains an eye-tracker blink (when that option is on);
+  - **outside recording**: the window (event + start … event + end) does not fit in the
+    recording;
+  - **same sample**: another selected event of the group is on the same EEG sample (MNE
+    needs one per sample);
+  - **over cap**: left out by the *max epochs / group* limit (random, reproducible);
+  - **rejected (amplitude)**: peak-to-peak or flat rejection; **rejected by** names the
+    channels;
+  - **rejected (BAD annotation)**: the epoch overlaps a `BAD_…` span or a file boundary;
+  - **kept**: the epochs used.
 - **Timeline**: every epoch as a bar over its window (event + start … event + end), one
   row per group, with a tick at the event. Faint bars are selected events; solid bars
   are kept epochs.
