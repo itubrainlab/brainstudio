@@ -55,7 +55,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.group_list.itemChanged.connect(lambda *_: self.pl.mark_stale("analysis"))
         row.addWidget(self.group_list, 1)
         row.addWidget(hint("Two groups: Welch t / Mann-Whitney, Hedges g (first − second), "
-                           "cluster test. More: ANOVA / Kruskal. Epoch-level statistics."))
+                           "ERP difference wave. More: ANOVA / Kruskal. Epoch-level statistics."))
         outer.addLayout(row)
         self.tabs = QtWidgets.QTabWidget()
         outer.addWidget(self.tabs, 1)
@@ -166,21 +166,10 @@ class AnalysisTab(QtWidgets.QWidget):
                                         "channels)")
         self.erp_m0 = _spin(-60, 120, 0.3, 0.01, 3, " s")
         self.erp_m1 = _spin(-60, 120, 0.5, 0.01, 3, " s")
-        self.erp_perm = QtWidgets.QSpinBox()
-        self.erp_perm.setRange(0, 100000)
-        self.erp_perm.setValue(1000)
-        self.erp_perm.setSpecialValueText("no test")
-        self.erp_spatial = QtWidgets.QCheckBox("spatio-temporal (all channels)")
-        self.erp_post = QtWidgets.QCheckBox("test from 0 s")
-        self.erp_post.setChecked(True)
         g.addWidget(self.erp_bl_on, 0, 0)
         g.addWidget(self.erp_bl0, 0, 1)
         g.addWidget(QtWidgets.QLabel("to"), 0, 2)
         g.addWidget(self.erp_bl1, 0, 3)
-        g.addWidget(QtWidgets.QLabel("cluster permutation test"), 0, 4)
-        g.addWidget(self.erp_perm, 0, 5)
-        g.addWidget(self.erp_spatial, 0, 6)
-        g.addWidget(self.erp_post, 0, 7)
         g.addWidget(QtWidgets.QLabel("component"), 1, 0)
         g.addWidget(self.erp_comp, 1, 1)
         g.addWidget(self.erp_pol, 1, 2, 1, 2)
@@ -232,10 +221,8 @@ class AnalysisTab(QtWidgets.QWidget):
         split.addWidget(self.erp_plot)
         tabs = QtWidgets.QTabWidget()
         self.erp_table = QtWidgets.QTableWidget()
-        self.erp_clusters = QtWidgets.QTableWidget()
         self.erp_trials = QtWidgets.QTableWidget()
         tabs.addTab(self.erp_table, "Component statistics")
-        tabs.addTab(self.erp_clusters, "Cluster test")
         tabs.addTab(self.erp_trials, "Per epoch")
         split.addWidget(tabs)
         split.setSizes([500, 220])
@@ -282,7 +269,7 @@ class AnalysisTab(QtWidgets.QWidget):
             return False
         first = next(iter(groups.values()))
         try:
-            roi = self._roi(self.erp_roi, first.ch_names)
+            self._roi(self.erp_roi, first.ch_names)  # warns when no typed channel exists
         except ValueError as e:
             QtWidgets.QMessageBox.warning(self, "Channels", str(e))
             return False
@@ -296,9 +283,6 @@ class AnalysisTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Component", "The window must start before it "
                                           "ends.")
             return False
-        n_perm = self.erp_perm.value()
-        spatial = self.erp_spatial.isChecked() and has_positions(first)
-        post = self.erp_post.isChecked()
 
         def job():
             notes = []
@@ -310,7 +294,7 @@ class AnalysisTab(QtWidgets.QWidget):
                 ev.comment = g
                 evokeds[g] = ev
             summary, per = E.component_analysis(eps, comp)
-            stats, diff = None, None
+            diff = None
             if len(eps) == 2:
                 (la, a), (lb, b) = eps.items()
                 diff = mne.combine_evoked([evokeds[la], evokeds[lb]], weights=[1, -1])
@@ -318,19 +302,8 @@ class AnalysisTab(QtWidgets.QWidget):
                 ov = len(set(a.events[:, 0]) & set(b.events[:, 0]))
                 if ov:
                     notes.append(f"⚠ {ov} events are in both groups (tests assume independence)")
-                if n_perm:
-                    try:
-                        stats = E.cluster_contrast(a, b, roi, n_perm,
-                                                   tmin=0.0 if post else None, spatial=spatial)
-                        if stats.get("excluded"):
-                            notes.append("flat channels left out of the cluster test: "
-                                         + ", ".join(stats["excluded"]))
-                    except Exception as e:  # report, keep the ERPs
-                        notes.append(f"cluster test: {e}")
-            elif n_perm:
-                notes.append("the cluster test needs exactly two groups")
             return dict(eps=eps, evokeds=evokeds, summary=summary, per_epoch=per,
-                        stats=stats, diff=diff, roi=list(comp.channels), comp=comp,
+                        diff=diff, roi=list(comp.channels), comp=comp,
                         baseline=bl, notes=notes)
 
         def done(res):
@@ -362,8 +335,6 @@ class AnalysisTab(QtWidgets.QWidget):
     def _plot_erp(self):
         p = self.erp_plot
         p.clear()
-        self.erp_clusters.clear()
-        self.erp_clusters.setRowCount(0)
         r = self.erp
         if r is None:
             self.erp_table.clear()
@@ -426,31 +397,8 @@ class AnalysisTab(QtWidgets.QWidget):
             cur.sigPositionChangeFinished.connect(
                 lambda line: setattr(self, "_erp_t", float(line.value())))
             p.addItem(cur)
-        rows = []
-        st = r["stats"]
-        if st:
-            for k, (mask, pv) in enumerate(zip(st["clusters"], st["p_values"])):
-                tm = mask.any(axis=1) if mask.ndim == 2 else mask
-                if not tm.any():
-                    continue
-                t0, t1 = float(st["times"][tm][0]), float(st["times"][tm][-1])
-                rows.append({"cluster": k + 1, "tmin (s)": t0, "tmax (s)": t1,
-                             "channels": int(mask.any(axis=0).sum()) if mask.ndim == 2
-                             else len(roi), "p": float(pv)})
-                if pv < 0.05:
-                    reg = pg.LinearRegionItem((t0, t1), movable=False,
-                                              brush=THEME.rgba("accent", 55), pen=pg.mkPen(None))
-                    reg.setZValue(-20)
-                    p.addItem(reg)
-            if rows:
-                fill_table(self.erp_clusters, pd.DataFrame(rows).sort_values("p"), fmt="{:.4g}")
         fill_table(self.erp_table, r["summary"], fmt="{:.4g}")
         fill_table(self.erp_trials, r["per_epoch"].iloc[:5000], fmt="{:.4g}")
-        sig = sum(1 for x in rows if x["p"] < 0.05)
-        test = ""
-        if st:
-            test = (f"  ·  {'spatio-temporal' if st['spatial'] else 'cluster-mean'} permutation "
-                    f"test: {len(st['p_values'])} clusters, {sig} with p < 0.05")
         bl = f"{r['baseline'][0]:g}…{r['baseline'][1]:g} s" if r["baseline"] else "none"
         sm = r["summary"]
         welch = ""
@@ -464,7 +412,7 @@ class AnalysisTab(QtWidgets.QWidget):
             f"{comp.name} {comp.tmin * 1000:.0f}–{comp.tmax * 1000:.0f} ms, "
             f"{'positive' if comp.polarity > 0 else 'negative'} peak, cluster "
             f"{'+'.join(roi) if len(roi) <= 8 else f'{len(roi)} channels'}  ·  baseline {bl}"
-            f"{welch}{test}  ·  click the plot to set a latency for the topomaps"
+            f"{welch}  ·  click the plot to set a latency for the topomaps"
             + ("\n" + "; ".join(r["notes"]) if r["notes"] else "")
             + "\nTrials are the observations: single-subject statistics, valid if the window "
               "was chosen before looking at the data.")
@@ -536,15 +484,6 @@ class AnalysisTab(QtWidgets.QWidget):
         mne.write_evokeds(out / "erp-ave.fif", evs, overwrite=True, verbose="error")
         r["summary"].to_csv(out / "erp_component_summary.csv", index=False)
         r["per_epoch"].to_csv(out / "erp_component_per_epoch.csv", index=False)
-        if r["stats"]:
-            st = r["stats"]
-            rows = []
-            for k, (mask, pv) in enumerate(zip(st["clusters"], st["p_values"])):
-                tm = mask.any(axis=1) if mask.ndim == 2 else mask
-                if tm.any():
-                    rows.append({"cluster": k + 1, "tmin": st["times"][tm][0],
-                                 "tmax": st["times"][tm][-1], "p": pv})
-            pd.DataFrame(rows).to_csv(out / "erp_clusters.csv", index=False)
         c = r["comp"]
         self._write_provenance(out / "erp.txt", {
             "component": f"{c.name} {c.tmin:g}–{c.tmax:g} s, polarity {c.polarity:+d}",

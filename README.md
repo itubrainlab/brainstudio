@@ -167,8 +167,7 @@ Three main tabs:
            * with more groups: a one-way ANOVA.
          * Trials are the observations: these are single-subject statistics.
          * Plots: cluster mean ± SEM with peaks marked, single channel, GFP or
-           butterfly. With two groups, the A − B difference and a cluster permutation
-           test (`mne.stats`), on the cluster mean or spatio-temporal.
+           butterfly; with two groups, the A − B difference wave.
          * Click the plot to set a latency for the topomaps and joint plot.
          * MNE compare-evokeds, joint plots and topomaps; CSV/FIF export.
        * *Band power*:
