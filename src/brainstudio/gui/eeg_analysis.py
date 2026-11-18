@@ -176,7 +176,7 @@ class AnalysisTab(QtWidgets.QWidget):
         g.addWidget(self.erp_bl0, 0, 1)
         g.addWidget(QtWidgets.QLabel("to"), 0, 2)
         g.addWidget(self.erp_bl1, 0, 3)
-        self.erp_ref = self._reference_combo(literature=True)
+        self.erp_ref = self._reference_combo()
         self.erp_ref_note = hint("")
         self.erp_ref.currentTextChanged.connect(lambda _: self._update_ref_note())
         g.addWidget(QtWidgets.QLabel("reference"), 0, 4)
@@ -243,18 +243,17 @@ class AnalysisTab(QtWidgets.QWidget):
         self.tabs.addTab(w, "ERP")
         self.erp_comp.setCurrentText("P300")
 
-    REF_LITERATURE = "literature (per component)"
+    REF_CHOICES = ("average", "mastoids", "as recorded")
 
-    def _reference_combo(self, literature: bool) -> QtWidgets.QComboBox:
+    def _reference_combo(self) -> QtWidgets.QComboBox:
         c = QtWidgets.QComboBox()
         c.setEditable(True)
         c.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
-        c.addItems(([self.REF_LITERATURE] if literature else [])
-                   + ["average", "mastoids", "as recorded"])
-        c.setToolTip("literature: the reference conventional for the ERP component "
-                     "(see the note) · average: common average of the good channels · "
-                     "mastoids: mean of M1/M2, TP9/TP10, A1/A2 or P9/P10 (the first pair "
-                     "present) · as recorded · or channel name(s), e.g. Cz or “M1, M2”")
+        c.addItems(list(self.REF_CHOICES))
+        c.setToolTip("average: common average of the good channels · mastoids: mean of "
+                     "M1/M2, TP9/TP10, A1/A2 or P9/P10 (the first pair present) · as "
+                     "recorded · or channel name(s), e.g. Cz or “M1, M2”. Choosing an ERP "
+                     "component selects its usual reference.")
         return c
 
     def _fill_reference_channels(self):
@@ -262,8 +261,7 @@ class AnalysisTab(QtWidgets.QWidget):
         for c in (self.erp_ref, self.bp_ref):
             cur = c.currentText()
             fixed = [c.itemText(i) for i in range(c.count())
-                     if c.itemText(i) in (self.REF_LITERATURE, "average", "mastoids",
-                                          "as recorded")]
+                     if c.itemText(i) in self.REF_CHOICES]
             c.blockSignals(True)
             c.clear()
             c.addItems(fixed)
@@ -276,18 +274,17 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _ref_spec(self, combo) -> str:
         t = combo.currentText().strip()
-        return "literature" if t == self.REF_LITERATURE else (
-            "recorded" if t == "as recorded" else t)
+        return "recorded" if t == "as recorded" else t
 
     def _update_ref_note(self):
+        """What the choice means for the loaded epochs (e.g. which mastoids)."""
         names = list(next(iter(self.pl.epochs.values())).ch_names) if self.pl.epochs else []
-        comp = self.erp_comp.currentText()
+        if not names or self.erp_ref.currentText() != "mastoids":
+            self.erp_ref_note.setText("")
+            return
         try:
-            _, label = E.resolve_erp_reference(self._ref_spec(self.erp_ref), names or
-                                               ["M1", "M2"], comp)
-            self.erp_ref_note.setText(("→ " + label) if names else
-                                      "→ " + E.COMPONENT_REFERENCE.get(
-                                          comp, ("average", "average reference"))[1])
+            _, label = E.resolve_erp_reference("mastoids", names)
+            self.erp_ref_note.setText("→ " + label)
         except ValueError as e:
             self.erp_ref_note.setText(f"⚠ {e}")
 
@@ -295,10 +292,8 @@ class AnalysisTab(QtWidgets.QWidget):
         comp = E.COMPONENT_PRESETS.get(name)
         if comp is None:
             return
-        # a new component gets its own conventional reference again
-        self.erp_ref.blockSignals(True)
-        self.erp_ref.setCurrentText(self.REF_LITERATURE)
-        self.erp_ref.blockSignals(False)
+        # each component comes with its usual reference
+        self.erp_ref.setCurrentText(E.COMPONENT_REFERENCE.get(name, "average"))
         for wdg in (self.erp_m0, self.erp_m1, self.erp_pol, self.erp_roi):
             wdg.blockSignals(True)
         self.erp_m0.setValue(comp.tmin)
@@ -350,8 +345,7 @@ class AnalysisTab(QtWidgets.QWidget):
             return False
         try:
             ref, ref_label = E.resolve_erp_reference(self._ref_spec(self.erp_ref),
-                                                     list(first.ch_names),
-                                                     self.erp_comp.currentText())
+                                                     list(first.ch_names))
         except ValueError as e:
             QtWidgets.QMessageBox.warning(self, "Reference", str(e))
             return False
@@ -619,7 +613,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.bp_method = QtWidgets.QComboBox()
         self.bp_method.addItems(["welch", "multitaper"])
         f.addRow("PSD (MNE)", self.bp_method)
-        self.bp_ref = self._reference_combo(literature=False)
+        self.bp_ref = self._reference_combo()
         self.bp_ref.setCurrentText("average")
         f.addRow("Reference", self.bp_ref)
         self.bp_roi = QtWidgets.QLineEdit()
