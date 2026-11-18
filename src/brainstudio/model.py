@@ -86,6 +86,13 @@ class GazeEvents:
         )
 
 
+def is_data_annotation(descriptions: pd.Series) -> pd.Series:
+    """True for annotations about the data rather than events (BAD_… spans, EDGE/BAD
+    boundaries of joined files): these keep their time when events are shifted."""
+    d = descriptions.astype(str).str.upper()
+    return d.str.startswith("BAD") | d.str.startswith("EDGE")
+
+
 @dataclass
 class Recording:
     """One loaded session: EEG (MNE Raw), gaze, and discrete events."""
@@ -109,6 +116,9 @@ class Recording:
     # Dataset information (BIDS: dataset, participant, eeg.json fields, bad channels
     # with reasons, where the electrode positions come from); see io.bids.bids_metadata
     metadata: dict = field(default_factory=dict)
+    # Shift applied to every marker event (s): + = events happened later than their
+    # timestamps. BAD_/EDGE annotations (data quality, file joins) are not shifted.
+    event_delay: float = 0.0
 
     @property
     def has_eeg(self) -> bool:
@@ -148,7 +158,11 @@ class Recording:
             ["description", "onset"], ignore_index=True)
         dup = (df["description"].eq(df["description"].shift())
                & (df["onset"].diff().abs() < 0.010))
-        return df[~dup].sort_values("onset", ignore_index=True)
+        df = df[~dup]
+        if self.event_delay:
+            df = df.copy()
+            df.loc[~is_data_annotation(df["description"]), "onset"] += self.event_delay
+        return df.sort_values("onset", ignore_index=True)
 
     def summary(self) -> str:
         lines = [f"Source: {self.source}" if self.source else "Source: (in memory)"]

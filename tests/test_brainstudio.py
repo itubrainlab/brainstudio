@@ -539,3 +539,20 @@ def test_bids_dataset_info_bads_and_positions(tmp_path):
     el = run.eeg.with_name("sub-01_space-CapTrak_electrodes.tsv")
     el.write_text("name\tx\ty\tz\nCz\t0\t0\t0.1\n")
     assert B._electrodes_file(run.eeg) == el
+
+
+def test_event_delay_shifts_markers_not_data_annotations(demo):
+    from brainstudio import events as EV
+    rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
+    rec.raw.annotations.append(10.0, 1.0, "BAD_acq_gap")
+    ev = G.detect_events(rec.gaze)
+    before = EV.build_event_table(rec, ev)
+    rec.event_delay = 0.25
+    after = EV.build_event_table(rec, ev)
+    stim0 = before[before.name == "stimulus"].onset.to_numpy()
+    stim1 = after[after.name == "stimulus"].onset.to_numpy()
+    assert np.allclose(stim1 - stim0, 0.25)
+    assert np.allclose(before[before.name == "fixation"].onset,
+                       after[after.name == "fixation"].onset)     # gaze events unchanged
+    bad = rec.all_events()
+    assert bad.loc[bad.description == "BAD_acq_gap", "onset"].iloc[0] == pytest.approx(10.0)

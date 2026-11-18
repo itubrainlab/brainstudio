@@ -162,6 +162,20 @@ file:
   `sub-01_ses-2_task-x_run-003_eeg.xdf`.
 - They are kept as text, so filter with `run == "003"`.
 
+### Event timing
+
+**Event delay** (Dataset panel) shifts every marker event relative to the EEG and gaze,
+to correct a recording misalignment: + means the events happened later than their
+timestamps, − earlier.
+
+- It applies to everything that uses events: the markers in the viewer, the event table,
+  phases, epochs and analyses.
+- Gaze events (fixations, saccades, blinks) and `BAD_`/boundary annotations keep their
+  times.
+- It is reset when another recording is loaded.
+- The Epoching tab's **EEG delay** is the same kind of correction, applied only when
+  cutting epochs.
+
 ### Trigger channels (EDF/BDF and others)
 
 The **Trigger channel → events** panel turns the codes on a channel into events. It opens
