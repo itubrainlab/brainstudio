@@ -101,14 +101,22 @@ def detect_bad_channels(raw: mne.io.BaseRaw, p: BadChannelParams | None = None,
 # =========================================================================== ICA
 @dataclass
 class ICAParams:
-    n_components: int = 20
-    method: str = "picard"        # picard | fastica | infomax
+    """ICA as in the ERP guide (neuraldatascience.io): fitted on a 1–30 Hz copy cut into
+    1 s segments, the bad segments found by AutoReject, enough components for 99 % of the
+    variance, ``random_state=42``, every 3rd sample."""
+    n_components: float = 0.99    # < 1: fraction of variance; ≥ 1: number of components
+    method: str = "picard"        # picard (extended, as ICLabel expects) | fastica | infomax
     l_freq: float = 1.0           # ICA is fitted on ≥ 1 Hz high-passed data
-    reject_uv: float | None = 500.0  # skip 2 s segments above this ptp when fitting
-    target_sfreq: float = 128.0   # decimate the fitting data to about this rate
-    max_samples: int = 300_000    # fit on at most this many samples (spread over the data)
+    h_freq: float | None = 30.0   # … and ≤ 30 Hz low-passed
+    clean: str = "autoreject"     # bad 1 s segments: "autoreject" | "threshold"
+    reject_uv: float | None = 500.0  # threshold cleaning: skip segments above this ptp
+    target_sfreq: float = 128.0   # resample the fitting data to about this rate
+    decim: int = 3                # fit on every 3rd sample
+    max_samples: int = 300_000    # … or fewer, so long recordings stay bounded
+    autoreject_max_epochs: int = 600  # AutoReject is fitted on at most this many segments
     max_iter: int = 500           # stop a fit that does not converge
-    seed: int = 97
+    seed: int = 42
+    iclabel: bool = True          # label the components with ICLabel (needs positions)
 
 
 #: below this high-pass cut-off an FIR filter gets very long: use a zero-phase IIR
@@ -199,52 +207,136 @@ def fit_ica(raw: mne.io.BaseRaw, bads=(), h_freq=None, notch=None,
     chans = ica_channels(raw, bads, tmin)
     if len(chans) < 3:
         raise ValueError("ICA needs at least 3 good EEG channels")
-    fit_raw = _filtered(raw, max(p.l_freq, 0.1), h_freq, notch, picks=chans, tmin=tmin)
+    h = p.h_freq if h_freq is None else h_freq
+    fit_raw = _filtered(raw, max(p.l_freq, 0.1), h, notch, picks=chans, tmin=tmin)
     # ``chans`` are the channels the user kept: the file's own bad list (e.g. BIDS
     # channels.tsv) must not drop any of them again inside ICA.fit
     fit_raw.info["bads"] = []
+    # average reference, as ICLabel expects (it does not change what ICA removes: the
+    # common mode is not a component of average-referenced data)
+    fit_raw.set_eeg_reference("average", projection=False, verbose="error")
     fit_raw.recording_t0 = _start_sample(raw, tmin) / raw.info["sfreq"]
     decim = max(1, int(fit_raw.info["sfreq"] // p.target_sfreq))
     if decim > 1:
         fit_raw.resample(fit_raw.info["sfreq"] / decim, verbose="error")
-    n = int(min(p.n_components, len(chans) - 1))
+    rank = len(chans) - 1  # average reference removes one dimension
+    nc = p.n_components if p.n_components < 1 else int(min(p.n_components, rank))
     method = p.method
     if method == "picard":
         try:
             import picard  # noqa: F401
         except ImportError:
             method = "infomax"
-    ica = mne.preprocessing.ICA(n_components=n, method=method, rng=p.seed,
+    ica = mne.preprocessing.ICA(n_components=nc, method=method, rng=p.seed,
                                 max_iter=p.max_iter,
                                 fit_params=dict(ortho=False, extended=True)
-                                if method == "picard" else None)
+                                if method == "picard" else
+                                dict(extended=True) if method == "infomax" else None)
     fit_raw.fit_note = ""
-    # long recordings: fit on every k-th sample, spread over the whole recording, so the
-    # fit time stays bounded (ICA needs far fewer samples than hours of EEG give)
-    every = max(1, int(np.ceil(fit_raw.n_times / p.max_samples)))
     notes = []
-    if every > 1:
-        notes.append(f"fitted on every {every}th sample ({fit_raw.n_times // every:,} of "
-                     f"{fit_raw.n_times:,})")
-    try:
-        ica.fit(fit_raw, reject=dict(eeg=p.reject_uv * 1e-6) if p.reject_uv else None,
-                tstep=2.0, decim=every, verbose="error")
-    except RuntimeError as e:
-        if "No clean segment" not in str(e):
-            raise
-        # every 2 s segment exceeds the rejection threshold, usually because noisy
-        # channels were kept: fit on all the data and say so
-        ica.fit(fit_raw, tstep=2.0, decim=every, verbose="error")
-        notes.insert(0, f"every 2 s segment exceeded the {p.reject_uv:g} µV fit rejection "
-                        "(noisy channels kept?), so ICA was fitted without rejection")
+    # 1 s segments; bad ones (AutoReject, or a peak-to-peak threshold) are left out
+    events = mne.make_fixed_length_events(fit_raw, duration=1.0)
+    seg = mne.Epochs(fit_raw, events, tmin=0.0, tmax=1.0, baseline=None, preload=True,
+                     reject_by_annotation=True, verbose="error")
+    good = np.ones(len(seg), bool)
+    if p.clean == "autoreject" and len(seg) >= 20 and _has_positions(seg):
+        try:
+            good = ~autoreject_bad_segments(seg, p)
+            notes.append(f"AutoReject left out {int((~good).sum())} of {len(seg)} 1 s "
+                         "segments")
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"AutoReject failed ({type(e).__name__}), threshold used")
+            good = _ptp_good(seg, p.reject_uv)
+    else:
+        if p.clean == "autoreject":
+            notes.append("AutoReject needs electrode positions and ≥ 20 segments: "
+                         "peak-to-peak threshold used")
+        good = _ptp_good(seg, p.reject_uv)
+    if good.sum() < max(10, len(good) // 10):
+        notes.insert(0, f"only {int(good.sum())} of {len(good)} 1 s segments were clean "
+                        "(noisy channels kept?), so ICA was fitted on all of them")
+        good[:] = True
+    fit_on = seg[np.flatnonzero(good)]
+    every = max(p.decim, int(np.ceil(len(fit_on) * len(fit_on.times) / p.max_samples)))
+    if every > p.decim:
+        notes.append(f"fitted on every {every}th sample")
+    ica.fit(fit_on, decim=every, verbose="error")
     if getattr(ica, "n_iter_", 0) >= p.max_iter:
         notes.append(f"stopped after {p.max_iter} iterations without converging — fewer "
                      "components or more bad channels may help")
+    fit_raw.ic_labels = fit_raw.ic_proba = None
+    if p.iclabel:
+        try:
+            fit_raw.ic_labels, fit_raw.ic_proba = iclabel(raw, ica, chans, notch, tmin)
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"ICLabel not run: {e}")
     fit_raw.fit_note = "; ".join(notes)
     return ica, fit_raw
 
 
+def _has_positions(inst) -> bool:
+    locs = np.array([ch["loc"][:3] for ch in inst.info["chs"]])
+    return bool(len(locs)) and int((np.isfinite(locs).all(1) &
+                                    (np.abs(locs).sum(1) > 0)).sum()) >= 4
+
+
+def _ptp_good(seg: mne.BaseEpochs, reject_uv) -> np.ndarray:
+    if not reject_uv:
+        return np.ones(len(seg), bool)
+    x = seg.get_data()
+    return np.ptp(x, axis=2).max(1) <= reject_uv * 1e-6
+
+
+def autoreject_bad_segments(epochs: mne.BaseEpochs, p: ICAParams) -> np.ndarray:
+    """AutoReject (``n_interpolate=[1, 2, 4]``, ``random_state=42``) marks bad segments;
+    fitted on at most ``p.autoreject_max_epochs`` of them so long recordings stay quick."""
+    from autoreject import AutoReject
+    ar = AutoReject(n_interpolate=[1, 2, 4], random_state=p.seed, n_jobs=1, verbose=False,
+                    picks=mne.pick_types(epochs.info, eeg=True, eog=False))
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return _autoreject_fit(ar, epochs, p)
+
+
+def _autoreject_fit(ar, epochs, p) -> np.ndarray:
+    n = len(epochs)
+    if n > p.autoreject_max_epochs:
+        pick = np.random.default_rng(p.seed).choice(n, p.autoreject_max_epochs, replace=False)
+        ar.fit(epochs[np.sort(pick)])
+    else:
+        ar.fit(epochs)
+    return np.asarray(ar.get_reject_log(epochs).bad_epochs, bool)
+
+
+#: ICLabel classes (MNE-ICALabel)
+IC_CLASSES = ("brain", "muscle artifact", "eye blink", "heart beat", "line noise",
+              "channel noise", "other")
+
+
+def iclabel(raw: mne.io.BaseRaw, ica: mne.preprocessing.ICA, chans: list[str], notch=None,
+            tmin: float | None = None) -> tuple[list[str], np.ndarray]:
+    """ICLabel class and probability of every component (MNE-ICALabel). ICLabel was
+    trained on 1–100 Hz, average-referenced data, so it gets such a copy of the channels
+    the ICA was fitted on."""
+    from mne_icalabel import label_components
+    if not _has_positions(raw.copy().pick(chans)):
+        raise ValueError("the EEG channels have no electrode positions (load a montage)")
+    nyq = raw.info["sfreq"] / 2
+    lab_raw = _filtered(raw, 1.0, min(100.0, nyq - 1), notch, picks=chans, tmin=tmin)
+    lab_raw.info["bads"] = []
+    lab_raw.set_eeg_reference("average", projection=False, verbose="error")
+    with mne.utils.use_log_level("error"):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out = label_components(lab_raw, ica, method="iclabel")
+    return list(out["labels"]), np.asarray(out["y_pred_proba"], float)
+
+
 FRONTAL = ("Fp1", "Fp2", "Fpz", "AF7", "AF8", "AF3", "AF4")
+#: EOG stand-ins without EOG electrodes (ERP guide: Fp1, Fp2, F7, F8)
+EOG_PROXIES = ("Fp1", "Fp2", "F7", "F8")
 
 
 def blink_regressor(times: np.ndarray, blinks: pd.DataFrame, pad: float = 0.05) -> np.ndarray:
@@ -281,14 +373,19 @@ def blink_locked_score(src: np.ndarray, sfreq: float, times: np.ndarray,
 
 def score_blink_components(ica: mne.preprocessing.ICA, fit_raw: mne.io.BaseRaw,
                            blinks: pd.DataFrame | None = None, eog_channels=None,
-                           z_thresh: float = 3.0) -> pd.DataFrame:
+                           z_thresh: float = 3.0, max_ic: int = 2,
+                           iclabel_p: float = 0.7) -> pd.DataFrame:
     """Rank ICA components as blink candidates.
 
     * ``eog_score``: |correlation| with EOG channels via ``ICA.find_bads_eog``.
-      Without EOG channels, frontal electrodes (Fp1/Fp2/…) act as proxies.
+      Without EOG channels, the frontal electrodes Fp1, Fp2, F7 and F8 act as proxies.
+      As in the ERP guide, the z threshold starts at 3.5 and steps down by 0.05 until
+      ``max_ic`` components are found (not below 2.0).
     * ``blink_t``: how strongly the component's blink-locked average (eye-tracker
-      blink onsets, −0.2…0.5 s) stands out: max |mean| / SEM, robust to jitter.
-    Components whose scores are z-outliers (> ``z_thresh``) are suggested.
+      blink onsets, −0.2…0.5 s) stands out: max |mean| / SEM, robust to jitter
+      (z-outliers above ``z_thresh`` are suggested).
+    * ``iclabel`` / ``iclabel_p``: the ICLabel class and its probability (from
+      :func:`fit_ica`); "eye blink" with p ≥ ``iclabel_p`` is suggested.
     """
     n = ica.n_components_
     df = pd.DataFrame({"component": np.arange(n)})
@@ -299,12 +396,20 @@ def score_blink_components(ica: mne.preprocessing.ICA, fit_raw: mne.io.BaseRaw,
     proxy = False
     if not eog:
         lower = {c.lower(): c for c in fit_raw.ch_names}
-        eog = [lower[c.lower()] for c in FRONTAL if c.lower() in lower][:2]
+        eog = [lower[c.lower()] for c in EOG_PROXIES if c.lower() in lower]
+        if not eog:
+            eog = [lower[c.lower()] for c in FRONTAL if c.lower() in lower][:2]
         proxy = True
     flagged = set()
     if eog:
-        idx, scores = ica.find_bads_eog(fit_raw, ch_name=eog, threshold=z_thresh,
-                                        measure="zscore", verbose="error")
+        z = 3.5
+        while True:
+            idx, scores = ica.find_bads_eog(fit_raw, ch_name=eog, threshold=z,
+                                            measure="zscore", verbose="error")
+            if len(idx) >= max_ic or z <= 2.0:
+                break
+            z = round(z - 0.05, 2)
+        df.attrs["eog_z"] = z
         scores = np.atleast_2d(np.asarray(scores))
         df["eog_score"] = np.abs(scores).max(0)
         flagged |= set(int(i) for i in idx)
@@ -319,6 +424,15 @@ def score_blink_components(ica: mne.preprocessing.ICA, fit_raw: mne.io.BaseRaw,
         flagged |= set(np.flatnonzero((z > z_thresh) & (t_score > 5)).tolist())
     else:
         df["blink_t"] = np.nan
+    labels, proba = getattr(fit_raw, "ic_labels", None), getattr(fit_raw, "ic_proba", None)
+    if labels is not None and len(labels) == n:
+        df["iclabel"] = labels
+        df["iclabel_p"] = proba
+        flagged |= set(np.flatnonzero((df["iclabel"] == "eye blink") &
+                                      (df["iclabel_p"] >= iclabel_p)).tolist())
+    else:
+        df["iclabel"] = ""
+        df["iclabel_p"] = np.nan
     df["suggested"] = df["component"].isin(flagged)
     df.attrs["eog_channels"] = eog
     df.attrs["proxy"] = proxy

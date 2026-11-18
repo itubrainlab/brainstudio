@@ -1,6 +1,7 @@
 """Tests on synthetic data (BIDS + XDF round trips, gaze detection, FRPs)."""
 
 import numpy as np
+import mne
 import pandas as pd
 import pytest
 
@@ -681,3 +682,49 @@ def test_band_power_baseline_is_per_subject():
     assert BP.subjects_without_baseline(base, subj) == ["c"]
     pooled, _ = BP.reference_for(onsets, BP.BandBaseline(base.onsets, 0, 10), base_bp, owner)
     assert np.allclose(pooled[:, 0, 0], np.mean([1, 1, 3, 3, 10, 10]))  # no labels: pooled
+
+
+def test_group_erp_averages_subjects_first():
+    """Grand average = mean of per-subject averages, whatever each subject's epoch count;
+    the across-subject test is a paired t-test on the subject means."""
+    from scipy import stats as sst
+    rng = np.random.default_rng(1)
+    info = mne.create_info(["Cz", "Pz"], 100.0, "eeg")
+    groups = {}
+    for g, amp in (("A", 4e-6), ("B", 1e-6)):
+        data, subj = [], []
+        for s, n in (("01", 5), ("02", 40), ("03", 12), ("04", 9)):
+            base = amp * (1 + 0.3 * int(s))
+            x = rng.normal(0, 1e-6, (n, 2, 80))
+            x[:, :, 40:60] += base
+            data.append(x)
+            subj += [s] * n
+        ep = mne.EpochsArray(np.concatenate(data), info, tmin=-0.2, verbose="error")
+        ep.metadata = pd.DataFrame({"subject": subj})
+        groups[g] = ep
+    comp = E.Component("X", 0.2, 0.39, ("Cz", "Pz"), +1)
+    res = E.group_component_analysis(groups, comp)
+    subs = list(res["evokeds"]["A"].values())
+    assert np.allclose(res["grand"]["A"].data, np.mean([e.data for e in subs], 0))
+    # pooled epochs would weigh subject 02 (40 epochs) eight times more than subject 01
+    pooled = groups["A"].average().data
+    assert not np.allclose(res["grand"]["A"].data, pooled)
+    sm = res["summary"].set_index("group")
+    assert sm.loc["A", "subjects"] == 4
+    per = res["subjects"].pivot(index="subject", columns="group", values="window mean µV")
+    t = sst.ttest_rel(per["A"], per["B"])
+    assert sm.loc["A − B", "t"] == pytest.approx(t.statistic)
+    assert sm.loc["A − B", "p"] == pytest.approx(t.pvalue)
+    assert len(res["diffs"]) == 4 and len(res["subject_tests"]) == 4
+
+
+def test_subject_spans_merge_runs():
+    from brainstudio.io.multi import segment_label, subject_spans
+    segs = [{"start": 0, "end": 10, "subject": "01", "run": "1"},
+            {"start": 10, "end": 20, "subject": "01", "run": "2"},
+            {"start": 20, "end": 35, "subject": "02", "run": "1"}]
+    spans = subject_spans(segs)
+    assert [(s["label"], s["start"], s["end"]) for s in spans] == [
+        ("sub-01", 0.0, 20), ("sub-02", 20.0, 35)]
+    assert segment_label(segs[1]) == "sub-01 · run-2"
+    assert subject_spans([{"start": 0, "end": 5}]) == []

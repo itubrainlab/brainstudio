@@ -123,17 +123,42 @@ class PreprocessTab(QtWidgets.QWidget):
         ip = P.ICAParams()
         self.ica_on = QtWidgets.QCheckBox("Remove components")
         self.ica_on.setChecked(True)
+        self.ica_var = QtWidgets.QCheckBox("99 % of variance")
+        self.ica_var.setChecked(True)
+        self.ica_var.setToolTip("As many components as explain 99 % of the variance (ERP "
+                                "guide); untick to set a number")
         self.ica_n = QtWidgets.QSpinBox()
         self.ica_n.setRange(2, 256)
-        self.ica_n.setValue(ip.n_components)
+        self.ica_n.setValue(20)
+        self.ica_n.setEnabled(False)
+        self.ica_var.toggled.connect(lambda on: self.ica_n.setEnabled(not on))
         self.ica_method = QtWidgets.QComboBox()
-        self.ica_method.addItems(["picard", "fastica", "infomax"])
+        self.ica_method.addItems(["picard", "infomax", "fastica"])
+        self.ica_method.setToolTip("picard and infomax run as extended infomax, which ICLabel "
+                                   "was trained on")
+        self.ica_clean = QtWidgets.QComboBox()
+        self.ica_clean.addItem("AutoReject", "autoreject")
+        self.ica_clean.addItem("threshold", "threshold")
+        self.ica_clean.setToolTip("How bad 1 s segments are left out of the fit: AutoReject "
+                                  "(ERP guide; needs electrode positions) or a peak-to-peak "
+                                  "threshold")
         self.ica_rej = _spin(0, 1e5, ip.reject_uv, 50, 0, " µV")
         self.ica_rej.setSpecialValueText("no rejection")
-        self.ica_rej.setToolTip("Skip 2 s segments above this peak-to-peak while fitting")
-        for lab, w in (("components", self.ica_n), ("method", self.ica_method),
-                       ("fit reject", self.ica_rej)):
-            g.addWidget(QtWidgets.QLabel(lab))
+        self.ica_rej.setToolTip("Threshold cleaning: skip 1 s segments above this "
+                                "peak-to-peak")
+        self.ica_rej.setEnabled(False)
+        self.ica_clean.currentIndexChanged.connect(
+            lambda _: self.ica_rej.setEnabled(self.ica_clean.currentData() == "threshold"))
+        self.ica_iclabel = QtWidgets.QCheckBox("ICLabel")
+        self.ica_iclabel.setChecked(True)
+        self.ica_iclabel.setToolTip("Label every component (brain, eye blink, muscle, heart, "
+                                    "line noise, channel noise, other) with MNE-ICALabel. "
+                                    "Needs electrode positions.")
+        for lab, w in (("components", self.ica_var), ("", self.ica_n),
+                       ("method", self.ica_method), ("bad segments", self.ica_clean),
+                       ("", self.ica_rej), ("", self.ica_iclabel)):
+            if lab:
+                g.addWidget(QtWidgets.QLabel(lab))
             g.addWidget(w)
         g.addStretch()
         v.addLayout(g)
@@ -417,9 +442,12 @@ class PreprocessTab(QtWidgets.QWidget):
         tmin = self.first_event()
         bads = self.bads()
         notch = {"off": None, "50 Hz": 50.0, "60 Hz": 60.0}[self.notch.currentText()]
-        ip = P.ICAParams(n_components=self.ica_n.value(), method=self.ica_method.currentText(),
-                         reject_uv=self.ica_rej.value() or None)
-        h = self.lp.value() or None
+        ip = P.ICAParams(n_components=0.99 if self.ica_var.isChecked() else self.ica_n.value(),
+                         method=self.ica_method.currentText(),
+                         clean=self.ica_clean.currentData(),
+                         reject_uv=self.ica_rej.value() or None,
+                         iclabel=self.ica_iclabel.isChecked())
+        h = None  # ICA is fitted on 1–30 Hz (ERP guide), whatever the ERP low-pass
         blinks = self.pl.gaze_events.blinks if self.pl.gaze_events is not None else None
         eog = [raw.ch_names[i] for i in mne.pick_types(raw.info, eog=True)]
 
@@ -438,7 +466,8 @@ class PreprocessTab(QtWidgets.QWidget):
                 self.ica_table.selectRow(0)
                 self.show_component(0)
 
-        self.worker.run(f"Fitting ICA ({ip.method}, {ip.n_components} components)…", job, done)
+        what = "99 % variance" if ip.n_components < 1 else f"{ip.n_components} components"
+        self.worker.run(f"Fitting ICA ({ip.method}, {what})…", job, done)
 
     def gaze_events_changed(self):
         """New eye-tracker blinks (gaze offset or detection settings changed): rescore the
@@ -502,7 +531,8 @@ class PreprocessTab(QtWidgets.QWidget):
             self.ica_view._args = None
             self.ica_view.restyle()
             return
-        cols = ["exclude", "component", "EOG/frontal |r|", "blink-locked t", "suggested"]
+        cols = ["exclude", "component", "ICLabel", "EOG/frontal |r|", "blink-locked t",
+                "suggested"]
         self.ica_table.setColumnCount(len(cols))
         self.ica_table.setHorizontalHeaderLabels(cols)
         self.ica_table.setRowCount(len(sc))
@@ -515,7 +545,9 @@ class PreprocessTab(QtWidgets.QWidget):
             ex.setCheckState(CHECKED if on else UNCHECKED)
             ex.setData(QtCore.Qt.UserRole, int(r.component))
             self.ica_table.setItem(i, 0, ex)
-            for j, txt in enumerate((f"ICA{r.component:03d}",
+            lab = getattr(r, "iclabel", "") or ""
+            lab = f"{lab} {r.iclabel_p:.0%}" if lab and np.isfinite(r.iclabel_p) else ""
+            for j, txt in enumerate((f"ICA{r.component:03d}", lab,
                                      "" if np.isnan(r.eog_score) else f"{r.eog_score:.2f}",
                                      "" if np.isnan(r.blink_t) else f"{r.blink_t:.1f}",
                                      "✓" if r.suggested else ""), start=1):
@@ -532,7 +564,9 @@ class PreprocessTab(QtWidgets.QWidget):
             f"{len(sc)} components on {len(self.pl.ica.ch_names)} channels. "
             f"{n_sug} suggested as blink components "
             f"({'frontal proxies' if proxy else 'EOG'}: {eog}; eye-tracker blinks: "
-            f"{'yes' if np.isfinite(sc['blink_t']).any() else 'no'}). "
+            f"{'yes' if np.isfinite(sc['blink_t']).any() else 'no'}"
+            + (f"; ICLabel eye blink ≥ 70 %" if (sc.get("iclabel", "") != "").any() else
+               "; ICLabel: not run") + "). "
             "Inspect with ‘Components’ / ‘Properties’ and tick what to remove."
             + ("" if n_sug else " None stands out: if blinks are not visible in the EEG, "
                                 "removing nothing is the right call."))

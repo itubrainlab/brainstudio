@@ -133,6 +133,8 @@ class ICAComponentView(QtWidgets.QWidget):
         if scores is not None:
             r = scores.iloc[k]
             parts = []
+            if r.get("iclabel", ""):
+                parts.append(f"ICLabel: {r['iclabel']} ({r['iclabel_p']:.0%})")
             if np.isfinite(r.get("eog_score", np.nan)):
                 parts.append(f"EOG/frontal |r| = {r['eog_score']:.2f}")
             if np.isfinite(r.get("blink_t", np.nan)):

@@ -91,14 +91,19 @@ def _analysis_checks(win) -> dict[str, bool]:
         ica, fit_raw = P.fit_ica(win.rec.raw, (), 40.0, None, P.ICAParams(n_components=5))
         out["ICA (picard)"] = ica.n_components_ == 5 and len(
             P.score_blink_components(ica, fit_raw, win.gaze_events.blinks)) == 5
+        out["ICLabel"] = fit_raw.ic_labels is not None and len(fit_raw.ic_labels) == 5
+        if not out["ICLabel"]:
+            _say(f"ICLabel: {fit_raw.fit_note}")
     except Exception as e:  # report and go on
         _say(f"ICA: {e!r}")
         out["ICA (picard)"] = False
+        out["ICLabel"] = False
     try:
         groups = {"stim": table[table.name == "stimulus"],
                   "fix": table[table.name == "fixation"].iloc[:60]}
-        eps, _ = EP.build_group_epochs(raw, groups, EP.EpochSettings(-0.2, 0.8, None))
+        eps, summ = EP.build_group_epochs(raw, groups, EP.EpochSettings(-0.2, 0.8, None))
         out["epochs"] = set(eps) == {"stim", "fix"}
+        out["AutoReject"] = summ.attrs.get("autoreject") == "applied"
         erp = {g: e.copy().apply_baseline((-0.2, 0)) for g, e in eps.items()}
         summary, _ = E.component_analysis(erp, E.COMPONENT_PRESETS["P300"])
         out["ERP component statistics"] = "p" in summary
@@ -107,6 +112,7 @@ def _analysis_checks(win) -> dict[str, bool]:
     except Exception as e:
         _say(f"analysis: {e!r}")
         out.setdefault("epochs", False)
+        out.setdefault("AutoReject", False)
         out.setdefault("ERP component statistics", False)
         out.setdefault("band power", False)
     return out

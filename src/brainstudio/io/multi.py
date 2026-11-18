@@ -169,3 +169,28 @@ def segment_columns(onsets: np.ndarray, segments: list[dict]) -> dict[str, np.nd
             out[col] = np.array([vals[i] if vals[i] is not None else "" for i in idx],
                                 dtype=object)
     return out
+
+
+def segment_label(seg: dict, with_subject: bool = True) -> str:
+    """Short name of a segment: ``sub-01 · ses-1 · run-2`` (only the entities it has)."""
+    parts = []
+    for key, pre in (("subject", "sub-"), ("session", "ses-"), ("run", "run-")):
+        v = seg.get(key)
+        if v not in (None, "") and (with_subject or key != "subject"):
+            parts.append(f"{pre}{v}")
+    return " · ".join(parts) or str(seg.get("file", ""))
+
+
+def subject_spans(segments: list[dict]) -> list[dict]:
+    """Consecutive segments of the same subject merged: subject, label, start, end."""
+    out: list[dict] = []
+    for s in segments or []:
+        subj = s.get("subject")
+        if subj in (None, ""):
+            continue
+        if out and out[-1]["subject"] == subj and abs(out[-1]["end"] - s["start"]) < 1e-6:
+            out[-1]["end"] = s["end"]
+        else:
+            out.append({"subject": subj, "label": f"sub-{subj}", "start": float(s["start"]),
+                        "end": float(s["end"])})
+    return out

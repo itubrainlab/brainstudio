@@ -15,6 +15,7 @@ from .. import eeg as E
 from .. import events as EV
 from .. import gaze as G
 from .. import io as bio
+from ..io.multi import subject_spans
 from ..model import Recording
 from . import icons, style
 from .eeg_analysis import AnalysisTab
@@ -355,6 +356,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.n_chan.setRange(1, 512)
         self.n_chan.setValue(20)
         self.n_chan.valueChanged.connect(lambda v: self.eeg_plot.set_visible_channels(v))
+        # subjects of combined recordings: jump from one to the next
+        self.subj_prev = QtWidgets.QToolButton()
+        self.subj_prev.setText("◀")
+        self.subj_prev.setToolTip("Previous subject")
+        self.subj_next = QtWidgets.QToolButton()
+        self.subj_next.setText("▶")
+        self.subj_next.setToolTip("Next subject")
+        self.subj_box = QtWidgets.QComboBox()
+        self.subj_box.setToolTip("Jump to the start of a subject's recording")
+        self.subj_box.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.subj_box.setMinimumContentsLength(6)
+        self.subj_box.activated.connect(self._jump_subject)
+        self.subj_prev.clicked.connect(lambda: self._step_subject(-1))
+        self.subj_next.clicked.connect(lambda: self._step_subject(+1))
+        self.subj_row = QtWidgets.QWidget()
+        sr_l = QtWidgets.QHBoxLayout(self.subj_row)
+        sr_l.setContentsMargins(0, 0, 0, 0)
+        sr_l.addWidget(self.subj_prev)
+        sr_l.addWidget(self.subj_next)
+        sr_l.addWidget(self.subj_box, 1)
+        self.subj_label = QtWidgets.QLabel("Subject")
+        self._subject_spans: list[dict] = []
+        f.addRow(self.subj_label, self.subj_row)
+        self.subj_label.setVisible(False)
+        self.subj_row.setVisible(False)
         f.addRow("Window", self.win_len)
         f.addRow("EEG scale", self.eeg_scale)
         f.addRow("Channels shown", self.n_chan)
@@ -1212,6 +1238,63 @@ class MainWindow(QtWidgets.QMainWindow):
         self.eeg_plot._set_event_lines(self.eeg_plot.plotItem, show)
         self.gaze_plot._set_event_lines(self.gaze_plot.pos_plot, show, labels=False)
         self.overview.set_recording(self.rec.duration, ev, self.rec.gaze)
+        self._show_segments()
+
+    def _show_segments(self):
+        """Where each subject's (and run's) recording starts, and the subject jump list."""
+        segs = self.rec.segments if self.rec is not None else []
+        self.eeg_plot._set_segment_lines(self.eeg_plot.plotItem, segs)
+        self.gaze_plot._set_segment_lines(self.gaze_plot.pos_plot, segs, labels=False)
+        spans = subject_spans(segs)
+        self._subject_spans = spans
+        self.overview.set_subjects(spans)
+        self.subj_box.blockSignals(True)
+        self.subj_box.clear()
+        for sp in spans:
+            self.subj_box.addItem(sp["label"])
+            self.subj_box.setItemData(self.subj_box.count() - 1,
+                                      f"{sp['start']:.1f}–{sp['end']:.1f} s",
+                                      QtCore.Qt.ToolTipRole)
+        self.subj_box.blockSignals(False)
+        many = len(spans) >= 2
+        self.subj_label.setVisible(many)
+        self.subj_row.setVisible(many)
+        self._sync_subject()
+
+    def _subject_at(self, t: float) -> int:
+        for k, sp in enumerate(self._subject_spans):
+            if sp["start"] <= t < sp["end"]:
+                return k
+        return len(self._subject_spans) - 1 if self._subject_spans else -1
+
+    def _jump_subject(self, k: int):
+        if not 0 <= k < len(self._subject_spans):
+            return
+        sp = self._subject_spans[k]
+        t0, t1 = self.eeg_plot.window()
+        w = t1 - t0
+        self.eeg_plot.set_window(sp["start"], sp["start"] + w)
+        self.set_cursor(sp["start"])
+        self.statusBar().showMessage(f"{sp['label']}: {sp['start']:.1f}–{sp['end']:.1f} s", 4000)
+
+    def _step_subject(self, step: int):
+        if not self._subject_spans:
+            return
+        t0, _ = self.eeg_plot.window()
+        k = self._subject_at(t0 + 1e-6)
+        self._jump_subject(int(np.clip(k + step, 0, len(self._subject_spans) - 1)))
+
+    def _sync_subject(self):
+        if not self._subject_spans:
+            return
+        t0, t1 = self.eeg_plot.window()
+        k = self._subject_at((t0 + t1) / 2)
+        if k != self.subj_box.currentIndex():
+            self.subj_box.blockSignals(True)
+            self.subj_box.setCurrentIndex(k)
+            self.subj_box.blockSignals(False)
+        self.subj_prev.setEnabled(k > 0 or t0 > self._subject_spans[0]["start"] + 1e-6)
+        self.subj_next.setEnabled(k < len(self._subject_spans) - 1)
 
     def _overlay_toggled(self, *_):
         kinds = {k: cb.isChecked() for k, cb in self.ov_checks.items()}
@@ -1243,6 +1326,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_window(self, t0, t1):
         self.overview.set_region(t0, t1)
+        self._sync_subject()
         self.gaze_plot._update_overlays(t0, t1)
         if not self.win_len.hasFocus():
             self.win_len.blockSignals(True)

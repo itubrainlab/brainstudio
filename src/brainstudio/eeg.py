@@ -613,6 +613,252 @@ def component_analysis(groups: dict[str, mne.BaseEpochs], comp: Component
     return summary, pd.concat(per, ignore_index=True)
 
 
+# =========================================================================== group ERPs
+def epoch_subjects(ep: mne.BaseEpochs) -> np.ndarray | None:
+    """Subject label of every epoch ("" when unknown), or None without a subject column."""
+    md = ep.metadata
+    if md is None or "subject" not in md:
+        return None
+    s = md["subject"]
+    return np.array(["" if (v is None or (isinstance(v, float) and np.isnan(v)))
+                     else str(v) for v in s], dtype=object)
+
+
+def subjects_in(groups: dict[str, mne.BaseEpochs]) -> list[str]:
+    """Subjects with at least one epoch in any group (sorted)."""
+    out = set()
+    for ep in groups.values():
+        k = epoch_subjects(ep)
+        if k is not None:
+            out |= set(k) - {""}
+    return sorted(out)
+
+
+def subject_evokeds(groups: dict[str, mne.BaseEpochs]) -> dict[str, dict[str, mne.Evoked]]:
+    """One Evoked per subject and group: each subject's epochs averaged on their own."""
+    out = {}
+    for g, ep in groups.items():
+        keys = epoch_subjects(ep)
+        out[g] = {}
+        if keys is None:
+            continue
+        for s in sorted(set(keys) - {""}):
+            ev = ep[np.flatnonzero(keys == s)].average()
+            ev.comment = f"{g} · sub-{s}"
+            out[g][s] = ev
+    return out
+
+
+def grand_average(evokeds: list[mne.Evoked]) -> mne.Evoked:
+    """Average of averages: every subject weighs the same, whatever its epoch count."""
+    if len(evokeds) == 1:
+        return evokeds[0].copy()
+    return mne.grand_average(list(evokeds), interpolate_bads=False, drop_bads=False)
+
+
+def _roi_wave(ev: mne.Evoked, chans: list[str]) -> np.ndarray:
+    return ev.get_data(picks=chans).mean(0) * 1e6
+
+
+def _peak(ev: mne.Evoked, chans: list[str], comp: "Component") -> tuple[float, float]:
+    roi = mne.channels.combine_channels(ev, {"roi": [ev.ch_names.index(c) for c in chans]},
+                                        method="mean", verbose="error")
+    _, lat, amp = roi.get_peak(tmin=comp.tmin, tmax=comp.tmax,
+                               mode="neg" if comp.polarity < 0 else "pos",
+                               return_amplitude=True, strict=False)
+    return float(amp) * 1e6, float(lat) * 1000
+
+
+def _rm_anova(y: np.ndarray) -> tuple[float, float, float, float]:
+    """One-way repeated-measures ANOVA on y (subjects × conditions): F, df1, df2, p."""
+    from scipy import stats as sst
+    n, k = y.shape
+    gm = y.mean()
+    ss_c = n * ((y.mean(0) - gm) ** 2).sum()
+    ss_s = k * ((y.mean(1) - gm) ** 2).sum()
+    ss_e = ((y - gm) ** 2).sum() - ss_c - ss_s
+    d1, d2 = k - 1, (k - 1) * (n - 1)
+    f = (ss_c / d1) / (ss_e / d2) if ss_e > 0 else np.nan
+    return float(f), float(d1), float(d2), float(sst.f.sf(f, d1, d2)) if np.isfinite(f) else np.nan
+
+
+def group_component_analysis(groups: dict[str, mne.BaseEpochs], comp: "Component") -> dict:
+    """ERP component across subjects, as in group ERP studies: average the epochs of each
+    subject first (one Evoked per subject and group), then average those Evokeds with equal
+    weight (grand average). Subjects, not epochs, are the observations.
+
+    Returns a dict with
+    * ``summary``: per group N subjects, mean ± SEM and 95 % CI of the subjects' window
+      means, peak of the grand average; then the across-subject test. Two groups: paired
+      t-test on the subjects that have both (= one-sample t-test of their difference
+      waves against 0), Wilcoxon signed-rank and Cohen's d_z; without shared subjects a
+      Welch t-test between subject means. More groups: repeated-measures ANOVA and
+      Friedman test on the subjects that have every group.
+    * ``subjects``: one row per subject and group (epochs, window mean, peak).
+    * ``subject_tests``: within each subject, the epoch-level test between the groups.
+    * ``evokeds`` / ``grand`` / ``diffs`` / ``grand_diff``.
+    """
+    from scipy import stats as sst
+
+    from . import stats as ST
+
+    if comp.tmin >= comp.tmax:
+        raise ValueError("The component window must start before it ends")
+    first = next(iter(groups.values()))
+    chans = [c for c in comp.channels if c in first.ch_names]
+    if not chans:
+        raise ValueError(f"None of {', '.join(comp.channels)} are among the epoch channels "
+                         "(renamed, or marked bad?)")
+    m = (first.times >= comp.tmin) & (first.times <= comp.tmax)
+    if not m.any():
+        raise ValueError("The component window lies outside the epochs")
+    evs = subject_evokeds(groups)
+    rows = []
+    vals: dict[str, dict[str, float]] = {}
+    for g, by_s in evs.items():
+        vals[g] = {}
+        for s, ev in by_s.items():
+            w = float(_roi_wave(ev, chans)[m].mean())
+            pa, pl = _peak(ev, chans, comp)
+            vals[g][s] = w
+            rows.append({"subject": s, "group": g, "epochs": ev.nave, "window mean µV": w,
+                         "peak µV": pa, "peak latency ms": pl})
+    subjects = pd.DataFrame(rows)
+    grand = {g: grand_average(list(by_s.values())) for g, by_s in evs.items() if by_s}
+    for g, ev in grand.items():
+        ev.comment = f"{g} (grand average)"
+
+    summary = []
+    for g, v in vals.items():
+        x = np.array(list(v.values()))
+        n = len(x)
+        sem = float(x.std(ddof=1) / np.sqrt(n)) if n > 1 else np.nan
+        ci = float(sst.t.ppf(0.975, n - 1) * sem) if n > 1 else np.nan
+        pa, pl = _peak(grand[g], chans, comp) if g in grand else (np.nan, np.nan)
+        summary.append({"group": g, "subjects": n, "epochs": int(sum(
+            e.nave for e in evs[g].values())), "window mean µV": float(x.mean()) if n
+            else np.nan, "sem": sem, "95% CI ±": ci, "grand-average peak µV": pa,
+            "grand-average peak latency ms": pl})
+    labels = list(vals)
+    diffs, grand_diff = {}, None
+    if len(labels) == 2:
+        ga, gb = labels
+        both = sorted(set(vals[ga]) & set(vals[gb]))
+        row = {"group": f"{ga} − {gb}"}
+        if len(both) >= 2:
+            a = np.array([vals[ga][s] for s in both])
+            b = np.array([vals[gb][s] for s in both])
+            d = a - b
+            t = sst.ttest_rel(a, b)
+            try:
+                wp = float(sst.wilcoxon(a, b).pvalue)
+            except ValueError:
+                wp = np.nan
+            sd = d.std(ddof=1)
+            row.update({"subjects": len(both), "window mean µV": float(d.mean()),
+                        "sem": float(sd / np.sqrt(len(d))),
+                        "95% CI ±": float(sst.t.ppf(0.975, len(d) - 1) * sd / np.sqrt(len(d))),
+                        "test": "paired t (subjects)", "t": float(t.statistic),
+                        "df": float(len(d) - 1), "p": float(t.pvalue), "p (Wilcoxon)": wp,
+                        "cohen dz": float(d.mean() / sd) if sd > 0 else np.nan})
+        else:
+            a, b = np.array(list(vals[ga].values())), np.array(list(vals[gb].values()))
+            if min(len(a), len(b)) >= 2:
+                t = sst.ttest_ind(a, b, equal_var=False)
+                row.update({"subjects": len(a) + len(b), "window mean µV":
+                            float(a.mean() - b.mean()), "test": "Welch t (subject means, "
+                            "independent groups)", "t": float(t.statistic), "df": float(t.df),
+                            "p": float(t.pvalue), "p (Mann-Whitney)": float(
+                                sst.mannwhitneyu(a, b).pvalue), "hedges g": ST.hedges_g(a, b)})
+        summary.append(row)
+        for s in both:
+            dv = mne.combine_evoked([evs[ga][s], evs[gb][s]], weights=[1, -1])
+            dv.comment = f"{ga} − {gb} · sub-{s}"
+            diffs[s] = dv
+        if diffs:
+            grand_diff = grand_average(list(diffs.values()))
+            grand_diff.comment = f"{ga} − {gb}"
+    elif len(labels) > 2:
+        common = sorted(set.intersection(*[set(v) for v in vals.values()]))
+        if len(common) >= 2:
+            y = np.array([[vals[g][s] for g in labels] for s in common])
+            f, d1, d2, p = _rm_anova(y)
+            fr = sst.friedmanchisquare(*y.T)
+            summary.append({"group": "all groups", "subjects": len(common),
+                            "test": "repeated-measures ANOVA", "F": f, "df": d1, "df2": d2,
+                            "p": p, "p (Friedman)": float(fr.pvalue)})
+
+    tests = []
+    keys = {g: epoch_subjects(ep) for g, ep in groups.items()}
+    for s in subjects_in(groups):
+        sub = {g: ep[np.flatnonzero(keys[g] == s)] for g, ep in groups.items()
+               if keys[g] is not None and (keys[g] == s).sum() >= 2}
+        if len(sub) < 2:
+            continue
+        r = ST.compare({g: ep.get_data(picks=chans).mean(1)[:, m].mean(1) * 1e6
+                        for g, ep in sub.items()})
+        tests.append({"subject": s, **{f"n {g}": len(ep) for g, ep in sub.items()},
+                      "test (epochs)": r["test"], "statistic": r["stat"], "p": r["p"],
+                      "effect (hedges g)": r["effect"], "p (non-parametric)": r["p_np"]})
+    subject_tests = pd.DataFrame(tests)
+    if len(subject_tests):
+        subject_tests["q (FDR)"] = ST.fdr(subject_tests["p"].to_numpy())
+    summary = pd.DataFrame(summary)
+    summary.insert(0, "component", f"{comp.name} {comp.tmin * 1000:.0f}–{comp.tmax * 1000:.0f} "
+                   f"ms {'+' if comp.polarity > 0 else '−'} @ {'+'.join(chans)}")
+    return dict(summary=summary, subjects=subjects, subject_tests=subject_tests,
+                evokeds=evs, grand=grand, diffs=diffs, grand_diff=grand_diff, channels=chans)
+
+
+def group_cluster_test(diffs: list[mne.Evoked], tfce: bool = False,
+                       n_permutations: int = 5000, seed: int = 42, alpha: float = 0.05,
+                       tmin: float | None = None, tmax: float | None = None) -> dict:
+    """Across-subject mass-univariate test of difference waves against 0 (ERP guide):
+    ``spatio_temporal_cluster_1samp_test`` with the channels' adjacency, cluster-forming
+    threshold from the t distribution or TFCE (``threshold=dict(start=0, step=0.2)``).
+
+    Returns t values and the significance mask (times × channels), one row per
+    significant cluster (time span, channels, p) and the settings."""
+    from mne.stats import spatio_temporal_cluster_1samp_test
+    if len(diffs) < 3:
+        raise ValueError("The cluster test needs at least 3 subjects with both groups")
+    ev0 = diffs[0].copy().pick("eeg")
+    if tmin is not None or tmax is not None:
+        ev0.crop(tmin, tmax)
+    chans = ev0.ch_names
+    x = np.array([d.copy().pick(chans).crop(ev0.times[0], ev0.times[-1]).data.T
+                  for d in diffs])                       # subjects × times × channels
+    adjacency, _ = mne.channels.find_ch_adjacency(ev0.info, ch_type="eeg")
+    kw = dict(threshold=dict(start=0, step=0.2)) if tfce else {}
+    with mne.utils.use_log_level("error"):
+        t_obs, clusters, pv, _ = spatio_temporal_cluster_1samp_test(
+            x, adjacency=adjacency, n_permutations=int(n_permutations), out_type="mask",
+            seed=seed, n_jobs=1, **kw)
+    mask = np.zeros(t_obs.shape, bool)
+    rows = []
+    if tfce:
+        mask = pv.reshape(t_obs.shape) < alpha
+        if mask.any():
+            ti, ci = np.nonzero(mask)
+            rows.append({"cluster": "TFCE", "from ms": ev0.times[ti.min()] * 1000,
+                         "to ms": ev0.times[ti.max()] * 1000,
+                         "channels": ", ".join(sorted({chans[c] for c in ci})),
+                         "p": float(pv.min())})
+    else:
+        for k in np.flatnonzero(pv < alpha):
+            m = clusters[k]
+            mask |= m
+            ti, ci = np.nonzero(m)
+            rows.append({"cluster": int(k), "from ms": ev0.times[ti.min()] * 1000,
+                         "to ms": ev0.times[ti.max()] * 1000,
+                         "sign": "+" if t_obs[m].mean() > 0 else "−",
+                         "channels": ", ".join(sorted({chans[c] for c in ci})),
+                         "p": float(pv[k])})
+    return dict(t_obs=t_obs, mask=mask, table=pd.DataFrame(rows), times=ev0.times,
+                channels=chans, n_subjects=len(diffs), tfce=tfce,
+                n_permutations=int(n_permutations))
+
+
 def rejection_causes(epochs: mne.BaseEpochs) -> dict[str, int]:
     """How many epochs each channel caused to be rejected, worst first."""
     counts: dict[str, int] = {}

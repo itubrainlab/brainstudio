@@ -17,9 +17,13 @@ from . import eeg as E
 
 @dataclass
 class EpochSettings:
-    tmin: float = -0.2
-    tmax: float = 0.8
-    reject_uv: float | None = 150.0   # peak-to-peak rejection (EEG)
+    """Defaults follow the ERP guide (neuraldatascience.io): −0.1 … 1.0 s, no fixed
+    amplitude threshold, AutoReject interpolates bad channels per epoch and drops the
+    epochs it cannot repair."""
+    tmin: float = -0.1
+    tmax: float = 1.0
+    reject_uv: float | None = None    # peak-to-peak rejection (EEG)
+    autoreject: bool = True           # AutoReject (local): interpolate, then drop
     flat_uv: float | None = None      # reject epochs flatter than this
     drop_blinks: bool = False         # drop epochs overlapping an eye-tracker blink
     max_epochs: int | None = 2000     # per group, reproducible random subsample
@@ -31,6 +35,8 @@ class EpochSettings:
             s += f", reject ptp > {self.reject_uv:g} µV"
         if self.flat_uv:
             s += f", flat < {self.flat_uv:g} µV"
+        if self.autoreject:
+            s += ", AutoReject"
         if self.drop_blinks:
             s += ", no blinks"
         if self.delay_ms:
@@ -104,4 +110,62 @@ def build_group_epochs(raw: mne.io.BaseRaw, groups: dict[str, pd.DataFrame],
                 if len(ep):
                     out[name] = ep
         rows.append(row)
-    return out, pd.DataFrame(rows)
+    summary = pd.DataFrame(rows)
+    if settings.autoreject and out:
+        out, summary = apply_autoreject(out, summary)
+    return out, summary
+
+
+def apply_autoreject(epochs: dict[str, mne.Epochs], summary: pd.DataFrame,
+                     max_fit: int = 600, seed: int = 42
+                     ) -> tuple[dict[str, mne.Epochs], pd.DataFrame]:
+    """AutoReject (``n_interpolate=[1, 2, 4]``, ``random_state=42``), as in the ERP guide:
+    fitted once on the epochs of every group (at most ``max_fit`` of them), then each
+    group is cleaned — bad channels are interpolated within an epoch and the epochs that
+    cannot be repaired are dropped. Needs electrode positions and ≥ 10 epochs."""
+    import warnings
+
+    from .preprocessing import _has_positions
+    summary = summary.copy()
+    summary["rejected (AutoReject)"] = 0
+    summary["interpolated (AutoReject)"] = 0
+    every = list(epochs.values())
+    n = sum(len(e) for e in every)
+    if not _has_positions(every[0]):
+        summary.attrs["autoreject"] = "not applied: the EEG channels have no positions"
+        return epochs, summary
+    if n < 10:
+        summary.attrs["autoreject"] = "not applied: fewer than 10 epochs"
+        return epochs, summary
+    from autoreject import AutoReject
+    with warnings.catch_warnings(), mne.utils.use_log_level("error"):
+        warnings.simplefilter("ignore")
+        # fitting needs only the data: one array of every group's epochs (their event
+        # codes may clash, which mne.concatenate_epochs refuses)
+        sizes = [len(e) for e in every]
+        pick = np.arange(n)
+        if n > max_fit:
+            pick = np.sort(np.random.default_rng(seed).choice(n, max_fit, False))
+        starts = np.cumsum([0] + sizes)
+        data = np.concatenate([every[k].get_data(item=pick[(pick >= starts[k]) &
+                                                         (pick < starts[k + 1])] - starts[k])
+                               for k in range(len(every))])
+        allep = mne.EpochsArray(data, every[0].info, tmin=every[0].tmin, baseline=None,
+                                verbose="error")
+        ar = AutoReject(n_interpolate=[1, 2, 4], random_state=seed, n_jobs=1,
+                        verbose=False, picks=mne.pick_types(allep.info, eeg=True, eog=False))
+        ar.fit(allep)
+        out = {}
+        for g, ep in epochs.items():
+            ep = ep.copy().load_data()
+            log = ar.get_reject_log(ep)
+            clean = ar.transform(ep)
+            i = summary.index[summary["group"] == g][0]
+            summary.loc[i, "rejected (AutoReject)"] = int(np.sum(log.bad_epochs))
+            summary.loc[i, "interpolated (AutoReject)"] = int(
+                (log.labels[~log.bad_epochs] == 2).sum())
+            summary.loc[i, "kept"] = len(clean)
+            if len(clean):
+                out[g] = clean
+    summary.attrs["autoreject"] = "applied"
+    return out, summary

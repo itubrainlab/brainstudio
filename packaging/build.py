@@ -68,6 +68,9 @@ def main() -> int:
         "--collect-all", "mne", "--collect-all", "mne_bids",
         "--collect-all", "pyqtgraph", "--collect-all", "pygaze",
         "--collect-all", "brainstudio", "--collect-all", "picard",
+        # ICLabel's network (ONNX) and AutoReject
+        "--collect-all", "mne_icalabel", "--collect-all", "onnxruntime",
+        "--collect-all", "autoreject",
         "--hidden-import", "pyxdf", "--hidden-import", "pybv",
         "--exclude-module", "PyQt5", "--exclude-module", "PyQt6",
         "--exclude-module", "tkinter", "--exclude-module", "pytest",

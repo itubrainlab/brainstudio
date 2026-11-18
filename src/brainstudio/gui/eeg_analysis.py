@@ -9,6 +9,7 @@ import mne
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
+from scipy import stats as sst
 from PySide6 import QtCore, QtWidgets
 
 from .. import bandpower as BP
@@ -17,6 +18,10 @@ from .. import stats as ST
 from .theme import THEME
 from .widgets import (NO_POS, StageHeader, _spin, _themed_plot, fill_table, has_positions,
                       hint, parse_channels)
+
+
+def _safe(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(name)) or "group"
 
 
 def _sem(x: np.ndarray, axis=0) -> np.ndarray:
@@ -153,7 +158,7 @@ class AnalysisTab(QtWidgets.QWidget):
         g = QtWidgets.QGridLayout()
         self.erp_bl_on = QtWidgets.QCheckBox("Baseline")
         self.erp_bl_on.setChecked(True)
-        self.erp_bl0 = _spin(-3600, 3600, -0.2, 0.05, 3, " s")
+        self.erp_bl0 = _spin(-3600, 3600, -0.1, 0.05, 3, " s")  # (None, 0) for −0.1 s epochs
         self.erp_bl1 = _spin(-3600, 3600, 0.0, 0.05, 3, " s")
         for x in (self.erp_bl0, self.erp_bl1):
             x.setToolTip("Pre-event baseline window, subtracted from every epoch")
@@ -206,6 +211,13 @@ class AnalysisTab(QtWidgets.QWidget):
         b.setObjectName("Primary")
         b.clicked.connect(lambda: self.compute_erp())
         row.addWidget(b)
+        self.btn_cluster = QtWidgets.QPushButton("Cluster test across subjects…")
+        self.btn_cluster.setToolTip(
+            "Spatio-temporal cluster permutation test (or TFCE) of the subjects' difference "
+            "waves against 0, as in the ERP guide. Needs ≥ 3 subjects with both groups and "
+            "electrode positions.")
+        self.btn_cluster.clicked.connect(self.erp_cluster)
+        self.btn_cluster.setEnabled(False)
         for label, fn in (("Compare evokeds (MNE)…", self.erp_compare),
                           ("Joint plot (MNE)…", self.erp_joint),
                           ("Topomaps (MNE)…", self.erp_topo),
@@ -213,10 +225,14 @@ class AnalysisTab(QtWidgets.QWidget):
             bb = QtWidgets.QPushButton(label)
             bb.clicked.connect(fn)
             row.addWidget(bb)
+        row.addWidget(self.btn_cluster)
         row.addStretch()
         row.addWidget(QtWidgets.QLabel("show"))
         self.erp_view = QtWidgets.QComboBox()
-        self.erp_view.addItems(["Cluster mean", "Single channel", "GFP", "Butterfly"])
+        self.erp_view.addItems(["Cluster mean", "Single channel", "Subjects", "GFP",
+                                "Butterfly"])
+        self.erp_view.setToolTip("Subjects: every subject's own average (with two or more "
+                                 "subjects), under the grand average")
         self.erp_view.currentTextChanged.connect(lambda *_: self._plot_erp())
         row.addWidget(self.erp_view)
         self.erp_chan = QtWidgets.QComboBox()
@@ -235,8 +251,13 @@ class AnalysisTab(QtWidgets.QWidget):
         tabs = QtWidgets.QTabWidget()
         self.erp_table = QtWidgets.QTableWidget()
         self.erp_trials = QtWidgets.QTableWidget()
+        self.erp_subjects = QtWidgets.QTableWidget()
+        self.erp_subject_tests = QtWidgets.QTableWidget()
         tabs.addTab(self.erp_table, "Component statistics")
+        tabs.addTab(self.erp_subjects, "Per subject")
+        tabs.addTab(self.erp_subject_tests, "Within each subject")
         tabs.addTab(self.erp_trials, "Per epoch")
+        self.erp_tabs = tabs
         split.addWidget(tabs)
         split.setSizes([500, 220])
         lay.addWidget(split, 1)
@@ -366,6 +387,24 @@ class AnalysisTab(QtWidgets.QWidget):
                 ev.comment = g
                 evokeds[g] = ev
             summary, per = E.component_analysis(eps, comp)
+            subj = {g: E.epoch_subjects(ep) for g, ep in eps.items()}
+            if any(k is not None for k in subj.values()):
+                per.insert(1, "subject", np.concatenate(
+                    [k if k is not None else np.full(len(ep), "", object)
+                     for k, ep in zip(subj.values(), eps.values())]))
+            group = None
+            if len(E.subjects_in(eps)) >= 2:
+                # several subjects: average each subject's epochs first, then the
+                # subjects' averages with equal weight; subjects are the observations
+                group = E.group_component_analysis(eps, comp)
+                unknown = sum(int((k == "").sum()) for k in subj.values() if k is not None)
+                if unknown:
+                    notes.append(f"⚠ {unknown} epochs without a subject are left out of the "
+                                 "subject averages")
+                diff = group["grand_diff"]
+                return dict(eps=eps, evokeds=group["grand"], summary=group["summary"],
+                            per_epoch=per, diff=diff, roi=list(comp.channels), comp=comp,
+                            baseline=bl, notes=notes, reference=ref_label, group=group)
             diff = None
             if len(eps) == 2:
                 (la, a), (lb, b) = eps.items()
@@ -376,7 +415,7 @@ class AnalysisTab(QtWidgets.QWidget):
                     notes.append(f"⚠ {ov} events are in both groups (tests assume independence)")
             return dict(eps=eps, evokeds=evokeds, summary=summary, per_epoch=per,
                         diff=diff, roi=list(comp.channels), comp=comp,
-                        baseline=bl, notes=notes, reference=ref_label)
+                        baseline=bl, notes=notes, reference=ref_label, group=group)
 
         def done(res):
             self.erp = res
@@ -412,6 +451,9 @@ class AnalysisTab(QtWidgets.QWidget):
             self.erp_table.clear()
             return
         roi, comp, view = r["roi"], r["comp"], self.erp_view.currentText()
+        grp = r.get("group")
+        if grp is not None:
+            roi = grp["channels"]
         self.erp_chan.setVisible(view == "Single channel")
         unit = "Amplitude (µV)"
         for g, ev in r["evokeds"].items():
@@ -431,25 +473,46 @@ class AnalysisTab(QtWidgets.QWidget):
             chans = [self.erp_chan.currentText()] if view == "Single channel" and \
                 self.erp_chan.currentText() in ev.ch_names else roi
             y = ev.copy().pick(chans).data.mean(0) * 1e6
-            x = r["eps"][g].get_data(picks=chans).mean(1) * 1e6
-            sem = _sem(x)
-            lo = p.plot(t, y - sem, pen=None)
-            hi = p.plot(t, y + sem, pen=None)
+            if grp is not None:  # 95 % CI across subjects (their own averages)
+                x = np.array([e.get_data(picks=chans).mean(0) * 1e6
+                              for e in grp["evokeds"][g].values()])
+                n = len(x)
+                band = (_sem(x) * sst.t.ppf(0.975, n - 1)) if n > 1 else np.zeros_like(y)
+                name = f"{g} (grand average, N={n} subjects)"
+                if view == "Subjects":
+                    for sname, xs in zip(grp["evokeds"][g], x):
+                        c = p.plot(t, xs, pen=pg.mkPen(self._color(g, 90), width=1))
+                        c.setToolTip(f"{g}: sub-{sname}")
+            else:
+                x = r["eps"][g].get_data(picks=chans).mean(1) * 1e6
+                band = _sem(x)
+                name = f"{g} (n={ev.nave})"
+            lo = p.plot(t, y - band, pen=None)
+            hi = p.plot(t, y + band, pen=None)
             p.addItem(pg.FillBetweenItem(lo, hi, brush=self._color(g, 50)))
-            p.plot(t, y, pen=pg.mkPen(col, width=2.2), name=f"{g} (n={ev.nave})")
+            p.plot(t, y, pen=pg.mkPen(col, width=2.2), name=name)
             if view == "Cluster mean":
                 row = r["summary"][r["summary"]["group"] == g]
+                pk = "grand-average peak" if grp is not None else "peak"
                 if len(row):
-                    p.plot([row["peak latency ms"].iloc[0] / 1000], [row["peak µV"].iloc[0]],
+                    p.plot([row[f"{pk} latency ms"].iloc[0] / 1000], [row[f"{pk} µV"].iloc[0]],
                            pen=None, symbol="o", symbolSize=9, symbolBrush=col,
                            symbolPen=pg.mkPen(THEME.fg))
-        if r["diff"] is not None and view in ("Cluster mean", "Single channel"):
+        if r["diff"] is not None and view in ("Cluster mean", "Single channel", "Subjects"):
             chans = [self.erp_chan.currentText()] if view == "Single channel" and \
                 self.erp_chan.currentText() in r["diff"].ch_names else roi
             d = r["diff"].copy().pick(chans).data.mean(0) * 1e6
+            name = r["diff"].comment
+            if grp is not None and len(grp["diffs"]) > 1:  # 95 % CI across subjects
+                xd = np.array([e.get_data(picks=chans).mean(0) * 1e6
+                               for e in grp["diffs"].values()])
+                band = _sem(xd) * sst.t.ppf(0.975, len(xd) - 1)
+                lo = p.plot(r["diff"].times, d - band, pen=None)
+                hi = p.plot(r["diff"].times, d + band, pen=None)
+                p.addItem(pg.FillBetweenItem(lo, hi, brush=THEME.rgba("fg", 30)))
+                name += f" (95 % CI, N={len(xd)})"
             p.plot(r["diff"].times, d, pen=pg.mkPen(THEME.fg, width=1.5,
-                                                     style=QtCore.Qt.DashLine),
-                   name=r["diff"].comment)
+                                                     style=QtCore.Qt.DashLine), name=name)
         p.setLabel("left", unit)
         p.addItem(pg.InfiniteLine(0, angle=90, pen=pg.mkPen(THEME.muted)))
         if r["baseline"]:
@@ -469,12 +532,26 @@ class AnalysisTab(QtWidgets.QWidget):
             cur.sigPositionChangeFinished.connect(
                 lambda line: setattr(self, "_erp_t", float(line.value())))
             p.addItem(cur)
+        self.btn_cluster.setEnabled(grp is not None and len(grp["diffs"]) >= 3)
         fill_table(self.erp_table, r["summary"], fmt="{:.4g}")
         fill_table(self.erp_trials, r["per_epoch"].iloc[:5000], fmt="{:.4g}")
+        for tab, key in ((self.erp_subjects, "subjects"), (self.erp_subject_tests,
+                                                            "subject_tests")):
+            fill_table(tab, grp[key] if grp is not None else pd.DataFrame(), fmt="{:.4g}")
+            self.erp_tabs.setTabVisible(self.erp_tabs.indexOf(tab), grp is not None)
         bl = f"{r['baseline'][0]:g}…{r['baseline'][1]:g} s" if r["baseline"] else "none"
         sm = r["summary"]
         welch = ""
-        if "p" in sm and sm["p"].notna().any():
+        if grp is not None:
+            last = sm.iloc[-1]
+            if "t" in sm and pd.notna(last.get("t")):
+                welch = (f"  ·  {last['group']}: Δ = {last['window mean µV']:.2f} µV, "
+                         f"{last['test']} t({last['df']:.0f}) = {last['t']:.2f}, "
+                         f"p = {last['p']:.3g}")
+            elif "F" in sm and pd.notna(last.get("F")):
+                welch = (f"  ·  {last['test']} F({last['df']:.0f}, {last['df2']:.0f}) = "
+                         f"{last['F']:.2f}, p = {last['p']:.3g}")
+        elif "p" in sm and sm["p"].notna().any():
             last = sm.iloc[-1]
             if "Welch t" in sm and pd.notna(last.get("Welch t")):
                 welch = (f"  ·  window mean {last['group']}: Δ = {last['window mean µV']:.2f} µV, "
@@ -487,20 +564,111 @@ class AnalysisTab(QtWidgets.QWidget):
             f"  ·  reference: {r.get('reference', 'as recorded')}"
             f"{welch}  ·  click the plot to set a latency for the topomaps"
             + ("\n" + "; ".join(r["notes"]) if r["notes"] else "")
-            + "\nTrials are the observations: single-subject statistics, valid if the window "
-              "was chosen before looking at the data.")
+            + ("\nGroup ERP: each subject's epochs are averaged first, then the subjects' "
+               "averages with equal weight (grand average); bands are 95 % CIs across "
+               "subjects and subjects are the observations. Valid if the window was chosen "
+               "before looking at the data." if grp is not None else
+               "\nTrials are the observations: single-subject statistics, valid if the "
+               "window was chosen before looking at the data."))
 
     def erp_compare(self):
         r = self.erp
         if r is None:
             return
         cols = {g: THEME.group(list(self.pl.epochs).index(g)) for g in r["evokeds"]}
+        grp = r.get("group")
+        # with subjects: a list of subject averages per group → mean and 95 % CI
+        evs = ({g: list(v.values()) for g, v in grp["evokeds"].items() if v}
+               if grp is not None else r["evokeds"])
         try:
-            mne.viz.plot_compare_evokeds(r["evokeds"], picks=r["roi"],
+            mne.viz.plot_compare_evokeds(evs, picks=r["roi"] if grp is None else
+                                         grp["channels"],
                                          combine="mean" if len(r["roi"]) > 1 else None,
+                                         ci=0.95 if grp is not None else None,
                                          colors=cols, show=True)
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Compare evokeds", str(e))
+
+    def erp_cluster(self):
+        r = self.erp
+        grp = r.get("group") if r else None
+        if grp is None or len(grp["diffs"]) < 3:
+            return
+        diffs = list(grp["diffs"].values())
+        if not has_positions(diffs[0]):
+            QtWidgets.QMessageBox.information(self, "Cluster test", NO_POS)
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Cluster test across subjects")
+        f = QtWidgets.QFormLayout(dlg)
+        kind = QtWidgets.QComboBox()
+        kind.addItems(["cluster (t threshold)", "TFCE"])
+        nperm = QtWidgets.QSpinBox()
+        nperm.setRange(100, 100_000)
+        nperm.setSingleStep(1000)
+        nperm.setValue(5000)
+        nperm.setToolTip("The ERP guide uses 5000 to explore and 50 000 for publication. "
+                         "With few subjects every sign flip is tested (at most 2^N).")
+        t0 = _spin(-3600, 3600, max(0.0, diffs[0].times[0]), 0.05, 3, " s")
+        t1 = _spin(-3600, 3600, diffs[0].times[-1], 0.05, 3, " s")
+        f.addRow("test", kind)
+        f.addRow("permutations", nperm)
+        f.addRow("from", t0)
+        f.addRow("to", t1)
+        f.addRow(hint(f"{len(diffs)} subjects' difference waves "
+                      f"({r['diff'].comment}) against 0, all EEG channels."))
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok |
+                                        QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        f.addRow(bb)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        tfce, n, a, b = kind.currentIndex() == 1, nperm.value(), t0.value(), t1.value()
+
+        def job():
+            return E.group_cluster_test(diffs, tfce=tfce, n_permutations=n, tmin=a, tmax=b)
+
+        def done(res):
+            self._show_cluster(res)
+
+        self.worker.run("Cluster test across subjects…", job, done)
+
+    def _show_cluster(self, res):
+        import matplotlib.pyplot as plt
+        r = self.erp
+        ev = r["diff"].copy().pick(res["channels"]).crop(res["times"][0], res["times"][-1])
+        n_sig = int(res["mask"].any(1).sum())
+        title = (f"{r['diff'].comment}: {'TFCE' if res['tfce'] else 'cluster'} test, "
+                 f"N={res['n_subjects']} subjects, {res['n_permutations']} permutations")
+        try:
+            ev.plot_image(mask=res["mask"].T, mask_style="mask", show=False,
+                          titles=dict(eeg=title), clim=None)
+            if res["mask"].any() and has_positions(ev):
+                sig_t = res["times"][res["mask"].any(1)]
+                mid = float(np.median(sig_t))
+                ev.plot_topomap(times=mid, average=max(float(np.ptp(sig_t)), 0.01),
+                                mask=res["mask"].T, show=False, contours=False)
+            plt.show()
+        except Exception as e:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(self, "Cluster test", str(e))
+        tab = res["table"]
+        msg = (f"{len(tab)} significant {'region' if res['tfce'] else 'cluster(s)'} "
+               f"(p < 0.05), {n_sig} time points.\n\n" +
+               (tab.to_string(index=False, float_format=lambda v: f"{v:.4g}")
+                if len(tab) else "No significant difference."))
+        n = res["n_subjects"]
+        if 2 ** n < 2 / 0.05:  # sign flips: the smallest attainable p is 2 / 2^N
+            msg += (f"\n\nWith {n} subjects only 2^{n} = {2 ** n} sign flips exist, so no "
+                    f"p can fall below {2 / 2 ** n:.3g}: more subjects are needed.")
+        if res["tfce"]:
+            msg += ("\n\nTFCE gives a p value per channel and time point, not per cluster: "
+                    "report the region, not cluster statistics.")
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Cluster test across subjects")
+        box.setText(title)
+        box.setInformativeText(msg if len(msg) < 1500 else msg[:1500] + " …")
+        box.exec()
 
     def erp_joint(self):
         r = self.erp
@@ -557,6 +725,17 @@ class AnalysisTab(QtWidgets.QWidget):
         mne.write_evokeds(out / "erp-ave.fif", evs, overwrite=True, verbose="error")
         r["summary"].to_csv(out / "erp_component_summary.csv", index=False)
         r["per_epoch"].to_csv(out / "erp_component_per_epoch.csv", index=False)
+        grp = r.get("group")
+        if grp is not None:  # one Evoked per subject and group (+ difference waves)
+            for g, by_s in grp["evokeds"].items():
+                for sname, ev in by_s.items():
+                    mne.write_evokeds(out / f"sub-{sname}_{_safe(g)}-ave.fif", ev,
+                                      overwrite=True, verbose="error")
+            for sname, ev in grp["diffs"].items():
+                mne.write_evokeds(out / f"sub-{sname}_difference-ave.fif", ev,
+                                  overwrite=True, verbose="error")
+            grp["subjects"].to_csv(out / "erp_component_per_subject.csv", index=False)
+            grp["subject_tests"].to_csv(out / "erp_component_within_subject.csv", index=False)
         c = r["comp"]
         self._write_provenance(out / "erp.txt", {
             "component": f"{c.name} {c.tmin:g}–{c.tmax:g} s, polarity {c.polarity:+d}",

@@ -235,6 +235,10 @@ The two panels are fixed, resizable parts of the tab.
 **Viewer**
 
 - **EEG traces** with event markers and shaded saccades, blinks and fixations.
+- **Subjects** of combined files or BIDS runs: a labelled line marks where each
+  recording starts (`sub-01 · ses-1 · run-2`), and the overview strip shades each
+  subject. The **Subject** row in the Controls panel jumps to a subject's start
+  (◀ ▶ step to the previous / next one) and follows the window as you scroll.
 - The traces show the **preprocessed** EEG by default, without the channels marked bad
   in ① Preprocessing. Switch to *Raw* in the Controls panel to see every EEG channel,
   with bad ones greyed.
@@ -306,15 +310,28 @@ The **EEG** tab is a three-stage pipeline:
   - The data keep their **recorded reference**. Re-referencing happens in each analysis:
     ERPs use the reference conventional for the component, band power the average
     reference.
-- **ICA blink removal** (`mne.preprocessing.ICA`, picard).
-  - It is fitted on a ≥ 1 Hz copy of the good, non-flat channels, at most 300,000
-    samples spread over the whole recording (long or combined recordings are subsampled,
-    so the fit stays quick) and at most 500 iterations. The ICA panel says when either
-    limit was used.
-  - Components are scored by how strongly they respond around the eye tracker's blinks
-    (a blink-locked t-score), and against EOG or, without EOG, the frontal electrodes
-    (`find_bads_eog`).
-  - Suggested components are pre-ticked.
+- **ICA blink removal** (`mne.preprocessing.ICA`), following the
+  [ERP guide](https://neuraldatascience.io/eeg/erp-artifacts):
+  - fitted on a separate **1–30 Hz**, average-referenced copy of the good, non-flat
+    channels, whatever the ERP filter;
+  - the copy is cut into **1 s segments**; **AutoReject** (`n_interpolate=[1, 2, 4]`,
+    `random_state=42`) marks the bad ones, which are left out of the fit. Without
+    electrode positions a peak-to-peak threshold is used instead;
+  - **99 % of the variance** (or a set number of components), `random_state=42`, every
+    3rd sample (more on long recordings: at most 300,000 samples), at most 500
+    iterations; picard and infomax run as extended infomax.
+- **Labelling the components**:
+  - **ICLabel** ([MNE-ICALabel](https://mne.tools/mne-icalabel)): brain, eye blink,
+    muscle, heart beat, line noise, channel noise or other, with its probability. It
+    gets a 1–100 Hz average-referenced copy, as the network was trained on, and needs
+    electrode positions;
+  - **EOG**: `find_bads_eog` against the EOG channels or, without them, **Fp1, Fp2, F7,
+    F8**. As in the guide, the z threshold starts at 3.5 and steps down by 0.05 until
+    two components are found (not below 2.0);
+  - **eye tracker**: how strongly a component responds around the tracker's blinks (a
+    blink-locked t-score).
+  - Suggested (pre-ticked): the EOG picks, ICLabel *eye blink* ≥ 70 %, and blink-locked
+    outliers. Check them: automated picks are not always right.
   - Clicking a component shows its scalp map, spectrum, blink-locked average and time
     course. Double-click opens MNE's properties window.
 - **Checks**: the spectrum before and after, noisy and flat windows per channel, and the
@@ -330,7 +347,11 @@ The **EEG** tab is a three-stage pipeline:
 - **Epoch window**:
   - start and end around each event, of any length (up to an hour either side). Before
     building, the memory the epochs need is estimated; above 2 GB you are asked first;
-  - peak-to-peak and flat rejection;
+  - defaults from the ERP guide: **−0.1 … 1.0 s**, no fixed amplitude threshold;
+  - **AutoReject** (on by default): it interpolates bad channels within an epoch and
+    drops the epochs it cannot repair. It is fitted once on the epochs of every group
+    (at most 600) and needs electrode positions;
+  - optional peak-to-peak and flat rejection;
   - an option to drop epochs that contain an eye-tracker blink;
   - a cap on epochs per group;
   - **EEG delay** (±500 ms) to correct a recording lag between events and EEG.
@@ -345,6 +366,8 @@ The **EEG** tab is a three-stage pipeline:
   - **rejected (amplitude)**: peak-to-peak or flat rejection; **rejected by** names the
     channels;
   - **rejected (BAD annotation)**: the epoch overlaps a `BAD_…` span or a file boundary;
+  - **rejected (AutoReject)**: epochs AutoReject could not repair; **interpolated
+    (AutoReject)** counts the channels it interpolated in the epochs kept;
   - **kept**: the epochs used.
 - **Timeline**: every epoch as a bar over its window (event + start … event + end), one
   row per group, with a tick at the event. Faint bars are selected events; solid bars
@@ -358,7 +381,8 @@ The **EEG** tab is a three-stage pipeline:
 
 ![ERP component analysis](docs/erp.png)
 
-- **Baseline**: a window before the event, e.g. −0.2…0 s.
+- **Baseline**: a window before the event; by default from the epoch start to 0 s,
+  i.e. MNE's `(None, 0)`.
 - **Component presets** set the time window, polarity and channel cluster: P1, N1,
   N170, P2, N2, MMN, P300, N400, LPP. They are conventional starting points; any edit
   makes the component *Custom*.
@@ -370,18 +394,42 @@ The **EEG** tab is a three-stage pipeline:
     P9/P10. Without one, the data stay **as recorded**; the note next to the choice
     says which mastoids are used, or that none were found.
   - The reference is applied to copies of the epochs, before the baseline.
-- **Component statistics** per group:
-  - window mean amplitude ± SEM on the cluster mean;
-  - peak amplitude and latency of the average ERP (`Evoked.get_peak`).
-- **Comparing groups**:
-  - two groups: a two-sided Welch t-test (t, df, p), Mann-Whitney U, Hedges' g and the
-    peak-latency difference;
-  - more groups: a one-way ANOVA.
-- **Views**: cluster mean ± SEM with peaks marked, single channel, GFP, butterfly.
+- **Several subjects** (combined files or BIDS runs), as in the
+  [group ERP guide](https://neuraldatascience.io/eeg/erp-group-viz):
+  - each subject's epochs are averaged on their own: **one Evoked per subject and
+    group**;
+  - the **grand average** is the average of those Evokeds (`mne.grand_average`), each
+    subject weighing the same whatever its number of epochs. Epochs are never pooled
+    across subjects;
+  - bands are **95 % confidence intervals across subjects**; the *Subjects* view draws
+    every subject's ERP under the grand average;
+  - difference waves are computed per subject, then averaged, with their own 95 % CI.
+  - **Statistics across subjects** (the *Component statistics* table): the subjects'
+    window means per group (mean, SEM, 95 % CI) and the grand average's peak. Two
+    groups: a **paired t-test** on the subjects that have both — the guide's
+    `ttest_1samp` of the difference waves against 0 — with Wilcoxon and Cohen's d_z
+    (independent groups of subjects: Welch t-test). More groups: a repeated-measures
+    ANOVA and a Friedman test.
+  - **Per subject**: each subject's epochs, window mean and peak per group; *Within each
+    subject*: the epoch-level test between the groups for every subject, FDR-corrected
+    across subjects.
+  - **Cluster test across subjects…**: the guide's `spatio_temporal_cluster_1samp_test`
+    of the subjects' difference waves against 0 (cluster-forming t threshold or TFCE),
+    over all channels and a time range you choose, with an image plot and topomap of
+    the significant points. It needs ≥ 3 subjects and positions; with N subjects no
+    p can fall below 2 / 2^N.
+- **One subject** (or no subject information): trials are the observations.
+  - **Component statistics** per group: window mean amplitude ± SEM on the cluster mean,
+    and the peak amplitude and latency of the average ERP (`Evoked.get_peak`).
+  - Two groups: a two-sided Welch t-test (t, df, p), Mann-Whitney U, Hedges' g and the
+    peak-latency difference; more groups: a one-way ANOVA.
+- **Views**: cluster mean with peaks marked, single channel, subjects, GFP, butterfly.
   With two groups, the A − B difference wave.
 - Click the plot to set the latency used by the topomaps and the joint plot.
 - MNE compare-evokeds, joint plot and topomaps.
-- Export: evokeds (`-ave.fif`), component summary and per-epoch CSV.
+- Export: evokeds (`-ave.fif`), component summary and per-epoch CSV; with subjects also
+  `sub-<id>_<group>-ave.fif` and `sub-<id>_difference-ave.fif` per subject, and the
+  per-subject and within-subject tables.
 
 **Band power**
 
@@ -505,22 +553,25 @@ table = EV.build_event_table(rec, ev)                           # markers + gaze
 # 1 preprocessing
 bad = P.detect_bad_channels(rec.raw, P.BadChannelParams(ptp_max_uv=250, notch=50))
 bads = bad.loc[bad.bad, "channel"].tolist()
-ica, fit_raw = P.fit_ica(rec.raw, bads, h_freq=40, notch=50)
-scores = P.score_blink_components(ica, fit_raw, ev.blinks)      # blink-locked + EOG/frontal
-pp = P.PreprocParams(bads=bads, l_freq=0.1, h_freq=40, notch=50,
+ica, fit_raw = P.fit_ica(rec.raw, bads, notch=50)               # 1–30 Hz, AutoReject, 99 %
+scores = P.score_blink_components(ica, fit_raw, ev.blinks)      # ICLabel + EOG/Fp + tracker
+pp = P.PreprocParams(bads=bads, l_freq=0.1, h_freq=30, notch=50,
                      ica_exclude=scores.loc[scores.suggested, "component"].tolist())
 clean = P.run_preprocessing(rec.raw, pp, ica)
 
 # 2 epoching: named groups of events
 fx = EV.filter_events(table, query='phase == "READING"', names={"fixation"})
 groups = {"AI": fx[fx.cond == "AI"], "NoAI": fx[fx.cond == "NoAI"]}
-epochs, summary = EP.build_group_epochs(clean, groups, EP.EpochSettings(-0.5, 1.5, 150))
+epochs, summary = EP.build_group_epochs(clean, groups, EP.EpochSettings(-0.1, 1.0))  # + AutoReject
 
 # 3a ERP component (pre-event baseline), as in Rhino ERP
 ref, why = E.resolve_erp_reference(E.COMPONENT_REFERENCE["P300"],  # "mastoids"
                                    epochs["AI"].ch_names)
 erp = {g: E.reference_epochs(e, ref).apply_baseline((-0.2, 0)) for g, e in epochs.items()}
-comp_summary, per_epoch = E.component_analysis(erp, E.COMPONENT_PRESETS["P300"])
+comp_summary, per_epoch = E.component_analysis(erp, E.COMPONENT_PRESETS["P300"])  # one subject
+grp = E.group_component_analysis(erp, E.COMPONENT_PRESETS["P300"])   # subjects: evoked each,
+grp["summary"], grp["subjects"], grp["grand"]                         # then grand average
+# cluster = E.group_cluster_test(list(grp["diffs"].values()), tfce=True)
 
 # 3b band power and indices (baseline: 5–115 s after BASELINE_START)
 s = BP.BandSettings(tmin=0, tmax=1.5)
@@ -620,9 +671,10 @@ system you are on.
 
 ## Notes and limitations
 
-- **Statistics are within one recording**: epochs are the observations. For group
-  studies, export the per-epoch or per-group values and model subjects outside
-  brAInStudio.
+- **ERPs across subjects** use subjects as the observations (see ③ Analysis). Band power
+  and the cognitive indices still treat epochs as observations (normalised per
+  subject): for group statistics on those, export the per-epoch values and model
+  subjects outside brAInStudio.
 - **Gaze algorithms**: the PyPI release of PyGaze has the AOI plugin, but not the
   offline detectors from PyGaze Analyser. brAInStudio reimplements those:
   - blinks: runs of missing samples;

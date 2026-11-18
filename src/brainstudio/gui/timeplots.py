@@ -66,6 +66,28 @@ class EventLinesMixin:
             self._event_items.append(line)
 
 
+class SegmentLinesMixin:
+    """A labelled line where each recording (subject / session / run) starts."""
+
+    def _set_segment_lines(self, plot: pg.PlotItem, segments: list[dict], labels=True):
+        from ..io.multi import segment_label
+        for item in getattr(self, "_segment_items", []):
+            plot.removeItem(item)
+        self._segment_items = []
+        if not segments or len(segments) < 2:
+            return
+        for k, seg in enumerate(segments):
+            line = pg.InfiniteLine(
+                seg["start"], angle=90, pen=pg.mkPen(THEME.accent, width=2),
+                label=segment_label(seg) if labels else None,
+                labelOpts={"position": 0.03, "color": THEME.accent,
+                           "fill": pg.mkBrush(THEME.rgba("bg", 220)),
+                           "anchors": [(0, 1), (0, 1)]})
+            line.setZValue(5)
+            plot.addItem(line, ignoreBounds=True)
+            self._segment_items.append(line)
+
+
 class GazeOverlayMixin:
     """Shaded spans for fixations/saccades/blinks, rebuilt for the visible window."""
 
@@ -100,7 +122,8 @@ class GazeOverlayMixin:
 
 
 # ============================================================================ EEG
-class EEGPlot(pg.PlotWidget, TimeCursorMixin, EventLinesMixin, GazeOverlayMixin):
+class EEGPlot(pg.PlotWidget, TimeCursorMixin, EventLinesMixin, SegmentLinesMixin,
+              GazeOverlayMixin):
     """Stacked multichannel EEG traces (butterfly-free, MNE-browser style)."""
 
     cursorMoved = QtCore.Signal(float)
@@ -222,7 +245,8 @@ class EEGPlot(pg.PlotWidget, TimeCursorMixin, EventLinesMixin, GazeOverlayMixin)
 
 
 # ============================================================================ gaze
-class GazePlot(pg.GraphicsLayoutWidget, TimeCursorMixin, EventLinesMixin, GazeOverlayMixin):
+class GazePlot(pg.GraphicsLayoutWidget, TimeCursorMixin, EventLinesMixin, SegmentLinesMixin,
+               GazeOverlayMixin):
     """Gaze x/y (px) and pupil traces."""
 
     cursorMoved = QtCore.Signal(float)
@@ -319,6 +343,7 @@ class OverviewBar(pg.PlotWidget):
         self.region.sigRegionChanged.connect(self._emit)
         self.validity = self.plot(pen=None, fillLevel=0, stepMode="center")
         self.ticks: list = []
+        self._spans: list = []
         self._block = False
         self.restyle()
 
@@ -329,6 +354,26 @@ class OverviewBar(pg.PlotWidget):
         self.validity.setBrush(pg.mkBrush(THEME.s(0, 110)))
         for t in self.ticks:
             t.setBrush(pg.mkBrush(THEME.event))
+
+    def set_subjects(self, spans: list[dict]):
+        """Subjects as alternately shaded spans with their name (click one to jump)."""
+        for it in self._spans:
+            self.removeItem(it)
+        self._spans = []
+        if len(spans) < 2:
+            return
+        for k, sp in enumerate(spans):
+            reg = pg.LinearRegionItem((sp["start"], sp["end"]), movable=False,
+                                      brush=THEME.rgba("fg", 18 if k % 2 else 6),
+                                      pen=pg.mkPen(THEME.rgba("accent", 160)))
+            reg.setZValue(-20)
+            self.addItem(reg)
+            txt = pg.TextItem(sp["label"], color=THEME.fg, anchor=(0, 0.5),
+                              fill=pg.mkBrush(THEME.rgba("bg", 170)))
+            txt.setPos(sp["start"], 0.45)
+            txt.setZValue(-10)
+            self.addItem(txt)
+            self._spans += [reg, txt]
 
     def set_recording(self, duration: float, events: pd.DataFrame, gaze=None):
         self.plotItem.setXRange(0, max(duration, 1e-3), padding=0.01)

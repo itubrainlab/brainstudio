@@ -84,13 +84,18 @@ class EpochTab(QtWidgets.QWidget):
         self.tmax = _spin(-MAX_EPOCH_S, MAX_EPOCH_S, st.tmax, 0.05, 3, " s")
         self.tmin.setToolTip("Epoch start relative to the event (negative = before)")
         self.tmax.setToolTip("Epoch end relative to the event")
-        self.reject = _spin(0, 1e5, st.reject_uv, 10, 0, " µV")
+        self.reject = _spin(0, 1e5, st.reject_uv or 0, 10, 0, " µV")
         self.reject.setSpecialValueText("off")
         self.reject.setToolTip("Drop epochs whose peak-to-peak exceeds this on any good EEG "
                                "channel")
         self.flat = _spin(0, 1000, 0, 0.5, 1, " µV")
         self.flat.setSpecialValueText("off")
         self.blinks = QtWidgets.QCheckBox("Drop epochs containing an eye-tracker blink")
+        self.autoreject = QtWidgets.QCheckBox("AutoReject: interpolate bad channels per "
+                                              "epoch, drop epochs it cannot repair")
+        self.autoreject.setChecked(st.autoreject)
+        self.autoreject.setToolTip("AutoReject (local), as in the ERP guide. Needs electrode "
+                                   "positions; fitted on at most 600 epochs of all groups.")
         self.max_ep = QtWidgets.QSpinBox()
         self.max_ep.setRange(10, 1_000_000)
         self.max_ep.setValue(st.max_epochs)
@@ -105,6 +110,7 @@ class EpochTab(QtWidgets.QWidget):
             g.addWidget(QtWidgets.QLabel(lab), i // 2, 2 * (i % 2))
             g.addWidget(w, i // 2, 2 * (i % 2) + 1)
         g.addWidget(self.blinks, 3, 0, 1, 4)
+        g.addWidget(self.autoreject, 5, 0, 1, 4)
         g.addWidget(hint("Epochs are not baseline-corrected here: the ERP baseline and the "
                          "band-power baseline are chosen in Analysis. Make epochs long "
                          "enough for both (e.g. −0.5…2 s for band power)."), 4, 0, 1, 4)
@@ -162,6 +168,7 @@ class EpochTab(QtWidgets.QWidget):
         self.max_ep.valueChanged.connect(lambda *_: self.pl.mark_stale("epoching"))
         self.delay.valueChanged.connect(lambda *_: self.pl.mark_stale("epoching"))
         self.blinks.toggled.connect(lambda *_: self.pl.mark_stale("epoching"))
+        self.autoreject.toggled.connect(lambda *_: self.pl.mark_stale("epoching"))
         self.pl.changed.connect(self._on_pipeline)
         self.pl.stateChanged.connect(self._on_state)
 
@@ -352,6 +359,7 @@ class EpochTab(QtWidgets.QWidget):
                              reject_uv=self.reject.value() or None,
                              flat_uv=self.flat.value() or None,
                              drop_blinks=self.blinks.isChecked(),
+                             autoreject=self.autoreject.isChecked(),
                              max_epochs=self.max_ep.value(),
                              delay_ms=self.delay.value())
 
@@ -424,6 +432,10 @@ class EpochTab(QtWidgets.QWidget):
             self.summary.setRowCount(0)
         else:
             fill_table(self.summary, df, fmt="{:g}")
+            note = df.attrs.get("autoreject", "")
+            self.summary.setToolTip(f"AutoReject {note}" if note else "")
+            if note.startswith("not"):
+                self.window().statusBar().showMessage(f"AutoReject {note}", 8000)
         self._plot_timeline()
 
     def _plot_timeline(self):
