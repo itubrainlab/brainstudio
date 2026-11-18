@@ -103,7 +103,12 @@ The style sheet is BrainStudio's own; no g.Pype files are used.
 
 Three main tabs:
 
-* **Viewer** (shows the preprocessed EEG by default; switch to raw in the Controls dock)
+* **Viewer**
+  * It shows the preprocessed EEG by default: only EEG-type channels, without the
+    channels marked bad in ① Preprocessing. Switch to raw in the Controls dock to see all
+    EEG channels, with bad ones greyed. EOG/ECG/EMG/misc/stim channels are not drawn.
+  * Without gaze data the eye-tracking views (gaze/pupil plots, screen view, Gaze tab,
+    gaze controls) are hidden.
   * Stacked EEG traces with event markers and shaded saccades, blinks and fixations.
   * Gaze x/y and pupil traces, linked on the same time axis.
   * Overview bar showing gaze validity and events.

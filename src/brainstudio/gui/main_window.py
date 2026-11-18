@@ -181,6 +181,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.topo = TopoView()
         right = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         right.addWidget(self.screen)
+        self.time_split = time_split
         right.addWidget(self.topo)
         right.setSizes([420, 380])
         h = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -369,6 +370,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trail = _spin(0, 10, 0.5, 0.1, 2, " s")
         self.trail.valueChanged.connect(self._trail_changed)
         f.addRow("Gaze trail", self.trail)
+        self.view_form = f
         lay.addWidget(box)
 
         # --- EEG display (preprocessing itself lives in the EEG tab)
@@ -391,6 +393,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # --- gaze
         box = QtWidgets.QGroupBox("Gaze event detection")
+        self.gaze_box = box
         f = QtWidgets.QFormLayout(box)
         p = G.DetectionParams()
         self.p_fix_dist = _spin(1, 500, p.fix_max_dist, 5, 0, " px")
@@ -659,6 +662,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 c.setData([], [])
         self.topo.set_raw(self.display_raw)
         self.gaze_plot.set_gaze(rec.gaze)
+        self._update_gaze_visibility()
         if rec.has_gaze:
             self.detect_gaze_events()
         self.info.setPlainText(rec.summary() + ("\n" + rec.description if rec.description else ""))
@@ -693,6 +697,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _load_eeg_plot(self):
         raw = self.display_raw
         picks = self._eeg_picks(raw)
+        if raw is self.pipeline.clean and raw is not None:
+            # preprocessed view: only the channels kept in ① Preprocessing
+            drop = set(self.pipeline.params.bads) | set(raw.info["bads"])
+            picks = [i for i in picks if raw.ch_names[i] not in drop] or picks
         data = raw.get_data(picks=picks).astype(np.float32)  # display only
         names = [raw.ch_names[i] for i in picks]
         types = raw.get_channel_types(picks=picks)
@@ -1126,8 +1134,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtCore.QTimer.singleShot(0, self._apply_theme)
         super().changeEvent(ev)
 
+    def _update_gaze_visibility(self):
+        """Eye-data views (gaze/pupil plots, screen view, Gaze tab, gaze controls) are
+        shown only when the recording has gaze data."""
+        has = self.rec is not None and self.rec.has_gaze
+        self.gaze_plot.setVisible(has)
+        self.screen.setVisible(has)
+        self.tabs.setTabVisible(self.tabs.indexOf(self.gaze_tab), has)
+        self.gaze_box.setVisible(has)
+        for w in (*self.ov_checks.values(), self.cb_scan, self.cb_heat, self.trail):
+            self.view_form.setRowVisible(w, has)
+
     def _after_gaze_change(self):
         g = self.rec.gaze
+        self._update_gaze_visibility()
         self.gaze_plot.set_gaze(g)
         self.screen.set_screen(g.screen_size)
         self.detect_gaze_events()
