@@ -387,6 +387,8 @@ def test_trigger_channel_codes_and_mask():
                           mne.create_info(["Fz", "Cz", "TRIG"], sf, "eeg"), verbose="error")
     raw._orig_units = {"TRIG": "uV"}        # as EDF readers keep it
     assert E.guess_trigger_channel(raw) == "TRIG"
+    assert E.type_channels_by_name(raw) == {"TRIG": "stim"}   # re-typed on load
+    assert E.guess_trigger_channel(raw) == "TRIG"
     ev = E.trigger_codes(raw, "TRIG")
     assert ev.code.tolist() == [1, 2, 1, 3, 258]
     assert ev.onset.tolist() == pytest.approx([2, 5, 8, 11, 14])

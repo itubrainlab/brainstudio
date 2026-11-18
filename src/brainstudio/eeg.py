@@ -237,13 +237,24 @@ def montage_from_source(source: str) -> mne.channels.DigMontage:
 def guess_channel_type(name: str) -> str:
     n = name.upper()
     for key, kind in (("EOG", "eog"), ("ECG", "ecg"), ("EKG", "ecg"), ("EMG", "emg"),
-                      ("TRIG", "stim"), ("STI", "stim"),
+                      ("TRIG", "stim"), ("STI", "stim"), ("STATUS", "stim"),
                       # g.tec Unicorn and similar: motion and housekeeping channels
                       ("ACC", "misc"), ("GYR", "misc"), ("BATT", "misc"), ("COUNTER", "misc"),
                       ("VALID", "misc")):
         if key in n:
             return kind
     return "eeg"
+
+
+def type_channels_by_name(raw: mne.io.BaseRaw) -> dict[str, str]:
+    """Re-type channels that a reader typed as EEG but whose names say otherwise
+    (EOG/ECG/EMG, TRIG/Status, accelerometer…). Returns the changes."""
+    types = dict(zip(raw.ch_names, raw.get_channel_types()))
+    changed = {ch: guess_channel_type(ch) for ch, t in types.items()
+               if t == "eeg" and guess_channel_type(ch) != "eeg"}
+    if changed:
+        raw.set_channel_types(changed, verbose="error")
+    return changed
 
 
 def apply_montage(raw: mne.io.BaseRaw, montage: mne.channels.DigMontage | None,
@@ -468,9 +479,10 @@ def trigger_codes(raw: mne.io.BaseRaw, channel: str, mask: int | None = None,
         thr = base + up / 2 if up >= down else base - down / 2  # positive or negative pulses
         data = ((x > thr) if up >= down else (x < thr)).astype(float)
     else:
-        is_stim = raw.get_channel_types([channel])[0] == "stim"
-        unit = getattr(raw, "_orig_units", {}).get(channel, "V")
-        data = np.round(x * (1.0 if is_stim else _UNIT_BACK.get(unit, 1.0)))
+        # undo the reader's unit scaling (µV stored → V in memory) from the file's unit,
+        # whatever the channel's type is now (it may have been re-typed as stim)
+        unit = getattr(raw, "_orig_units", {}).get(channel, "")
+        data = np.round(x * _UNIT_BACK.get(unit, 1.0))
     info = mne.create_info(["TRIG"], raw.info["sfreq"], "stim")
     trig = mne.io.RawArray(data[None], info, first_samp=raw.first_samp, verbose="error")
     ev = mne.find_events(trig, stim_channel="TRIG", shortest_event=1, consecutive=True,

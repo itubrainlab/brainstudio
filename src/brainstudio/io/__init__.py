@@ -45,6 +45,12 @@ def load(path: str | Path, screen_size=(1920, 1080), roles=None, options=None) -
     The recording gets one segment with the BIDS entities of the file name."""
     rec = _load_one(path, screen_size, roles, options)
     rec.sources = [Path(path)]
+    if rec.raw is not None:  # e.g. EDF readers type every channel as EEG
+        from ..eeg import type_channels_by_name
+        changed = type_channels_by_name(rec.raw)
+        if changed:
+            note = "channel types from names: " + ", ".join(f"{c}→{t}" for c, t in changed.items())
+            rec.description = (rec.description + "\n" if rec.description else "") + note
     return set_segments(rec, entities_from_path(path))
 
 

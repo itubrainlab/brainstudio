@@ -681,9 +681,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(rec.summary().replace("\n", "  |  "))
 
     def _eeg_picks(self, raw):
-        return mne.pick_types(raw.info, meg=True, eeg=True, eog=True, ecg=True, emg=True,
-                              misc=True, seeg=True, ecog=True, dbs=True, bio=True,
-                              resp=True, fnirs=True, exclude=[])
+        """Channels of the EEG scope: EEG only (EOG/ECG/EMG/misc/stim are hidden);
+        all data channels when nothing is typed as EEG."""
+        picks = mne.pick_types(raw.info, eeg=True, exclude=[])
+        if len(picks):
+            return picks
+        return mne.pick_types(raw.info, meg=True, eog=True, ecg=True, emg=True, misc=True,
+                              seeg=True, ecog=True, dbs=True, bio=True, resp=True,
+                              fnirs=True, exclude=[])
 
     def _load_eeg_plot(self):
         raw = self.display_raw
