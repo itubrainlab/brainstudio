@@ -690,11 +690,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.eeg_plot.plotItem.getViewBox().setLimits(xMin=-1, xMax=rec.duration + 1)
         self.eeg_plot.set_window(0, win)
         self.set_cursor(0.0)
-        self.setWindowTitle(f"brAInStudio — {rec.source.name if rec.source else ''}")
-        self.title_label.setText(rec.source.name if rec.source else "recording")
-        self.title_label.setToolTip(str(rec.source or ""))
+        title, tip = self._recording_title(rec)
+        self.setWindowTitle(f"brAInStudio — {title}")
+        self.title_label.setText(title)
+        self.title_label.setToolTip(tip)
         self._update_ribbon()
         self.statusBar().showMessage(rec.summary().replace("\n", "  |  "))
+
+    def _recording_title(self, rec) -> tuple[str, str]:
+        """Name shown in the top bar and window title, and its tooltip: the dataset
+        folder for BIDS, the file name otherwise ("first + N more" for combined files)."""
+        files = [p for p in (rec.sources or [rec.source]) if p]
+        if self.bids_root is not None:
+            runs = [s.get("file", "") for s in rec.segments if s.get("file")]
+            return self.bids_root.name, f"{self.bids_root}\n" + "\n".join(runs)
+        if len(files) > 1:
+            return (f"{Path(files[0]).name} + {len(files) - 1} more",
+                    "\n".join(str(p) for p in files))
+        return (Path(files[0]).name if files else "recording"), str(files[0] if files else "")
 
     def _eeg_picks(self, raw):
         """Channels of the EEG scope: EEG only (EOG/ECG/EMG/misc/stim are hidden);
