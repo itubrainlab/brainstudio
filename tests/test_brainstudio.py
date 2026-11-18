@@ -67,6 +67,25 @@ def test_frp_recovers_lambda_response(demo):
     assert 0.06 < evk.times[np.argmax(oz)] < 0.14  # simulated P1 at ~90 ms
 
 
+def test_dejitter_follows_rate_change():
+    """A stream whose rate changes midway (seen in Gazepoint recordings) must keep its
+    timestamps: one straight line through them misplaces samples by seconds."""
+    rng = np.random.default_rng(0)
+    true = np.r_[np.arange(150_000) / 149.28, 150_000 / 149.28 + np.arange(60_000) / 148.53]
+    stamped = true + 2000 + rng.uniform(-0.01, 0.01, len(true))  # jitter
+    clean, _, info = _clean_timestamps({"time_stamps": stamped,
+                                        "info": {"nominal_srate": ["60"]}})
+    assert np.abs(clean - 2000 - true).max() < 0.03
+    assert np.all(np.diff(clean) >= 0)
+    assert any("not constant" in m for m in info["notes"])
+    # a steady stream is still a straight line (jitter removed, no note)
+    steady = 2000 + np.arange(100_000) / 256 + rng.uniform(-0.01, 0.01, 100_000)
+    clean, _, info = _clean_timestamps({"time_stamps": steady,
+                                        "info": {"nominal_srate": ["256"]}})
+    assert np.abs(np.diff(clean, 2)).max() < 1e-6
+    assert not any("not constant" in m for m in info["notes"])
+
+
 def test_foreign_clock_samples_recover_offset(tmp_path):
     """Samples stamped on another clock (seen in real Gazepoint recordings)."""
     n, sr, off = 3000, 150.0, 325222.957

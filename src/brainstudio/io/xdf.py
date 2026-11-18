@@ -17,6 +17,7 @@ from pathlib import Path
 
 import mne
 import numpy as np
+from scipy.ndimage import uniform_filter1d
 import pandas as pd
 import pyxdf
 
@@ -275,15 +276,28 @@ def _clean_timestamps(stream: dict) -> tuple[np.ndarray, np.ndarray, dict]:
         cuts = np.flatnonzero((d > gap) | (d < -gap)) + 1
         rates = []
         out = ts.copy()
+        drift = 0.0
         for seg in np.split(np.arange(len(ts)), cuts):
             if len(seg) < 3:
                 continue
             k = np.arange(len(seg))
             slope, icpt = np.polyfit(k, ts[seg], 1)
-            out[seg] = icpt + slope * k
+            fit = icpt + slope * k
             if slope > 0:
                 rates.append((len(seg), 1.0 / slope))
+                # a constant rate is an assumption: devices that drop samples or change
+                # rate (e.g. Gazepoint) drift seconds away from any straight line. Follow
+                # the timestamps' slow trend (5 s average) and drop only the jitter.
+                w = int(min(len(seg), max(3, round(5.0 / slope))))
+                trend = uniform_filter1d(ts[seg] - fit, w, mode="nearest")
+                if np.abs(trend).max() > max(0.01, 2 * slope):
+                    drift = max(drift, float(np.abs(trend).max()))
+                    fit = np.maximum.accumulate(fit + trend)
+            out[seg] = fit
         ts = out
+        if drift:
+            info["notes"].append(f"sampling rate not constant: timestamps followed (up to "
+                                 f"{drift:.2f} s away from a constant rate)")
         if rates:
             eff = float(np.average([r for _, r in rates], weights=[w for w, _ in rates]))
             info["srate"] = eff

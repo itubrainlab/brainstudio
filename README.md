@@ -197,6 +197,10 @@ Everything lives on one time base: t = 0 is the first EEG sample.
   - pyxdf applies the LSL clock offsets stored in the file.
   - BrainStudio then removes jitter from each regular stream with one linear fit per
     gap-free segment, and uses the *effective* sampling rate.
+  - When a stream's rate is not constant (some Gazepoint recordings drop samples or
+    change rate), the straight line can drift seconds away from the timestamps.
+    BrainStudio then follows the timestamps' 5 s trend instead and notes this in the
+    info panel, so gaze stays aligned with the EEG over the whole recording.
   - Some devices stamp a few samples on another clock (Gazepoint, for example).
     BrainStudio detects and removes these samples, and uses them to estimate the offset
     between the clocks. A stream that does not overlap the EEG is moved onto the EEG
