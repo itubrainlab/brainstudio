@@ -24,8 +24,12 @@ import pandas as pd
 from .model import GazeEvents, Recording
 
 BASE_COLUMNS = ["onset", "duration", "name", "kind", "description"]
-_START = re.compile(r"^(.*?)[_\- ]?(START|BEGIN|ON)$", re.I)
-_END = re.compile(r"^(.*?)[_\- ]?(END|STOP|OFF)$", re.I)
+#: names of detected gaze events; markers with these names get a "_marker" suffix
+GAZE_EVENT_NAMES = ("fixation", "saccade", "blink")
+# "<PHASE>_START" … "<PHASE>_END"; a separator is required, so names that merely
+# end in "on"/"off" (e.g. "fixation") are not phase markers
+_START = re.compile(r"^(.+?)[_\- ](START|BEGIN|ON)$", re.I)
+_END = re.compile(r"^(.+?)[_\- ](END|STOP|OFF)$", re.I)
 
 
 def _safe_key(k: str) -> str:
@@ -65,10 +69,13 @@ def _to_numeric_columns(df: pd.DataFrame, cols) -> pd.DataFrame:
 
 
 def _phase_spans(markers: pd.DataFrame) -> list[tuple[str, float, float, dict]]:
-    """(phase, start, end, attrs) spans from *_START / *_END marker pairs."""
+    """(phase, start, end, attrs) spans from *_START / *_END marker pairs and from
+    markers that have a duration (e.g. paired start/stop rows of a marker stream)."""
     spans, open_ = [], {}
-    for on, desc in markers[["onset", "description"]].itertuples(index=False):
+    for on, dur, desc in markers[["onset", "duration", "description"]].itertuples(index=False):
         name, attrs = parse_description(desc)
+        if dur and float(dur) > 0:
+            spans.append((name, float(on), float(on) + float(dur), attrs))
         if m := _START.match(name):
             open_[m.group(1).upper()] = (on, attrs)
         elif (m := _END.match(name)) and m.group(1).upper() in open_:
@@ -88,6 +95,8 @@ def build_event_table(rec: Recording, gaze_events: GazeEvents | None = None,
     rows = []
     for on, dur, desc in markers[["onset", "duration", "description"]].itertuples(index=False):
         name, attrs = parse_description(desc)
+        if name.lower() in GAZE_EVENT_NAMES:  # e.g. a "fixation" cross marker
+            name = f"{name}_marker"
         rows.append({"onset": float(on), "duration": float(dur or 0.0), "name": name,
                      "kind": "marker", "description": str(desc), **attrs})
     tables = [pd.DataFrame(rows)] if rows else []
@@ -120,27 +129,34 @@ def build_event_table(rec: Recording, gaze_events: GazeEvents | None = None,
         return pd.DataFrame(columns=BASE_COLUMNS + ["phase"])
     df = pd.concat(tables, ignore_index=True).sort_values("onset", ignore_index=True)
 
-    # ---- context from START/END phases
-    spans = _phase_spans(markers)
+    # ---- context from phases: the innermost (latest-starting) span decides the
+    # phase and fills attributes first; outer spans fill what is still empty.
+    # Inherited attributes never overwrite an event's own value.
+    spans = sorted(_phase_spans(markers), key=lambda x: -x[1])
     df["phase"] = ""
     if spans:
         onset = df["onset"].to_numpy()
-        best_start = np.full(len(df), -np.inf)
+        phase = np.full(len(df), "", dtype=object)
+        cols: dict[str, np.ndarray] = {}
         for key, start, end, attrs in spans:
-            inside = (onset >= start) & (onset <= end) & (start >= best_start)
-            if not inside.any():
+            lo, hi = np.searchsorted(onset, start, "left"), np.searchsorted(onset, end, "right")
+            if hi <= lo:
                 continue
-            best_start[inside] = start
-            df.loc[inside, "phase"] = key
+            seg = phase[lo:hi]
+            seg[seg == ""] = key
             for k, v in attrs.items():
-                if k not in df:
-                    df[k] = np.nan
-                    df[k] = df[k].astype(object)
-                # inherited attributes never overwrite an event's own value
-                own = df.loc[inside, k]
-                fill = own.isna() | (own.astype(str) == "")
-                df.loc[own.index[fill], k] = v
-                attr_cols.append(k)
+                if k not in cols:
+                    base = df[k].to_numpy(dtype=object, copy=True) if k in df else \
+                        np.full(len(df), None, dtype=object)
+                    cols[k] = base
+                    attr_cols.append(k)
+                c = cols[k][lo:hi]
+                empty = np.array([x is None or (isinstance(x, float) and np.isnan(x)) or x == ""
+                                  for x in c], dtype=bool)
+                c[empty] = v
+        df["phase"] = phase
+        for k, arr in cols.items():
+            df[k] = arr
     df = _to_numeric_columns(df, set(attr_cols))
     order = BASE_COLUMNS + ["phase"] + [c for c in df.columns
                                         if c not in BASE_COLUMNS and c != "phase"]

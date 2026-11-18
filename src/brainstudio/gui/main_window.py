@@ -24,6 +24,7 @@ from .montage_dialog import MontageDialog
 from .pipeline import STAGES, EEGPipeline
 from .preprocess_tab import PreprocessTab
 from .screenview import ScreenView
+from .stream_dialog import StreamDialog
 from .theme import THEME, apply_theme
 from .timeplots import EEGPlot, GazePlot, OverviewBar
 from .topoview import TopoView
@@ -279,11 +280,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stream_table.horizontalHeader().setSectionResizeMode(
             0, QtWidgets.QHeaderView.Stretch)
         self.stream_table.currentCellChanged.connect(lambda r, *_: self._show_stream(r))
+        self.stream_table.cellDoubleClicked.connect(lambda r, *_: self._stream_details(r))
         sv.addWidget(self.stream_table)
         row = QtWidgets.QHBoxLayout()
-        self.btn_roles = QtWidgets.QPushButton("Reload with these roles")
-        self.btn_roles.setToolTip("Reload the file using the roles chosen above "
-                                  "(resets montage and pipeline results)")
+        det = QtWidgets.QPushButton("Details…")
+        det.setToolTip("Everything about the selected stream, and how each of its channels "
+                       "or columns is used (double-click a stream)")
+        det.clicked.connect(lambda: self._stream_details(self.stream_table.currentRow()))
+        row.addWidget(det)
+        self.btn_roles = QtWidgets.QPushButton("Reload with these settings")
+        self.btn_roles.setObjectName("Primary")
+        self.btn_roles.setToolTip("Reload the file with the roles and stream settings chosen "
+                                  "here (resets montage and pipeline results)")
         self.btn_roles.clicked.connect(self._apply_stream_roles)
         self.btn_roles.setEnabled(False)
         auto = QtWidgets.QPushButton("Automatic")
@@ -525,7 +533,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.set_recording(rec)
 
-    def open_file(self, path, roles=None):
+    def open_file(self, path, roles=None, options=None):
         path = Path(path)
         if path.is_dir():
             self.open_bids(path)
@@ -536,7 +544,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             with self._busy(f"Loading {path.name}…"):
-                rec = bio.load(path, self.screen_size(), roles=roles)
+                rec = bio.load(path, self.screen_size(), roles=roles, options=options)
         except Exception as e:
             self._error("Could not load file", e)
             return
@@ -614,6 +622,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ================================================================== streams
     def _fill_streams(self):
         streams = self.rec.streams if self.rec is not None else []
+        self._stream_opts = {st["key"]: dict(st.get("options") or {}) for st in streams}
         self.streams_box.setVisible(bool(streams))
         t = self.stream_table
         t.setRowCount(len(streams))
@@ -652,13 +661,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         cur = {s["key"]: s["role"] for s in self.rec.streams}
         new = self.stream_roles()
-        changed = new != cur
+        applied = {s["key"]: (s.get("options") or {}) for s in self.rec.streams}
+        opts_changed = {k for k, o in getattr(self, "_stream_opts", {}).items()
+                        if o != applied.get(k, {})}
+        changed = new != cur or bool(opts_changed)
         self.btn_roles.setEnabled(changed)
         bold = QtGui.QFont()
         for i in range(self.stream_table.rowCount()):
             k = self.stream_table.item(i, 0).data(QtCore.Qt.UserRole)
             f = QtGui.QFont(bold)
-            f.setBold(new.get(k) != cur.get(k))
+            f.setBold(new.get(k) != cur.get(k) or k in opts_changed)
             self.stream_table.item(i, 0).setFont(f)
 
     def _show_stream(self, row):
@@ -670,9 +682,30 @@ class MainWindow(QtWidgets.QMainWindow):
             f"({', '.join(st['labels'][:8])}{' …' if len(st['labels']) > 8 else ''}), "
             f"{st['samples']} samples — role {st['role']} (automatic: {st['auto_role']})", 10000)
 
+    def _stream_details(self, row: int):
+        if self.rec is None or not (0 <= row < len(self.rec.streams)):
+            return
+        st = self.rec.streams[row]
+        combo = self.stream_table.cellWidget(row, 1)
+        role = combo.currentText()
+        dlg = StreamDialog(st, role, self._stream_opts.get(st["key"]) if role == st["role"]
+                           else None, self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        new_role, opts = dlg.result_options()
+        self._stream_opts[st["key"]] = opts
+        combo.blockSignals(True)
+        combo.setCurrentText(new_role)
+        combo.blockSignals(False)
+        self._roles_edited()
+        if self.btn_roles.isEnabled():
+            self.statusBar().showMessage("Stream settings changed — press “Reload with these "
+                                         "settings” to apply them.", 8000)
+
     def _auto_stream_roles(self):
         if self.rec is None:
             return
+        self._stream_opts = {s["key"]: {} for s in self.rec.streams}
         auto = {s["key"]: s["auto_role"] for s in self.rec.streams}
         for i in range(self.stream_table.rowCount()):
             k = self.stream_table.item(i, 0).data(QtCore.Qt.UserRole)
@@ -691,7 +724,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.warning(self, "Stream roles",
                                               f"Only one stream can be {role}.")
                 return
-        self.open_file(self.rec.source, roles=roles)
+        # options only apply to the role they were made for
+        opts = {k: o for k, o in self._stream_opts.items() if o}
+        self.open_file(self.rec.source, roles=roles, options=opts or None)
 
     # ================================================================== pipeline
     def _on_pipeline(self, what):
@@ -777,6 +812,22 @@ class MainWindow(QtWidgets.QMainWindow):
         aois = self.screen.pygaze_aois() if self.screen.aois else None
         self.event_df = EV.build_event_table(self.rec, self.gaze_events, aois)
         self.pipeline.set_event_table(self.event_df)
+        self._fill_event_list()
+
+    def _fill_event_list(self):
+        """Dataset dock: the markers with every column they carry."""
+        df = self.event_df
+        m = df[df["kind"] == "marker"] if len(df) else df
+        cols = ["onset", "name", "duration", "phase"] + [
+            c for c in m.columns if c not in EV.BASE_COLUMNS + ["phase", "x", "y",
+                                                                "amplitude", "peak_velocity"]
+            and m[c].notna().any() and (m[c].astype(str) != "").any()]
+        cols = [c for c in cols if c in m.columns]
+        view = m[cols].copy()
+        for c in view.columns:  # empty cells instead of nan/None
+            if view[c].dtype == object:
+                view[c] = view[c].fillna("")
+        fill_table(self.event_table, view.iloc[:5000], fmt="{:.3f}")
 
     def _aois_changed(self):
         self.gaze_tab.update_aoi_stats()
@@ -874,7 +925,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.eeg_plot._set_event_lines(self.eeg_plot.plotItem, show)
         self.gaze_plot._set_event_lines(self.gaze_plot.pos_plot, show, labels=False)
         self.overview.set_recording(self.rec.duration, ev, self.rec.gaze)
-        fill_table(self.event_table, ev[["onset", "description"]], fmt="{:.3f}")
 
     def _overlay_toggled(self, *_):
         kinds = {k: cb.isChecked() for k, cb in self.ov_checks.items()}

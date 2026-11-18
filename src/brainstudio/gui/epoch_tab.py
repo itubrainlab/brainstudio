@@ -96,9 +96,24 @@ class EpochTab(QtWidgets.QWidget):
         rv.addWidget(self.summary)
         self.timeline = _themed_plot(bottom=("Recording time", "s"))
         self.timeline.setMouseEnabled(y=False)
-        rv.addWidget(QtWidgets.QLabel("Where the events of each group are (faint = selected, "
-                                      "bold = kept as epochs)"))
-        rv.addWidget(self.timeline, 1)
+        self.views = QtWidgets.QTabWidget()
+        tw = QtWidgets.QWidget()
+        tl = QtWidgets.QVBoxLayout(tw)
+        tl.setContentsMargins(0, 4, 0, 0)
+        tl.addWidget(hint("Where the events of each group are (faint = selected, bold = kept "
+                          "as epochs)"))
+        tl.addWidget(self.timeline, 1)
+        self.views.addTab(tw, "Timeline")
+        ew = QtWidgets.QWidget()
+        el = QtWidgets.QVBoxLayout(ew)
+        el.setContentsMargins(0, 4, 0, 0)
+        self.rows_info = hint("")
+        el.addWidget(self.rows_info)
+        self.rows = QtWidgets.QTableWidget()
+        self.rows.setSortingEnabled(False)
+        el.addWidget(self.rows, 1)
+        self.views.addTab(ew, "Events of this group (all columns)")
+        rv.addWidget(self.views, 1)
         split.addWidget(right)
         split.setSizes([440, 900])
 
@@ -154,6 +169,31 @@ class EpochTab(QtWidgets.QWidget):
     def _select_group(self, i):
         if 0 <= i < len(self._selectors):
             self.stack.setCurrentWidget(self._selectors[i])
+            self._show_rows()
+
+    def _show_rows(self):
+        """The current group's events with every column that has a value."""
+        sel = self.current()
+        if sel is None:
+            return
+        try:
+            df = sel.selected()
+        except ValueError as e:
+            self.rows.clear()
+            self.rows.setRowCount(0)
+            self.rows_info.setText(f"Filter error: {e}")
+            return
+        cols = [c for c in df.columns if c not in ("description",)
+                and df[c].notna().any() and (df[c].astype(str) != "").any()]
+        view = df[cols].copy()
+        for c in view.columns:
+            if view[c].dtype == object:
+                view[c] = view[c].fillna("")
+        n = len(view)
+        fill_table(self.rows, view.iloc[:3000], fmt="{:.4g}")
+        self.rows_info.setText(f"{sel.label()}: {n} events"
+                               + (" (first 3000 shown)" if n > 3000 else "")
+                               + " — the columns are what the filters can use")
 
     def _group_changed(self, sel: EventSelector):
         if sel not in self._selectors:
@@ -167,6 +207,8 @@ class EpochTab(QtWidgets.QWidget):
         if item is not None:
             item.setText(f"{sel.label()}   ({n} events)")
             item.setForeground(pg.mkColor(THEME.group(i)))
+        if sel is self.current():
+            self._show_rows()
         sig = (sel.label(), tuple(sorted(sel.checked_names())), sel.text.text(),
                sel.query.text(), n)
         if self._sigs.get(id(sel)) != sig:  # only real changes make epochs out of date

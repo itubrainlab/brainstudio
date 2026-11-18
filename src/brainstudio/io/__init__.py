@@ -36,14 +36,14 @@ def load_eyetracking_file(path: str | Path, screen_size=(1920, 1080)) -> GazeDat
     raise ValueError(f"Unsupported eye-tracking file: {path.name}")
 
 
-def load(path: str | Path, screen_size=(1920, 1080), roles=None) -> Recording:
+def load(path: str | Path, screen_size=(1920, 1080), roles=None, options=None) -> Recording:
     """Load a single file (XDF, any MNE-readable EEG file, EyeLink .asc).
 
     ``roles`` (XDF only): stream id → EEG / gaze / markers / ignore overrides."""
     path = Path(path)
     name = path.name.lower()
     if name.endswith((".xdf", ".xdfz")):
-        return load_xdf(path, screen_size, roles=roles)
+        return load_xdf(path, screen_size, roles=roles, options=options)
     if name.endswith(".asc"):
         raw = mne.io.read_raw_eyelink(path, verbose="error")
         rec = Recording(gaze=gaze_from_raw(raw, screen_size, drop=False), source=path)

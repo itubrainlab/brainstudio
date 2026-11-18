@@ -56,9 +56,11 @@ def write_xdf(path: str | Path, streams: list[dict]) -> None:
         payload = bytearray(struct.pack("<I", sid) + _varlen(len(ts)))
         for i, t in enumerate(ts):
             payload += b"\x08" + struct.pack("<d", t)
-            if fmt == "string":
-                v = str(s["data"][i]).encode()
-                payload += _varlen(len(v)) + v
+            if fmt == "string":  # one length-prefixed string per channel
+                row = s["data"][i]
+                for v in (row if isinstance(row, (list, tuple)) else [row]):
+                    b = str(v).encode()
+                    payload += _varlen(len(b)) + b
             else:
                 payload += np.asarray(s["data"][i], dtype=_FMT[fmt][1:]).astype(
                     _FMT[fmt]).tobytes()

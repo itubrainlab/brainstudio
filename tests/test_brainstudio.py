@@ -286,3 +286,64 @@ def test_xdf_stream_roles_override(demo):
     with pytest.raises(ValueError, match="Only one stream can be EEG"):
         load_xdf(demo / "demo.xdf", roles={gaze_key: "EEG"})
     assert roles  # every stream is listed with its metadata
+
+
+def test_numeric_string_stream_is_gaze(tmp_path):
+    """Gazepoint-style streams send numbers as text at a regular rate: read as data."""
+    t = np.arange(0, 20, 1 / 60)
+    x = 0.5 + 0.1 * np.sin(t)
+    rows = [[f"{a:.5f}", f"{0.4:.5f}", "1", f"{25 + np.sin(k):.3f}", f"{26:.3f}"]
+            for k, a in enumerate(x)]
+    eeg_t = np.arange(0, 20, 1 / 100)
+    write_xdf(tmp_path / "s.xdf", [
+        dict(name="GazepointGaze", type="gaze", srate=60, format="string",
+             labels=["FPOGX", "FPOGY", "FPOGV", "LPD", "RPD"], timestamps=t, data=rows),
+        dict(name="EEG", type="EEG", srate=100, format="float32", labels=["Cz", "Pz"],
+             timestamps=eeg_t, data=np.random.default_rng(0).normal(0, 10, (len(eeg_t), 2))),
+        dict(name="markers", type="Markers", srate=0, format="string", labels=["m"],
+             timestamps=np.array([1.0, 2.0]), data=["a", "b"]),
+    ])
+    rec = load_xdf(tmp_path / "s.xdf")
+    roles = {s["name"]: s["role"] for s in rec.streams}
+    assert roles == {"GazepointGaze": "gaze", "EEG": "EEG", "markers": "markers"}
+    assert rec.gaze is not None and np.nanmean(rec.gaze.x) == pytest.approx(0.5 * 1920, rel=0.05)
+    assert np.nanmedian(rec.gaze.pupil) == pytest.approx(25.5, abs=0.6)
+
+
+def test_multicolumn_markers_pair_and_keep_every_column(tmp_path):
+    """start/stop rows → events with duration; every column → an event-table column;
+    gaze events inside a trial inherit its phase and attributes."""
+    from brainstudio import events as EV
+    eeg_t = np.arange(0, 30, 1 / 100)
+    rows = [["start", "trials", "clip1.mp4", "sad", ""], ["stop", "trials", "clip1.mp4", "sad",
+                                                          "angry"],
+            ["start", "trials", "clip2.mp4", "happy", ""], ["end", "trials", "clip2.mp4",
+                                                            "happy", "happy"],
+            ["start", "fixation", "clip2.mp4", "happy", ""]]
+    write_xdf(tmp_path / "m.xdf", [
+        dict(name="EEG", type="EEG", srate=100, format="float32", labels=["Cz", "Pz"],
+             timestamps=eeg_t, data=np.random.default_rng(0).normal(0, 10, (len(eeg_t), 2))),
+        dict(name="exp_stim", type="Markers", srate=0, format="string",
+             labels=["c1", "c2", "c3", "c4", "c5"],
+             timestamps=np.array([2.0, 5.0, 10.0, 12.5, 20.0]), data=rows),
+    ])
+    rec = load_xdf(tmp_path / "m.xdf")
+    st = next(s for s in rec.streams if s["name"] == "exp_stim")
+    auto = st["auto_options"]["markers"]
+    assert auto["columns"][:2] == ["flag", "name"]
+    tab = EV.build_event_table(rec)
+    trials = tab[tab.name == "trials"].reset_index(drop=True)
+    assert list(trials.duration) == pytest.approx([3.0, 2.5])
+    assert {"c3", "c4", "c5"} <= set(tab.columns)
+    assert list(trials.c5) == ["angry", "happy"]                     # response from stop row
+    assert (tab.name == "trials_end").sum() == 2
+    assert (tab.name == "fixation_marker").sum() == 1   # unclosed start kept; no clash
+    assert (tab.name == "fixation").sum() == 0          # with gaze "fixation" events
+    # user options: rename and re-assign columns
+    opts = {st["key"]: {"names": ["action", "event", "stimulus", "emotion", "response"],
+                        "columns": ["flag", "name", "attribute", "attribute", "ignore"],
+                        "end_events": False}}
+    tab2 = EV.build_event_table(load_xdf(tmp_path / "m.xdf", options=opts))
+    assert "emotion" in tab2 and "response" not in tab2 and "trials_end" not in set(tab2.name)
+    # phase inheritance from events with a duration; "fixation" is not a *_ON phase
+    assert EV._START.match("fixation") is None
