@@ -99,6 +99,9 @@ class Recording:
     source: Path | None = None
     description: str = ""
     gaze_events: GazeEvents | None = None
+    # Streams of a multi-stream source (XDF): dicts with key, name, type, channels,
+    # srate, format, samples, labels, auto_role and role (EEG/gaze/markers/ignore)
+    streams: list = field(default_factory=list)
 
     @property
     def has_eeg(self) -> bool:

@@ -58,6 +58,23 @@ as missing.
 
 ## GUI
 
+BrainStudio is styled like the lab's other app, brAInStream:
+* the dark style with blue highlights and the brAIn lab red;
+* a top bar with the br**AI**n studio wordmark;
+* icons drawn in code.
+
+The style sheet is BrainStudio's own; no g.Pype files are used.
+
+**Dataset dock** (left):
+* a **ribbon** of buttons for the File menu's functions: BIDS, File, Eye data, Montage,
+  Stimulus, Export, Snapshot;
+* the recording tree;
+* for XDF files, a **Streams** table. It lists every stream with its channels and rate
+  and the **role** it plays: *EEG*, *gaze*, *markers* or *ignore*. Roles are picked
+  automatically. To change them, pick another role and press **Reload with these
+  roles**. **Automatic** goes back to the automatic roles. At most one stream can be
+  EEG and one gaze; hover a stream to see its channel labels.
+
 Three main tabs:
 
 * **Viewer** (shows the preprocessed EEG by default; switch to raw in the Controls dock)
@@ -198,7 +215,8 @@ from brainstudio.io import load_xdf
 from brainstudio import gaze as G, events as EV, preprocessing as P, epoching as EP
 from brainstudio import bandpower as BP, stats as ST, eeg as E
 
-rec = load_xdf("recording.xdf")
+rec = load_xdf("recording.xdf")      # roles={"4": "ignore"} overrides a stream's role
+print([(st["name"], st["role"]) for st in rec.streams])
 gtec = E.montage_from_source("gtec_64")                         # names + positions
 E.apply_montage(rec.raw, gtec, gtec.ch_names)
 ev = G.detect_events(rec.gaze)                                  # fixations / saccades / blinks

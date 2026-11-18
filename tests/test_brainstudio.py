@@ -269,3 +269,20 @@ def test_cluster_test_needs_two_epochs_per_group():
     many = mne.EpochsArray(rng.normal(0, 1e-6, (5, 2, 50)), info, verbose="error")
     with pytest.raises(ValueError, match="at least 2 epochs"):
         E.cluster_contrast(one, many, n_permutations=10)
+
+
+def test_xdf_stream_roles_override(demo):
+    rec = load_xdf(demo / "demo.xdf")
+    roles = {s["name"]: s for s in rec.streams}
+    assert {s["role"] for s in rec.streams} >= {"EEG", "gaze", "markers"}
+    assert all(s["role"] == s["auto_role"] for s in rec.streams)
+    gaze_key = next(s["key"] for s in rec.streams if s["role"] == "gaze")
+    eeg_key = next(s["key"] for s in rec.streams if s["role"] == "EEG")
+    no_gaze = load_xdf(demo / "demo.xdf", roles={gaze_key: "ignore"})
+    assert no_gaze.gaze is None and no_gaze.raw is not None
+    assert next(s for s in no_gaze.streams if s["key"] == gaze_key)["role"] == "ignore"
+    no_eeg = load_xdf(demo / "demo.xdf", roles={eeg_key: "ignore"})
+    assert no_eeg.raw is None and no_eeg.gaze is not None
+    with pytest.raises(ValueError, match="Only one stream can be EEG"):
+        load_xdf(demo / "demo.xdf", roles={gaze_key: "EEG"})
+    assert roles  # every stream is listed with its metadata

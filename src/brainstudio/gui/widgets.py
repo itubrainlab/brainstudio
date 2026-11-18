@@ -83,10 +83,8 @@ def hint(text: str) -> QtWidgets.QLabel:
 
 def run_button(text: str) -> QtWidgets.QPushButton:
     b = QtWidgets.QPushButton(text)
-    f = b.font()
-    f.setBold(True)
-    b.setFont(f)
-    b.setMinimumHeight(30)
+    b.setObjectName("Primary")  # brAIn lab style: blue primary action
+    b.setMinimumHeight(28)
     return b
 
 

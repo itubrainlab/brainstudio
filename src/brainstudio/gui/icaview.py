@@ -57,7 +57,7 @@ class ICAComponentView(QtWidgets.QWidget):
             ax.set_facecolor(THEME.bg)
         sf = fit_raw.info["sfreq"]
         src = sources[k]
-        col = THEME.event if excluded else THEME.s(0)
+        col = THEME.event if excluded else THEME.group(0)  # hex: matplotlib colour
 
         # scalp map of the mixing pattern
         if has_positions(fit_raw):

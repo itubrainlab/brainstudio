@@ -16,6 +16,7 @@ from .. import events as EV
 from .. import gaze as G
 from .. import io as bio
 from ..model import Recording
+from . import icons, style
 from .eeg_analysis import AnalysisTab
 from .epoch_tab import EpochTab
 from .gaze_tab import GazeTab
@@ -34,8 +35,10 @@ pg.setConfigOptions(antialias=False, useOpenGL=False)
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
+        style.apply(QtWidgets.QApplication.instance())
         super().__init__()
-        self.setWindowTitle("BrainStudio — EEG & eye-tracking viewer")
+        self.setWindowTitle("brAInStudio — EEG & eye-tracking analysis")
+        self.setWindowIcon(icons.app())
         self.resize(1600, 950)
         self.rec: Recording | None = None
         self.display_raw: mne.io.BaseRaw | None = None
@@ -48,6 +51,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline = EEGPipeline(self)
         self.worker = Worker(self)
 
+        self._build_toolbar()
         self._build_central()
         self._build_left_dock()
         self._build_right_dock()
@@ -67,6 +71,94 @@ class MainWindow(QtWidgets.QMainWindow):
                 0, self._apply_theme))
 
     # ================================================================== layout
+    def _build_toolbar(self):
+        """brAIn lab top bar: logo, wordmark, the open recording, help."""
+        bar = QtWidgets.QToolBar("brAInStudio")
+        bar.setObjectName("Toolbar")
+        bar.setMovable(False)
+        bar.setFloatable(False)
+        bar.toggleViewAction().setVisible(False)
+        w = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(w)
+        row.setContentsMargins(8, 3, 8, 3)
+        row.setSpacing(0)
+        logo = QtWidgets.QLabel()
+        logo.setPixmap(icons.app().pixmap(QtCore.QSize(26, 26)))
+        row.addWidget(logo)
+        row.addSpacing(8)
+        for text, name in (("br", "Brand"), ("AI", "BrandAI"), ("n", "Brand"),
+                           (" studio", "BrandSub")):
+            lab = QtWidgets.QLabel(text)
+            lab.setObjectName(name)
+            row.addWidget(lab)
+        row.addSpacing(14)
+        div = QtWidgets.QFrame()
+        div.setObjectName("Divider")
+        div.setFixedSize(1, 22)
+        row.addWidget(div)
+        row.addSpacing(14)
+        self.title_label = QtWidgets.QLabel("no recording open")
+        self.title_label.setObjectName("ProjectName")
+        row.addWidget(self.title_label)
+        row.addStretch(1)
+        help_ = QtWidgets.QToolButton()
+        help_.setIcon(icons.question())
+        help_.setIconSize(QtCore.QSize(20, 20))
+        help_.setToolTip("Keyboard shortcuts")
+        help_.clicked.connect(self._show_shortcuts)
+        row.addWidget(help_)
+        bar.addWidget(w)
+        self.addToolBar(QtCore.Qt.TopToolBarArea, bar)
+        self.toolbar = bar
+
+    def _show_shortcuts(self):
+        QtWidgets.QMessageBox.information(
+            self, "Shortcuts", "←/→  previous/next page\nSpace  play/pause\n"
+            "Click in a time plot  move cursor\n+/-  EEG scale\nPgUp/PgDn  scroll channels")
+
+    def _build_ribbon(self) -> QtWidgets.QWidget:
+        """Buttons for the File menu's load and export functions."""
+        rib = QtWidgets.QWidget()
+        rib.setObjectName("Ribbon")
+        rib.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        g = QtWidgets.QGridLayout(rib)
+        g.setContentsMargins(4, 4, 4, 4)
+        g.setSpacing(2)
+        items = (("BIDS", icons.folder(), "Open a BIDS dataset (Ctrl+B)", self.action_open_bids),
+                 ("File", icons.file(), "Open an XDF / EEG / EyeLink file (Ctrl+O)",
+                  self.action_open_file),
+                 ("Eye data", icons.eye_plus(), "Attach an eye-tracking file to the "
+                  "recording (Ctrl+E)", self.action_attach_gaze),
+                 ("Montage", icons.cap(), "Channel names & montage (Ctrl+M)",
+                  self.action_montage),
+                 ("Stimulus", icons.image(), "Load a stimulus image for the screen view "
+                  "(Ctrl+I)", self.action_stimulus),
+                 ("Export", icons.export(), "Export gaze events (CSV)",
+                  self.export_gaze_events),
+                 ("Snapshot", icons.camera(), "Save the screen view (PNG)", self.export_screen))
+        self.ribbon_buttons = {}
+        for k, (text, icon, tip, fn) in enumerate(items):
+            b = QtWidgets.QToolButton()
+            b.setText(text)
+            b.setIcon(icon)
+            b.setIconSize(QtCore.QSize(26, 26))
+            b.setToolButtonStyle(QtCore.Qt.ToolButtonTextUnderIcon)
+            b.setToolTip(tip)
+            b.setAutoRaise(True)
+            b.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+            b.clicked.connect(fn)
+            g.addWidget(b, k // 4, k % 4)
+            self.ribbon_buttons[text] = b
+        return rib
+
+    def _update_ribbon(self):
+        rec = self.rec
+        on = {"Eye data": rec is not None, "Montage": rec is not None and rec.raw is not None,
+              "Export": self.gaze_events is not None,
+              "Snapshot": rec is not None and rec.has_gaze}
+        for k, v in on.items():
+            self.ribbon_buttons[k].setEnabled(v)
+
     def _build_central(self):
         self.eeg_plot = EEGPlot()
         self.gaze_plot = GazePlot()
@@ -106,6 +198,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipe_label = QtWidgets.QLabel("")
         bar.addWidget(self.pipe_label, 1)
         self.btn_pipe = QtWidgets.QPushButton("Run pipeline ▶▶")
+        self.btn_pipe.setObjectName("Primary")
         self.btn_pipe.setToolTip("Run every stage that is not up to date, in order")
         self.btn_pipe.clicked.connect(self.run_pipeline)
         bar.addWidget(self.btn_pipe)
@@ -162,10 +255,45 @@ class MainWindow(QtWidgets.QMainWindow):
         dock.setObjectName("dataset")
         w = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 4)
+        lay.addWidget(self._build_ribbon())
+        inner = QtWidgets.QVBoxLayout()
+        inner.setContentsMargins(6, 0, 6, 0)
+        lay.addLayout(inner, 1)
+        lay = inner
         self.tree = QtWidgets.QTreeWidget()
         self.tree.setHeaderLabels(["Recording"])
         self.tree.itemActivated.connect(self._tree_activated)
-        lay.addWidget(self.tree, 3)
+        lay.addWidget(self.tree, 2)
+
+        # --- streams of a multi-stream file (XDF) and the role each one plays
+        self.streams_box = QtWidgets.QGroupBox("Streams")
+        sv = QtWidgets.QVBoxLayout(self.streams_box)
+        sv.setContentsMargins(4, 4, 4, 4)
+        self.stream_table = QtWidgets.QTableWidget(0, 4)
+        self.stream_table.setHorizontalHeaderLabels(["stream", "role", "ch", "Hz"])
+        self.stream_table.verticalHeader().setVisible(False)
+        self.stream_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.stream_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.stream_table.horizontalHeader().setStretchLastSection(False)
+        self.stream_table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.Stretch)
+        self.stream_table.currentCellChanged.connect(lambda r, *_: self._show_stream(r))
+        sv.addWidget(self.stream_table)
+        row = QtWidgets.QHBoxLayout()
+        self.btn_roles = QtWidgets.QPushButton("Reload with these roles")
+        self.btn_roles.setToolTip("Reload the file using the roles chosen above "
+                                  "(resets montage and pipeline results)")
+        self.btn_roles.clicked.connect(self._apply_stream_roles)
+        self.btn_roles.setEnabled(False)
+        auto = QtWidgets.QPushButton("Automatic")
+        auto.setToolTip("Back to the roles BrainStudio picks by itself")
+        auto.clicked.connect(self._auto_stream_roles)
+        row.addWidget(self.btn_roles, 1)
+        row.addWidget(auto)
+        sv.addLayout(row)
+        self.streams_box.setVisible(False)
+        lay.addWidget(self.streams_box, 2)
         self.info = QtWidgets.QPlainTextEdit()
         self.info.setReadOnly(True)
         self.info.setMaximumHeight(150)
@@ -175,8 +303,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.event_table.cellDoubleClicked.connect(self._event_jump)
         lay.addWidget(self.event_table, 2)
         dock.setWidget(w)
+        w.setMinimumWidth(330)
         self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, dock)
         self.left_dock = dock
+        self._update_ribbon()
 
     def _build_right_dock(self):
         dock = QtWidgets.QDockWidget("Controls", self)
@@ -395,14 +525,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.set_recording(rec)
 
-    def open_file(self, path):
+    def open_file(self, path, roles=None):
         path = Path(path)
         if path.is_dir():
             self.open_bids(path)
             return
+        if self.worker.busy:
+            QtWidgets.QMessageBox.information(self, "Busy", "Wait for the running "
+                                              "computation to finish.")
+            return
         try:
             with self._busy(f"Loading {path.name}…"):
-                rec = bio.load(path, self.screen_size())
+                rec = bio.load(path, self.screen_size(), roles=roles)
         except Exception as e:
             self._error("Could not load file", e)
             return
@@ -425,6 +559,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gaze_offset = 0.0
         self.gaze_events = None
         self.pupil_clean = None
+        self.pipeline.set_gaze_events(None)
+        self.eeg_plot.gaze_events = self.gaze_plot.gaze_events = None
         if rec.has_gaze:
             self.scr_w.setValue(rec.gaze.screen_size[0])
             self.scr_h.setValue(rec.gaze.screen_size[1])
@@ -443,6 +579,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if rec.has_gaze:
             self.detect_gaze_events()
         self.info.setPlainText(rec.summary() + ("\n" + rec.description if rec.description else ""))
+        self._fill_streams()
         self._refresh_events()
         self._rebuild_event_table()
         self.gaze_tab.update_gaze_stats()
@@ -453,7 +590,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.eeg_plot.plotItem.getViewBox().setLimits(xMin=-1, xMax=rec.duration + 1)
         self.eeg_plot.set_window(0, win)
         self.set_cursor(0.0)
-        self.setWindowTitle(f"BrainStudio — {rec.source.name if rec.source else ''}")
+        self.setWindowTitle(f"brAInStudio — {rec.source.name if rec.source else ''}")
+        self.title_label.setText(rec.source.name if rec.source else "recording")
+        self.title_label.setToolTip(str(rec.source or ""))
+        self._update_ribbon()
         self.statusBar().showMessage(rec.summary().replace("\n", "  |  "))
 
     def _eeg_picks(self, raw):
@@ -470,6 +610,88 @@ class MainWindow(QtWidgets.QMainWindow):
         self.eeg_plot.set_data(data, raw.times, names, types, raw.info["bads"])
         self.n_chan.setMaximum(max(len(names), 1))
         self.eeg_plot.set_visible_channels(min(self.n_chan.value(), len(names)))
+
+    # ================================================================== streams
+    def _fill_streams(self):
+        streams = self.rec.streams if self.rec is not None else []
+        self.streams_box.setVisible(bool(streams))
+        t = self.stream_table
+        t.setRowCount(len(streams))
+        for i, st in enumerate(streams):
+            name = QtWidgets.QTableWidgetItem(st["name"] or f"stream {st['key']}")
+            name.setData(QtCore.Qt.UserRole, st["key"])
+            labels = ", ".join(st["labels"][:16]) + (" …" if len(st["labels"]) > 16 else "")
+            name.setToolTip(f"{st['name']}  (id {st['key']}, type {st['type']})\n"
+                            f"{st['samples']} samples, "
+                            f"{st['format']}\nautomatic role: {st['auto_role']}\n"
+                            f"channels: {labels}")
+            name.setFlags(name.flags() & ~QtCore.Qt.ItemIsEditable)
+            t.setItem(i, 0, name)
+            combo = QtWidgets.QComboBox()
+            combo.addItems(list(bio.xdf.ROLES))
+            combo.setCurrentText(st["role"])
+            combo.setToolTip(f"automatic: {st['auto_role']}")
+            combo.currentTextChanged.connect(lambda _=None: self._roles_edited())
+            t.setCellWidget(i, 1, combo)
+            for j, v in enumerate((str(st["channels"]),
+                                   f"{st['srate']:g}" if st["srate"] else "irreg."), start=2):
+                it = QtWidgets.QTableWidgetItem(v)
+                it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
+                t.setItem(i, j, it)
+        t.resizeColumnsToContents()
+        t.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        self._roles_edited()
+
+    def stream_roles(self) -> dict[str, str]:
+        t = self.stream_table
+        return {t.item(i, 0).data(QtCore.Qt.UserRole): t.cellWidget(i, 1).currentText()
+                for i in range(t.rowCount())}
+
+    def _roles_edited(self):
+        if self.rec is None:
+            return
+        cur = {s["key"]: s["role"] for s in self.rec.streams}
+        new = self.stream_roles()
+        changed = new != cur
+        self.btn_roles.setEnabled(changed)
+        bold = QtGui.QFont()
+        for i in range(self.stream_table.rowCount()):
+            k = self.stream_table.item(i, 0).data(QtCore.Qt.UserRole)
+            f = QtGui.QFont(bold)
+            f.setBold(new.get(k) != cur.get(k))
+            self.stream_table.item(i, 0).setFont(f)
+
+    def _show_stream(self, row):
+        if self.rec is None or not (0 <= row < len(self.rec.streams)):
+            return
+        st = self.rec.streams[row]
+        self.statusBar().showMessage(
+            f"{st['name']}: {st['type']}, {st['channels']} ch "
+            f"({', '.join(st['labels'][:8])}{' …' if len(st['labels']) > 8 else ''}), "
+            f"{st['samples']} samples — role {st['role']} (automatic: {st['auto_role']})", 10000)
+
+    def _auto_stream_roles(self):
+        if self.rec is None:
+            return
+        auto = {s["key"]: s["auto_role"] for s in self.rec.streams}
+        for i in range(self.stream_table.rowCount()):
+            k = self.stream_table.item(i, 0).data(QtCore.Qt.UserRole)
+            self.stream_table.cellWidget(i, 1).setCurrentText(auto[k])
+        self._roles_edited()
+        if self.btn_roles.isEnabled():
+            self._apply_stream_roles()
+
+    def _apply_stream_roles(self):
+        if self.rec is None or self.rec.source is None:
+            return
+        roles = self.stream_roles()
+        for role in ("EEG", "gaze"):
+            n = sum(r == role for r in roles.values())
+            if n > 1:
+                QtWidgets.QMessageBox.warning(self, "Stream roles",
+                                              f"Only one stream can be {role}.")
+                return
+        self.open_file(self.rec.source, roles=roles)
 
     # ================================================================== pipeline
     def _on_pipeline(self, what):
@@ -548,6 +770,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gaze_tab.update_gaze_stats()
         self._rebuild_event_table()
         self._update_screen()
+        self._update_ribbon()
 
     # ================================================================== events / montage
     def _rebuild_event_table(self):

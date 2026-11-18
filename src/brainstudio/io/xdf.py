@@ -267,9 +267,22 @@ def _overlap(a: tuple[float, float], b: tuple[float, float]) -> float:
 
 
 # --------------------------------------------------------------------------- main
+ROLES = ("EEG", "gaze", "markers", "ignore")
+
+
+def stream_key(stream: dict) -> str:
+    """Stable identifier of a stream within its file (the XDF stream id)."""
+    return str(stream["info"].get("stream_id", _info(stream, "name")))
+
+
 def load_xdf(path: str | Path, screen_size=(1920, 1080), eeg_stream=None,
-             gaze_stream=None) -> Recording:
+             gaze_stream=None, roles: dict[str, str] | None = None) -> Recording:
     """Load an XDF file. ``eeg_stream``/``gaze_stream`` force a stream by name or id.
+
+    ``roles`` maps stream keys (:func:`stream_key`, the XDF stream id) to one of
+    ``EEG``, ``gaze``, ``markers`` or ``ignore`` and overrides the automatic
+    classification for those streams. At most one stream can be EEG and one gaze.
+    The roles used end up in ``Recording.streams``.
 
     Clock handling: LSL clock offsets recorded in the file are applied by
     pyxdf. Streams that still do not overlap the EEG in time are mapped onto
@@ -298,6 +311,32 @@ def load_xdf(path: str | Path, screen_size=(1920, 1080), eeg_stream=None,
         (s for s in eeg_cands if EEG_TYPE.search(str(_info(s, "type")))), None)
     if eeg_s is None and eeg_cands:
         eeg_s = max(eeg_cands, key=lambda s: int(_info(s, "channel_count", 0)))
+
+    # ---- roles: automatic, then user overrides
+    auto = {stream_key(s): "ignore" for s in streams}
+    auto.update({stream_key(m): "markers" for m in markers})
+    if eeg_s is not None:
+        auto[stream_key(eeg_s)] = "EEG"
+    if gaze_s is not None:
+        auto[stream_key(gaze_s)] = "gaze"
+    final = dict(auto)
+    for k, r in (roles or {}).items():
+        if k in final:
+            if r not in ROLES:
+                raise ValueError(f"Unknown stream role {r!r} (use {', '.join(ROLES)})")
+            final[str(k)] = r
+    for role in ("EEG", "gaze"):
+        chosen = [k for k, r in final.items() if r == role]
+        if len(chosen) > 1:
+            raise ValueError(f"Only one stream can be {role} (got {len(chosen)})")
+    by_key = {stream_key(s): s for s in streams}
+    eeg_s = next((by_key[k] for k, r in final.items() if r == "EEG"), None)
+    gaze_s = next((by_key[k] for k, r in final.items() if r == "gaze"), None)
+    markers = [by_key[k] for k, r in final.items() if r == "markers"]
+    for s in (eeg_s, gaze_s):
+        if s is not None and _is_marker(s):
+            raise ValueError(f"{_info(s, 'name')} is a marker/string stream and cannot be "
+                             "EEG or gaze")
 
     notes: list[str] = []
     clean = {}
@@ -377,8 +416,16 @@ def load_xdf(path: str | Path, screen_size=(1920, 1080), eeg_stream=None,
             events.description[inside].to_numpy()))
         events = events[~inside]
     rec.events = events.reset_index(drop=True)
-    roles = {id(m): "markers" for m in markers}
-    roles.update({id(eeg_s): "EEG", id(gaze_s): "gaze"})
-    names = ", ".join(f"{_info(s, 'name')} [{roles.get(id(s), 'unused')}]" for s in streams)
+    names = ", ".join(f"{_info(s, 'name')} [{final[stream_key(s)]}"
+                      f"{'' if final[stream_key(s)] == auto[stream_key(s)] else ', set by user'}]"
+                      for s in streams)
     rec.description = "XDF streams: " + names + ("\n" + "\n".join(notes) if notes else "")
+    rec.streams = [{
+        "key": stream_key(s), "name": _info(s, "name"), "type": _info(s, "type"),
+        "channels": int(_info(s, "channel_count", 0) or 0),
+        "srate": float(_info(s, "nominal_srate", 0) or 0),
+        "format": _info(s, "channel_format"), "samples": len(s["time_stamps"]),
+        "labels": [c["label"] for c in _channel_meta(s)],
+        "auto_role": auto[stream_key(s)], "role": final[stream_key(s)],
+    } for s in streams]
     return rec
