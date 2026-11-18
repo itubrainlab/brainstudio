@@ -20,9 +20,14 @@ from .widgets import (NO_POS, StageHeader, _spin, _themed_plot, fill_table, has_
 
 
 def _sem(x: np.ndarray, axis=0) -> np.ndarray:
+    """Standard error of the mean, NaN where fewer than two values (no warnings)."""
+    x = np.asarray(x, float)
     n = np.sum(np.isfinite(x), axis=axis)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        return np.nanstd(x, axis=axis, ddof=1) / np.sqrt(np.maximum(n, 1))
+    mean = np.nanmean(np.where(np.isfinite(x), x, 0.0), axis=axis) * np.size(x, axis) \
+        / np.maximum(n, 1)
+    dev = np.where(np.isfinite(x), x - np.expand_dims(mean, axis), 0.0)
+    var = np.sum(dev ** 2, axis=axis) / np.maximum(n - 1, 1)
+    return np.where(n >= 2, np.sqrt(var / np.maximum(n, 1)), np.nan)
 
 
 def _bars(plot: pg.PlotItem, xs, means, sems, color, width):
