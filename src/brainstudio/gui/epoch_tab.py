@@ -136,8 +136,9 @@ class EpochTab(QtWidgets.QWidget):
         tw = QtWidgets.QWidget()
         tl = QtWidgets.QVBoxLayout(tw)
         tl.setContentsMargins(0, 4, 0, 0)
-        tl.addWidget(hint("Where the events of each group are (faint = selected, bold = kept "
-                          "as epochs)"))
+        tl.addWidget(hint("Each bar is one epoch window (event + start … event + end); faint = "
+                          "selected, solid = kept as an epoch, tick = the event (time 0). "
+                          "Zoom with the mouse wheel."))
         tl.addWidget(self.timeline, 1)
         self.views.addTab(tw, "Timeline")
         ew = QtWidgets.QWidget()
@@ -425,22 +426,31 @@ class EpochTab(QtWidgets.QWidget):
         self._plot_timeline()
 
     def _plot_timeline(self):
+        """Each group on its own row: every epoch as a bar spanning its window
+        (onset + start … onset + end); faint = selected, solid = kept as an epoch.
+        A tick marks the event itself (time 0 of the epoch)."""
         p = self.timeline
         p.clear()
         sel = getattr(self, "_selected", {})
         labels = list(sel) or list(self.pl.epochs)
+        st = self.pl.epoch_settings
+        width = st.tmax - st.tmin
+        delay = st.delay_ms / 1000.0
         for i, lab in enumerate(labels):
             y = len(labels) - 1 - i
             rows = sel.get(lab)
             if rows is not None and len(rows):
-                on = rows["onset"].to_numpy(float)
-                p.plot(on, np.full(len(on), y), pen=None, symbol="|", symbolSize=14,
-                       symbolPen=pg.mkPen(THEME.s(i, 70)))
+                on = rows["onset"].to_numpy(float) + delay
+                p.addItem(pg.BarGraphItem(x0=on + st.tmin, width=width, y0=y - 0.3,
+                                          height=0.6, brush=THEME.s(i, 35), pen=pg.mkPen(None)))
             ep = self.pl.epochs.get(lab)
             if ep is not None and ep.metadata is not None:
-                on = ep.metadata["onset"].to_numpy(float)
-                p.plot(on, np.full(len(on), y), pen=None, symbol="|", symbolSize=22,
-                       symbolPen=pg.mkPen(THEME.s(i), width=2))
+                on = ep.metadata["onset"].to_numpy(float)  # already shifted by the delay
+                p.addItem(pg.BarGraphItem(x0=on + ep.tmin, width=ep.tmax - ep.tmin,
+                                          y0=y - 0.3, height=0.6, brush=THEME.s(i, 110),
+                                          pen=pg.mkPen(THEME.s(i), width=1)))
+                p.plot(on, np.full(len(on), y), pen=None, symbol="|", symbolSize=18,
+                       symbolPen=pg.mkPen(THEME.fg, width=1))
         p.getAxis("left").setTicks([[(len(labels) - 1 - i, lab) for i, lab in
                                      enumerate(labels)]])
         p.setYRange(-0.7, max(len(labels) - 0.3, 0.3), padding=0)

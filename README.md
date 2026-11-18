@@ -292,7 +292,10 @@ The **EEG** tab is a three-stage pipeline:
   - **EEG delay** (±500 ms) to correct a recording lag between events and EEG.
 - **Recordings**: tick the subjects, sessions, runs, tasks or files to use events from.
 - **Summary**: selected, outside the recording, rejected, kept, and the **channels that
-  caused rejections**; plus a timeline of each group's events.
+  caused rejections**.
+- **Timeline**: every epoch as a bar over its window (event + start … event + end), one
+  row per group, with a tick at the event. Faint bars are selected events; solid bars
+  are kept epochs.
 - Epochs are *not* baseline-corrected here: each analysis picks its own baseline.
 - Save one `-epo.fif` per group, with the event table as epochs metadata.
 
