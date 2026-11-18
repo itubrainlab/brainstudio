@@ -1,4 +1,4 @@
-"""BrainStudio: EEG + eye-tracking analysis built on MNE and PyGaze."""
+"""brAInStudio: EEG + eye-tracking analysis built on MNE and PyGaze."""
 
 from .model import GazeData, GazeEvents, Recording
 

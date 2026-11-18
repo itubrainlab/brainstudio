@@ -166,7 +166,7 @@ MONTAGE_DIRS = (Path(__file__).parent / "montages", Path.home() / ".brainstudio"
 
 
 def layout_montages() -> dict[str, Path]:
-    """Channel-layout montages shipped with BrainStudio or in ~/.brainstudio/montages."""
+    """Channel-layout montages shipped with brAInStudio or in ~/.brainstudio/montages."""
     out: dict[str, Path] = {}
     for d in MONTAGE_DIRS:
         if d.is_dir():

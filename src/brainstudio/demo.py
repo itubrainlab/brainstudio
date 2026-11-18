@@ -190,7 +190,7 @@ def write_bids(root: str | Path, subjects=("01", "02")) -> Path:
         (d / f"{base}_recording-eye1_physioevents.json").write_text(json.dumps({
             "Columns": ["onset", "duration", "message"],
             "onset": {"Units": "ms"}}, indent=2))
-    make_dataset_description(path=root, name="BrainStudio synthetic free-viewing",
+    make_dataset_description(path=root, name="brAInStudio synthetic free-viewing",
                              dataset_type="raw", overwrite=True, verbose="error")
     return root
 

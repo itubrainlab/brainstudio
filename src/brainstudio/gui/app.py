@@ -12,7 +12,7 @@ import brainstudio.gui  # noqa: F401  (sets Qt env vars before Qt imports)
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="BrainStudio: EEG + eye-tracking viewer")
+    ap = argparse.ArgumentParser(description="brAInStudio: EEG + eye-tracking viewer")
     ap.add_argument("path", nargs="?", help="BIDS dataset root, XDF, EEG or EyeLink file")
     ap.add_argument("--demo", action="store_true",
                     help="generate a synthetic BIDS dataset + XDF and open it")
@@ -24,7 +24,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.version:
         from .. import __version__
-        _say(f"BrainStudio {__version__}")
+        _say(f"brAInStudio {__version__}")
         return 0
 
     from PySide6 import QtWidgets
@@ -47,7 +47,7 @@ def main(argv=None):
     plt.ion()
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
-    app.setApplicationName("BrainStudio")
+    app.setApplicationName("brAInStudio")
     win = MainWindow()
     if args.screen:
         w, h = (int(v) for v in args.screen.lower().split("x"))

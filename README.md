@@ -1,8 +1,8 @@
 # brAInStudio
 
-<img src="src/brainstudio/resources/brainstudio.svg" alt="BrainStudio icon" width="96" align="right">
+<img src="src/brainstudio/resources/brainstudio.svg" alt="brAInStudio icon" width="96" align="right">
 
-BrainStudio is a desktop app and Python library for analysing **simultaneous EEG and
+brAInStudio is a desktop app and Python library for analysing **simultaneous EEG and
 eye-tracking recordings**. It loads XDF (Lab Streaming Layer), EDF/BDF and other EEG
 files, and BIDS datasets. It shows EEG and gaze on one time base, and takes the EEG
 through a **preprocessing → epoching → analysis** pipeline: ERP components, band power
@@ -10,7 +10,7 @@ and cognitive-state indices, compared between groups of events.
 
 - [MNE-Python](https://mne.tools) and [MNE-BIDS](https://mne.tools/mne-bids) do the EEG
   work: reading, filtering, ICA, epochs, evokeds, spectra and statistics.
-- [PyGaze](https://www.pygaze.org) provides the areas of interest (AOIs). BrainStudio
+- [PyGaze](https://www.pygaze.org) provides the areas of interest (AOIs). brAInStudio
   reimplements the PyGazeAnalyser event detectors.
 - The interface is PySide6 and pyqtgraph, in the dark style of the ITU brAIn lab's
   other apps.
@@ -35,8 +35,8 @@ and cognitive-state indices, compared between groups of events.
 ## Install and run
 
 **Packages**: every [release](https://github.com/itubrainlab/brainstudio/releases) has a
-standalone app for macOS (`.dmg`), Windows (`.zip`, run `BrainStudio.exe`) and Linux
-(`.tar.gz`, run `BrainStudio/BrainStudio`), plus a wheel. The apps are not signed:
+standalone app for macOS (`.dmg`), Windows (`.zip`, run `brAInStudio.exe`) and Linux
+(`.tar.gz`, run `brAInStudio/brAInStudio`), plus a wheel. The apps are not signed:
 - macOS: the first time, right-click the app and choose **Open**.
 - Windows: SmartScreen may ask you to confirm.
 
@@ -111,7 +111,7 @@ regular rate and numeric values are read as numbers.
 ### Multi-column marker streams
 
 Marker streams often carry several text columns per sample, for example
-`['start', 'trials', 'clip.mp4', 'sad', …]`. BrainStudio loads **every column**:
+`['start', 'trials', 'clip.mp4', 'sad', …]`. brAInStudio loads **every column**:
 
 - **Start/stop flag**: a `start` row and the next `stop`/`end` row with the same name
   become one event with a duration. The stop row fills in values the start row left
@@ -143,7 +143,7 @@ Loading a BIDS run also reads the dataset's own information:
   placement, the online filters already applied, the recording timing, and where the
   positions came from.
 
-MNE-BIDS reads the files. If it fails on broken sidecars, BrainStudio falls back to a
+MNE-BIDS reads the files. If it fails on broken sidecars, brAInStudio falls back to a
 plain reader and applies `channels.tsv` itself. When runs are combined, a channel bad in
 any run is bad in the combined recording.
 
@@ -195,14 +195,14 @@ Everything lives on one time base: t = 0 is the first EEG sample.
 
 - **XDF**:
   - pyxdf applies the LSL clock offsets stored in the file.
-  - BrainStudio then removes jitter from each regular stream with one linear fit per
+  - brAInStudio then removes jitter from each regular stream with one linear fit per
     gap-free segment, and uses the *effective* sampling rate.
   - When a stream's rate is not constant (some Gazepoint recordings drop samples or
     change rate), the straight line can drift seconds away from the timestamps.
-    BrainStudio then follows the timestamps' 5 s trend instead and notes this in the
+    brAInStudio then follows the timestamps' 5 s trend instead and notes this in the
     info panel, so gaze stays aligned with the EEG over the whole recording.
   - Some devices stamp a few samples on another clock (Gazepoint, for example).
-    BrainStudio detects and removes these samples, and uses them to estimate the offset
+    brAInStudio detects and removes these samples, and uses them to estimate the offset
     between the clocks. A stream that does not overlap the EEG is moved onto the EEG
     clock with that offset.
   - If no offset can be found, the stream starts are aligned and the info panel shows a
@@ -615,16 +615,16 @@ uv sync --group build
 uv run --group build python packaging/build.py
 ```
 
-This writes `dist/BrainStudio-<version>-<system>-<arch>.{dmg,zip,tar.gz}` for the
+This writes `dist/brAInStudio-<version>-<system>-<arch>.{dmg,zip,tar.gz}` for the
 system you are on.
 
 ## Notes and limitations
 
 - **Statistics are within one recording**: epochs are the observations. For group
   studies, export the per-epoch or per-group values and model subjects outside
-  BrainStudio.
+  brAInStudio.
 - **Gaze algorithms**: the PyPI release of PyGaze has the AOI plugin, but not the
-  offline detectors from PyGaze Analyser. BrainStudio reimplements those:
+  offline detectors from PyGaze Analyser. brAInStudio reimplements those:
   - blinks: runs of missing samples;
   - fixations: dispersion-based;
   - saccades: a velocity threshold.
@@ -642,5 +642,5 @@ system you are on.
   [pyxdf](https://github.com/xdf-modules/pyxdf), [PyGaze](https://www.pygaze.org) and
   [python-picard](https://pierreablin.github.io/picard/).
 - The ERP component analysis follows the lab's Rhino ERP.
-- The look follows brAInStream. The style sheet and icons are BrainStudio's own; the app
+- The look follows brAInStream. The style sheet and icons are brAInStudio's own; the app
   icon uses the brAIn lab brain from brAInStream (MIT, ITU brAIn lab).

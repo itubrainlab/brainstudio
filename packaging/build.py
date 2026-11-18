@@ -1,13 +1,13 @@
-"""Build a standalone BrainStudio app with PyInstaller for the system it runs on.
+"""Build a standalone brAInStudio app with PyInstaller for the system it runs on.
 
     uv sync --group build
     uv run --group build python packaging/build.py
 
-Writes ``dist/BrainStudio-<version>-<system>-<arch>.<ext>``:
+Writes ``dist/brAInStudio-<version>-<system>-<arch>.<ext>``:
 
-* macOS: ``BrainStudio.app`` in a ``.dmg``
-* Windows: the ``BrainStudio`` folder (``BrainStudio.exe``) in a ``.zip``
-* Linux: the ``BrainStudio`` folder in a ``.tar.gz``
+* macOS: ``brAInStudio.app`` in a ``.dmg``
+* Windows: the ``brAInStudio`` folder (``brAInStudio.exe``) in a ``.zip``
+* Linux: the ``brAInStudio`` folder in a ``.tar.gz``
 
 and prints the path of the app executable, which accepts ``--self-test``.
 """
@@ -26,7 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build" / "pyinstaller"
 DIST = ROOT / "dist"
-NAME = "BrainStudio"
+NAME = "brAInStudio"
 
 
 def _system() -> tuple[str, str]:

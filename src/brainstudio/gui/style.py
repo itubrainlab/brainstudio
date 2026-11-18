@@ -1,7 +1,7 @@
 """The look: the brAIn lab's dark style shared with brAInStream.
 
 brAInStream dresses itself in g.Pype's dark theme with the lab's red. This module
-recreates that look for BrainStudio with its own palette and style sheet (no g.Pype
+recreates that look for brAInStudio with its own palette and style sheet (no g.Pype
 files are used): a #353535 window, #2a2a2a fields, #2a82da highlight, square
 buttons, gradient title bars on docks and group boxes, tabs underlined in blue, and
 the brAIn lab red (#BA0022) for the brand.

@@ -1,4 +1,4 @@
-"""BrainStudio main window."""
+"""brAInStudio main window."""
 
 from __future__ import annotations
 
@@ -318,7 +318,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_roles.clicked.connect(self._apply_stream_roles)
         self.btn_roles.setEnabled(False)
         auto = QtWidgets.QPushButton("Automatic")
-        auto.setToolTip("Back to the roles BrainStudio picks by itself")
+        auto.setToolTip("Back to the roles brAInStudio picks by itself")
         auto.clicked.connect(self._auto_stream_roles)
         row.addWidget(self.btn_roles, 1)
         row.addWidget(auto)

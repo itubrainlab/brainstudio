@@ -551,7 +551,7 @@ def test_bids_dataset_info_bads_and_positions(tmp_path):
     rec = load_bids_runs(root, [run])
     assert set(rec.raw.info["bads"]) == {"Cz", "Pz"}
     assert rec.metadata["bad_channels"]["Cz"] == "broken lead"
-    assert rec.metadata["dataset"]["Name"] == "BrainStudio synthetic free-viewing"
+    assert rec.metadata["dataset"]["Name"] == "brAInStudio synthetic free-viewing"
     assert "Bad channels (channels.tsv): Pz, Cz (broken lead)" in rec.description
     assert rec.metadata["montage_source"]  # template or electrodes file
     # electrodes.tsv at subject level with a space- entity (no task/run)
