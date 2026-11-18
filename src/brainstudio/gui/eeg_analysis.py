@@ -295,6 +295,10 @@ class AnalysisTab(QtWidgets.QWidget):
         comp = E.COMPONENT_PRESETS.get(name)
         if comp is None:
             return
+        # a new component gets its own conventional reference again
+        self.erp_ref.blockSignals(True)
+        self.erp_ref.setCurrentText(self.REF_LITERATURE)
+        self.erp_ref.blockSignals(False)
         for wdg in (self.erp_m0, self.erp_m1, self.erp_pol, self.erp_roi):
             wdg.blockSignals(True)
         self.erp_m0.setValue(comp.tmin)
