@@ -641,3 +641,24 @@ def test_erp_reference_choices(demo):
     assert np.allclose(pair.get_data(picks=["T7"]) + pair.get_data(picks=["T8"]), 0,
                        atol=1e-12)                                    # mean of T7/T8 = 0
     _ = mne
+
+
+def test_band_power_baseline_is_per_subject():
+    """Epochs are normalised against their own subject's baseline, never pooled."""
+    from brainstudio import bandpower as BP
+    # baseline events: subject a at 0 s and 100 s, subject b at 200 s
+    base = BP.BandBaseline(np.array([0.0, 100.0, 200.0]), 0, 10, "mean", "rest",
+                           np.array(["a", "a", "b"]))
+    owner = np.array([0, 0, 1, 1, 2, 2])                       # 2 segments per event
+    base_bp = np.array([1.0, 1.0, 3.0, 3.0, 10.0, 10.0])[:, None, None]  # a: 1 and 3, b: 10
+    onsets = np.array([50.0, 150.0, 250.0, 260.0])
+    subj = np.array(["a", "a", "b", "c"])                      # c has no baseline
+    mean, sd = BP.reference_for(onsets, base, base_bp, owner, subj)
+    assert mean[:3, 0, 0].tolist() == [2.0, 2.0, 10.0]          # own subject's mean only
+    assert np.isnan(mean[3, 0, 0])                              # no borrowing across subjects
+    base.mode = "nearest"
+    mean, _ = BP.reference_for(onsets, base, base_bp, owner, subj)
+    assert mean[:3, 0, 0].tolist() == [1.0, 3.0, 10.0]          # nearest event of the subject
+    assert BP.subjects_without_baseline(base, subj) == ["c"]
+    pooled, _ = BP.reference_for(onsets, BP.BandBaseline(base.onsets, 0, 10), base_bp, owner)
+    assert np.allclose(pooled[:, 0, 0], np.mean([1, 1, 3, 3, 10, 10]))  # no labels: pooled

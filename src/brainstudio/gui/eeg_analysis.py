@@ -730,6 +730,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.bl_event.addItem("— none (absolute power) —")
         if t is not None and len(t):
             m = t[t["kind"] == "marker"]["name"].astype(str).value_counts()
+            m = m[~m.index.str.upper().str.startswith(("BAD", "EDGE"))]  # not events
             names = sorted(m.index, key=lambda n: ("BASELINE" not in n.upper()
                                                    and "REST" not in n.upper(), n))
             for n in names:
@@ -756,8 +757,11 @@ class AnalysisTab(QtWidgets.QWidget):
             raise ValueError(f"No “{name}” events match the baseline filter")
         if self.bl_t1.value() <= self.bl_t0.value():
             raise ValueError("The baseline end must be after its start")
-        return BP.BandBaseline(np.sort(sel["onset"].to_numpy(float)), self.bl_t0.value(),
-                               self.bl_t1.value(), self.bl_mode.currentData(), name)
+        sel = sel.sort_values("onset")
+        subjects = sel["subject"].to_numpy() if "subject" in sel else None
+        return BP.BandBaseline(sel["onset"].to_numpy(float), self.bl_t0.value(),
+                               self.bl_t1.value(), self.bl_mode.currentData(), name,
+                               subjects)
 
     def compute_bp(self, then=None):
         groups = self._need_groups()
@@ -797,13 +801,26 @@ class AnalysisTab(QtWidgets.QWidget):
                 notes.append(f"baseline: {len(base_bp)} segments of {seg:.2f} s from "
                              f"{len(np.unique(owner))} “{base.label}” event(s), "
                              f"{base.t0:g}…{base.t1:g} s after")
+                subj_all = sorted({str(x) for ep in eps.values() if ep.metadata is not None
+                                   and "subject" in ep.metadata
+                                   for x in ep.metadata["subject"].fillna("")} - {""})
+                if subj_all:
+                    notes.append(f"normalised per subject ({len(subj_all)}: "
+                                 f"{', '.join(subj_all[:8])}{' …' if len(subj_all) > 8 else ''})")
+                    missing = BP.subjects_without_baseline(base, subj_all)
+                    if missing:
+                        notes.append("⚠ no baseline event for subject(s) "
+                                     f"{', '.join(missing)}: their epochs are left out "
+                                     "of the normalised values")
             ridx = BP.resolve_roi(roi, ch)
             for g, ep in eps.items():
                 bp = BP.band_power(ep, s)
                 out["bp"][g] = bp
                 if base_bp is not None:
+                    subj = (ep.metadata["subject"].to_numpy()
+                            if "subject" in ep.metadata else None)
                     ref, sd = BP.reference_for(ep.metadata["onset"].to_numpy(float), base,
-                                               base_bp, owner)
+                                               base_bp, owner, subj)
                 else:
                     ref = sd = None
                 out["ref"][g], out["sd"][g] = ref, sd
@@ -882,14 +899,21 @@ class AnalysisTab(QtWidgets.QWidget):
 
         def job():
             out = {"band": band, "mode": mode, "curves": {}}
-            lvl = sd = None
+            levels = None
             if base is not None and mode != "absolute":
-                lvl, sd = BP.baseline_timecourse_level(
+                levels = BP.baseline_timecourse_levels(   # per subject
                     raw, base, rng, roi, ref=r["reference"],
                     ch_names=list(next(iter(groups.values())).ch_names))
             for g, ep in groups.items():
                 t, pw = BP.band_timecourse(E.reference_epochs(ep, r["reference"]), rng, roi)
-                if lvl is not None:
+                if levels is not None:
+                    subj = BP._subject_keys(ep.metadata["subject"].to_numpy()
+                                            if ep.metadata is not None
+                                            and "subject" in ep.metadata else None, len(pw))
+                    if set(levels) == {""}:
+                        subj[:] = ""
+                    lvl = np.array([levels.get(x, (np.nan, np.nan))[0] for x in subj])[:, None]
+                    sd = np.array([levels.get(x, (np.nan, np.nan))[1] for x in subj])[:, None]
                     with np.errstate(divide="ignore", invalid="ignore"):
                         pw = {"dB": 10 * np.log10(pw / lvl), "% change": 100 * (pw - lvl) / lvl,
                               "ratio": pw / lvl, "z": (pw - lvl) / sd}[mode]

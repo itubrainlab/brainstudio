@@ -50,12 +50,16 @@ class BandSettings:
 
 @dataclass
 class BandBaseline:
-    """Band-power baseline: ``t0``…``t1`` s after each baseline event onset."""
+    """Band-power baseline: ``t0``…``t1`` s after each baseline event onset.
+
+    ``subjects`` (one per onset) makes the normalisation per subject: an epoch is
+    only ever compared with baseline segments of its own subject."""
     onsets: np.ndarray             # baseline event onsets (s, recording time)
     t0: float = 0.0
     t1: float = 10.0
     mode: str = "mean"             # mean | nearest (most recent preceding event)
     label: str = ""
+    subjects: np.ndarray | None = None
 
 
 # =========================================================================== power
@@ -143,25 +147,68 @@ def baseline_band_power(raw: mne.io.BaseRaw, base: BandBaseline, settings: BandS
     return band_power(ep, s), owner
 
 
+def _subject_keys(values, n: int) -> np.ndarray:
+    """Subject labels as text ("" = unknown); one subject when there are none."""
+    if values is None:
+        return np.full(n, "", dtype=object)
+    v = pd.Series(values).fillna("").astype(str).to_numpy(dtype=object)
+    return v if len(v) == n else np.full(n, "", dtype=object)
+
+
 def reference_for(onsets: np.ndarray, base: BandBaseline, base_bp: np.ndarray,
-                  owner: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+                  owner: np.ndarray, subjects=None) -> tuple[np.ndarray, np.ndarray]:
     """Baseline mean and SD per epoch: (n_epochs, n_ch, n_bands) each.
 
-    ``mode="mean"`` uses all baseline segments; ``"nearest"`` uses the segments
-    of the most recent baseline event before each epoch (or the first one).
+    Normalisation is **per subject**: an epoch of subject *s* only uses baseline
+    segments of baseline events of *s* (``base.subjects`` and the epochs'
+    ``subjects``); without subject labels everything is one subject.
+    ``mode="mean"`` uses all of the subject's baseline segments; ``"nearest"`` the
+    segments of the subject's most recent baseline event before the epoch (or its
+    first one). Epochs whose subject has no baseline get NaN.
     """
-    if base.mode == "nearest" and len(np.unique(owner)) > 1:
-        b_on = np.asarray(base.onsets, float)
-        idx = np.searchsorted(b_on, onsets, side="right") - 1
-        idx = np.clip(idx, 0, len(b_on) - 1)
-        mean = np.stack([np.nanmean(base_bp[owner == k], 0) if (owner == k).any()
-                         else np.nanmean(base_bp, 0) for k in idx])
-        sd = np.stack([np.nanstd(base_bp[owner == k], 0) if (owner == k).sum() > 1
-                       else np.nanstd(base_bp, 0) for k in idx])
-        return mean, sd
-    m, s = np.nanmean(base_bp, 0), np.nanstd(base_bp, 0)
+    onsets = np.asarray(onsets, float)
     n = len(onsets)
-    return np.broadcast_to(m, (n, *m.shape)), np.broadcast_to(s, (n, *s.shape))
+    b_on = np.asarray(base.onsets, float)
+    b_sub = _subject_keys(base.subjects, len(b_on))
+    e_sub = _subject_keys(subjects, n)
+    if not (b_sub != "").any() or not (e_sub != "").any():  # no subject information
+        b_sub, e_sub = np.full(len(b_on), "", object), np.full(n, "", object)
+    seg_sub = b_sub[owner]
+    shape = base_bp.shape[1:]
+    mean = np.full((n, *shape), np.nan)
+    sd = np.full((n, *shape), np.nan)
+    with np.errstate(invalid="ignore"):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            for subj in np.unique(e_sub):
+                ei = np.flatnonzero(e_sub == subj)
+                si = seg_sub == subj
+                if not si.any():
+                    continue  # no baseline for this subject: leave NaN
+                if base.mode == "nearest":
+                    ks = np.flatnonzero(b_sub == subj)          # this subject's events
+                    pos = np.searchsorted(b_on[ks], onsets[ei], side="right") - 1
+                    pick = ks[np.clip(pos, 0, len(ks) - 1)]
+                    for e, k in zip(ei, pick):
+                        own = owner == k
+                        if not own.any():
+                            own = si
+                        mean[e] = np.nanmean(base_bp[own], 0)
+                        sd[e] = np.nanstd(base_bp[own if own.sum() > 1 else si], 0)
+                else:
+                    mean[ei] = np.nanmean(base_bp[si], 0)
+                    sd[ei] = np.nanstd(base_bp[si], 0)
+    return mean, sd
+
+
+def subjects_without_baseline(base: BandBaseline, subjects) -> list[str]:
+    """Subjects of the epochs that have no baseline event."""
+    b = set(_subject_keys(base.subjects, len(base.onsets)))
+    e = set(_subject_keys(subjects, len(subjects) if subjects is not None else 0))
+    if b == {""} or e <= {""}:
+        return []
+    return sorted(e - b)
 
 
 def normalise(bp: np.ndarray, ref: np.ndarray | None, sd: np.ndarray | None,
@@ -292,21 +339,33 @@ def band_timecourse(epochs: mne.BaseEpochs, band: tuple[float, float], picks: li
     return epochs.times, morlet_band(x, epochs.info["sfreq"], band)
 
 
-def baseline_timecourse_level(raw: mne.io.BaseRaw, base: BandBaseline,
-                              band: tuple[float, float], picks: list[str],
-                              seg_len: float = 4.0, ref=None,
-                              ch_names: list[str] | None = None) -> tuple[float, float]:
-    """Mean and SD of the same Morlet band power in the baseline window (edges trimmed).
-    With ``ref``, segments over ``ch_names`` are re-referenced like the epochs first."""
+def baseline_timecourse_levels(raw: mne.io.BaseRaw, base: BandBaseline,
+                               band: tuple[float, float], picks: list[str],
+                               seg_len: float = 4.0, ref=None,
+                               ch_names: list[str] | None = None
+                               ) -> dict[str, tuple[float, float]]:
+    """Mean and SD of the same Morlet band power in the baseline window (edges trimmed),
+    **per subject** (key "" when there are no subject labels). With ``ref``, segments
+    over ``ch_names`` are re-referenced like the epochs first."""
     from .eeg import reference_epochs
     picks = [c for c in picks if c in raw.ch_names and c not in raw.info["bads"]]
     chans = [c for c in (ch_names or picks) if c in raw.ch_names]
-    ep, _ = baseline_epochs(raw, base, max(seg_len, 6.0 / band[0]), chans)
+    ep, owner = baseline_epochs(raw, base, max(seg_len, 6.0 / band[0]), chans)
     ep = reference_epochs(ep, ref)
     p = morlet_band(ep.get_data(picks=picks), ep.info["sfreq"], band)
     trim = int(np.ceil(1.5 / band[0] * ep.info["sfreq"]))
     core = p[:, trim:-trim] if p.shape[1] > 2 * trim + 2 else p
-    return float(np.nanmean(core)), float(np.nanstd(core.mean(1)))
+    seg_sub = _subject_keys(base.subjects, len(base.onsets))[owner]
+    return {str(s): (float(np.nanmean(core[seg_sub == s])),
+                     float(np.nanstd(core[seg_sub == s].mean(1))))
+            for s in np.unique(seg_sub)}
+
+
+def baseline_timecourse_level(raw, base, band, picks, seg_len=4.0, ref=None, ch_names=None
+                              ) -> tuple[float, float]:
+    """Pooled level (all baseline segments); see :func:`baseline_timecourse_levels`."""
+    b = BandBaseline(base.onsets, base.t0, base.t1, base.mode, base.label, None)
+    return baseline_timecourse_levels(raw, b, band, picks, seg_len, ref, ch_names)[""]
 
 
 # =========================================================================== gaze metrics

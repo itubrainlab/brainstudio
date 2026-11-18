@@ -387,7 +387,10 @@ The **EEG** tab is a three-stage pipeline:
 - **Baseline**: a window **after a baseline event**, e.g. 5…115 s after
   `BASELINE_START`.
   - It is cut into segments as long as the analysis window.
-  - Either all baseline events or the most recent one before each epoch is used.
+  - Either all baseline events or the most recent one before each epoch is used,
+    always **per subject**: an epoch is compared only with its own subject's baseline,
+    never with a baseline pooled across subjects. A subject without a baseline event
+    gets no normalised values, and the info line says so.
   - Results can be shown in dB, % change, ratio or z.
 - Bar charts ± SEM, a Morlet time course of the event-related change in a band
   (ERD/ERS) on the same baseline, and MNE topomaps per band, group and difference.
