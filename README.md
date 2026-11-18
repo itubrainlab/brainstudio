@@ -467,29 +467,31 @@ How groups are compared:
   statistics**.
 - Every result exports to CSV or FIF, with a text file recording the settings used.
 
-**Export script…** (ERP, band power and indices) saves a Python script that repeats
-the analysis from the files onwards, in four `# %%` cells: **Loading**,
-**Preprocessing**, **Epoching** and **Analysis**.
+**Export script…** (ERP, band power and indices) saves a stand-alone Python script that
+repeats the analysis from the data files onwards. It needs only the standard libraries
+(MNE, MNE-BIDS, pyxdf, AutoReject, scipy, pandas, numpy — the first lines list them),
+**not brAInStudio**.
 
-- It uses the settings the results on screen were computed with: the files, stream
-  roles, montage, trigger events and gaze offset; the gaze detection and AOIs; the
-  bad channels, filters and the ICA fit with the components removed; the event groups
-  and epoch settings; and the analysis settings. Settings edited afterwards without
-  re-running don't change the script.
-- The standard steps are plain MNE, AutoReject and scipy code: the ICA fit
-  (`mne.preprocessing.ICA` on AutoReject-cleaned 1 s segments), `ica.apply`, the
-  reference and baseline, one `Evoked` per subject, `mne.grand_average`, the paired
-  t-test and `plot_compare_evokeds`. brAInStudio functions are used only where no
-  standard library does the job:
-  - reading XDF with stream roles and clock alignment;
-  - gaze event detection;
-  - the event table and its groups;
-  - the high-pass below 0.5 Hz (MNE's `filter_data` on each stretch between
-    boundaries, because `Raw.filter`'s IIR fails on a boundary at the first sample);
-  - the app's own measure tables (component statistics, band power with per-subject
-    baselines, cognitive indices).
-- The app runs the same functions (`brainstudio.workflow`), and a test checks that an
-  exported script gives the app's preprocessed data, epochs and tables exactly.
+- **Four sections** (`# %%` cells, run one by one in VS Code, Spyder or Jupyter):
+  **1 Loading**, **2 Preprocessing**, **3 Epoching**, **4 Analysis**. Each section
+  starts with a plain-language explanation of what it does with the actual settings
+  (files, filters, ICA, groups, windows, statistics), then the code it needs, then its
+  steps.
+- **Standard code** for the standard steps: the ICA fit (`mne.preprocessing.ICA` on
+  AutoReject-cleaned 1 s segments), `ica.apply`, the montage
+  (`mne.channels.make_dig_montage` with the positions written out),
+  `set_eeg_reference`, `apply_baseline`, one `Evoked` per subject, `mne.grand_average`,
+  `stats.ttest_rel` and `plot_compare_evokeds`.
+- **brAInStudio's own code** where no library does the job (reading XDF with stream
+  roles and clock alignment, BIDS with eye tracking, gaze event detection, the event
+  table and its groups, the epoching report, the measure tables, band-power baselines
+  per subject, cognitive indices) is **copied into the script unchanged**, in a
+  foldable `# region` block per section. Only what the script uses is copied.
+- It uses the settings the results on screen were computed with: settings edited
+  afterwards without re-running don't change the script.
+- Because the app runs exactly that code, the script gives the app's numbers. A test
+  runs an exported script with brAInStudio blocked and checks that the preprocessed
+  data, the epochs and the tables are identical.
 - If the results mix epochs with newer preprocessing or events, the export asks you to
   compute them again first.
 
@@ -638,7 +640,8 @@ src/brainstudio/
   workflow.py        the app's steps as functions: groups, montage, triggers, ERP,
                      band power, time course, indices (the app and scripts call them)
   script.py          exported analysis scripts (Loading / Preprocessing / Epoching /
-                     Analysis)
+                     Analysis), explained section by section
+  bundle.py          copies the brAInStudio code a script uses into it (stand-alone)
   montages/          channel layouts (gtec_64, gtec_unicorn)
   demo.py            synthetic EEG + gaze dataset (BIDS and XDF)
   gui/               PySide6 app: main window, Data/EEG/Gaze tabs, pipeline state,

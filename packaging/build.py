@@ -71,6 +71,9 @@ def main() -> int:
         # ICLabel's network (ONNX) and AutoReject
         "--collect-all", "mne_icalabel", "--collect-all", "onnxruntime",
         "--collect-all", "autoreject",
+        # the source files exported scripts copy their code from (brainstudio.bundle)
+        "--add-data", f"{ROOT / 'src' / 'brainstudio'}/*.py{os.pathsep}brainstudio",
+        "--add-data", f"{ROOT / 'src' / 'brainstudio' / 'io'}/*.py{os.pathsep}brainstudio/io",
         "--hidden-import", "pyxdf", "--hidden-import", "pybv",
         "--exclude-module", "PyQt5", "--exclude-module", "PyQt6",
         "--exclude-module", "tkinter", "--exclude-module", "pytest",

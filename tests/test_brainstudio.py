@@ -739,7 +739,7 @@ def test_script_literals_are_exact_python():
                        recordings={"file": [f"sub-{i:02d}_task-x_eeg.vhdr" for i in range(9)]})
     code = SC.assign("spec = ", spec)
     assert max(len(line) for line in code.splitlines()) <= SC.WIDTH
-    ns = {"W": W}
+    ns = {"GroupSpec": W.GroupSpec}  # scripts hold the class itself, no module prefix
     exec(code, ns)
     assert ns["spec"] == spec
     assert SC.lit(np.float64(0.1)) == "0.1" and SC.lit(np.int64(3)) == "3"
@@ -760,6 +760,10 @@ def test_exported_script_reproduces_the_erp(tmp_path):
     write_bids(root, subjects=("01", "02"))
     runs = bio.scan_bids(root)
     rec = bio.load_bids_runs(root, runs, None)
+    # a layout montage step: the script must give bit-identical electrode positions
+    layout, _ = E.read_channel_layout(E.layout_montages()["gtec_64"])
+    names = layout[:len(rec.raw.ch_names)]
+    W.set_montage(rec, "gtec_64", names)
     det = G.DetectionParams()
     gev = G.detect_events(rec.gaze, det)
     table = EV.build_event_table(rec, gev, None)
@@ -774,14 +778,26 @@ def test_exported_script_reproduces_the_erp(tmp_path):
     spec = W.ErpSpec(["stim", "resp"], E.COMPONENT_PRESETS["P300"], (-0.1, 0.0), "average")
     res = W.run_erp(epochs, spec)
     load = {"steps": [{"kind": "load_bids", "root": str(root),
-                       "runs": [list(r.key) for r in runs], "screen_size": None}],
+                       "runs": [list(r.key) for r in runs], "screen_size": None},
+                      {"kind": "montage", "source": "gtec_64", "names": names}],
             "gaze": {"params": det, "aois": {}}}
     recipe = {"load": load, "groups": specs, "settings": st,
               "pre": {"load": load, "params": pp,
                       "ica": {"steps": fit_raw.fit_steps}}}
     path = tmp_path / "erp.py"
-    path.write_text(SC.build_script("erp", recipe, spec, list(epochs["stim"].ch_names)))
-    g = runpy.run_path(str(path), run_name="exported")
+    path.write_text(SC.build_script("erp", recipe, spec,
+                                    {"ch_names": list(epochs["stim"].ch_names),
+                                     "n_subjects": 2}))
+    src = path.read_text()
+    assert "import brainstudio" not in src and "from brainstudio" not in src
+    import sys
+    saved = {k: v for k, v in sys.modules.items() if k.split(".")[0] == "brainstudio"}
+    for k in saved:  # the script must not need brainstudio
+        sys.modules[k] = None
+    try:
+        g = runpy.run_path(str(path), run_name="exported")
+    finally:
+        sys.modules.update(saved)
     assert np.array_equal(g["clean"].get_data(), clean.get_data())
     assert np.array_equal(g["epochs"]["stim"].get_data(), epochs["stim"].get_data())
     pd.testing.assert_frame_equal(g["summary_table"], res["summary"])

@@ -692,7 +692,9 @@ class AnalysisTab(QtWidgets.QWidget):
         try:
             if kind == "erp":
                 ch = list(next(iter(r["eps"].values())).ch_names)
-                code = SC.build_script("erp", r["recipe"], r["spec"], ch)
+                code = SC.build_script("erp", r["recipe"], r["spec"],
+                                       {"ch_names": ch, "n_subjects":
+                                        len(E.subjects_in(r["eps"]))})
             elif kind == "bandpower":
                 band = self.tc["band"] if self.tc is not None else None
                 code = SC.build_script("bandpower", r["recipe"], r["spec"], band)
