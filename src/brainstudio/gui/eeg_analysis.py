@@ -15,6 +15,7 @@ from PySide6 import QtCore, QtWidgets
 from .. import bandpower as BP
 from .. import eeg as E
 from .. import stats as ST
+from .. import workflow as W
 from .theme import THEME
 from .widgets import (NO_POS, StageHeader, _spin, _themed_plot, fill_table, has_positions,
                       hint, parse_channels)
@@ -24,15 +25,7 @@ def _safe(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(name)) or "group"
 
 
-def _sem(x: np.ndarray, axis=0) -> np.ndarray:
-    """Standard error of the mean, NaN where fewer than two values (no warnings)."""
-    x = np.asarray(x, float)
-    n = np.sum(np.isfinite(x), axis=axis)
-    mean = np.nanmean(np.where(np.isfinite(x), x, 0.0), axis=axis) * np.size(x, axis) \
-        / np.maximum(n, 1)
-    dev = np.where(np.isfinite(x), x - np.expand_dims(mean, axis), 0.0)
-    var = np.sum(dev ** 2, axis=axis) / np.maximum(n - 1, 1)
-    return np.where(n >= 2, np.sqrt(var / np.maximum(n, 1)), np.nan)
+_sem = W.sem  # one implementation, shared with the exported scripts
 
 
 def _bars(plot: pg.PlotItem, xs, means, sems, color, width):
@@ -221,7 +214,8 @@ class AnalysisTab(QtWidgets.QWidget):
         for label, fn in (("Compare evokeds (MNE)…", self.erp_compare),
                           ("Joint plot (MNE)…", self.erp_joint),
                           ("Topomaps (MNE)…", self.erp_topo),
-                          ("Export…", self.erp_export)):
+                          ("Export…", self.erp_export),
+                          ("Export script…", lambda: self.export_script("erp"))):
             bb = QtWidgets.QPushButton(label)
             bb.clicked.connect(fn)
             row.addWidget(bb)
@@ -376,46 +370,14 @@ class AnalysisTab(QtWidgets.QWidget):
                                           "ends.")
             return False
 
+        spec = W.ErpSpec(groups=list(groups), component=comp, baseline=bl,
+                         reference=self._ref_spec(self.erp_ref))
+        epochs, recipe = self.pl.epochs, self.pl.epoch_recipe
+
         def job():
-            notes = []
-            eps = {g: E.reference_epochs(ep, ref) for g, ep in groups.items()}
-            eps = {g: (ep.copy().apply_baseline(bl, verbose="error") if bl else ep)
-                   for g, ep in eps.items()}
-            evokeds = {}
-            for g, ep in eps.items():
-                ev = ep.average()
-                ev.comment = g
-                evokeds[g] = ev
-            summary, per = E.component_analysis(eps, comp)
-            subj = {g: E.epoch_subjects(ep) for g, ep in eps.items()}
-            if any(k is not None for k in subj.values()):
-                per.insert(1, "subject", np.concatenate(
-                    [k if k is not None else np.full(len(ep), "", object)
-                     for k, ep in zip(subj.values(), eps.values())]))
-            group = None
-            if len(E.subjects_in(eps)) >= 2:
-                # several subjects: average each subject's epochs first, then the
-                # subjects' averages with equal weight; subjects are the observations
-                group = E.group_component_analysis(eps, comp)
-                unknown = sum(int((k == "").sum()) for k in subj.values() if k is not None)
-                if unknown:
-                    notes.append(f"⚠ {unknown} epochs without a subject are left out of the "
-                                 "subject averages")
-                diff = group["grand_diff"]
-                return dict(eps=eps, evokeds=group["grand"], summary=group["summary"],
-                            per_epoch=per, diff=diff, roi=list(comp.channels), comp=comp,
-                            baseline=bl, notes=notes, reference=ref_label, group=group)
-            diff = None
-            if len(eps) == 2:
-                (la, a), (lb, b) = eps.items()
-                diff = mne.combine_evoked([evokeds[la], evokeds[lb]], weights=[1, -1])
-                diff.comment = f"{la} − {lb}"
-                ov = len(set(a.events[:, 0]) & set(b.events[:, 0]))
-                if ov:
-                    notes.append(f"⚠ {ov} events are in both groups (tests assume independence)")
-            return dict(eps=eps, evokeds=evokeds, summary=summary, per_epoch=per,
-                        diff=diff, roi=list(comp.channels), comp=comp,
-                        baseline=bl, notes=notes, reference=ref_label, group=group)
+            res = W.run_erp(epochs, spec)
+            res["recipe"] = recipe
+            return res
 
         def done(res):
             self.erp = res
@@ -713,6 +675,38 @@ class AnalysisTab(QtWidgets.QWidget):
         fig.suptitle(f"Mean amplitude at {what} (±{lim:.1f} µV)")
         plt.show()
 
+    def export_script(self, kind: str):
+        """Save a Python script that repeats this analysis from loading onwards, with
+        the settings the results on screen were computed with."""
+        from .. import script as SC
+        r = {"erp": self.erp, "bandpower": self.bp, "indices": self.idx}[kind]
+        title = SC.TITLES[kind]
+        if r is None:
+            QtWidgets.QMessageBox.information(self, title, f"Compute {title.lower()} first.")
+            return
+        if kind != "erp" and not r.get("consistent", False):
+            QtWidgets.QMessageBox.warning(
+                self, title, "These results mix epochs with newer preprocessing or events: "
+                "build the epochs and compute again, then export the script.")
+            return
+        try:
+            if kind == "erp":
+                ch = list(next(iter(r["eps"].values())).ch_names)
+                code = SC.build_script("erp", r["recipe"], r["spec"], ch)
+            elif kind == "bandpower":
+                band = self.tc["band"] if self.tc is not None else None
+                code = SC.build_script("bandpower", r["recipe"], r["spec"], band)
+            else:
+                code = SC.build_script("indices", r["recipe"], (r["bp"]["spec"], r["spec"]))
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self, title, str(e))
+            return
+        fn, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, f"Export {title.lower()} script", f"{kind}_analysis.py", "Python (*.py)")
+        if fn:
+            Path(fn).write_text(code)
+            self.window().statusBar().showMessage(f"Script saved to {fn}", 6000)
+
     def erp_export(self):
         r = self.erp
         if r is None:
@@ -836,7 +830,8 @@ class AnalysisTab(QtWidgets.QWidget):
         row.addWidget(b)
         lv.addLayout(row)
         row = QtWidgets.QHBoxLayout()
-        for label, fn in (("Topomaps (MNE)…", self.bp_topo), ("Export…", self.bp_export)):
+        for label, fn in (("Topomaps (MNE)…", self.bp_topo), ("Export…", self.bp_export),
+                          ("Export script…", lambda: self.export_script("bandpower"))):
             bb = QtWidgets.QPushButton(label)
             bb.clicked.connect(fn)
             row.addWidget(bb)
@@ -923,24 +918,14 @@ class AnalysisTab(QtWidgets.QWidget):
         self.bl_event.setCurrentIndex(i)
         self.bl_event.blockSignals(False)
 
-    def baseline(self) -> BP.BandBaseline | None:
+    def baseline(self) -> W.BaselineSpec | None:
         name = self.bl_event.currentData()
         if not name:
             return None
-        t = self.pl.event_table
-        sel = t[t["name"].astype(str) == name]
-        if self.bl_query.text().strip():
-            from .. import events as EV
-            sel = EV.filter_events(sel, query=self.bl_query.text())
-        if not len(sel):
-            raise ValueError(f"No “{name}” events match the baseline filter")
-        if self.bl_t1.value() <= self.bl_t0.value():
-            raise ValueError("The baseline end must be after its start")
-        sel = sel.sort_values("onset")
-        subjects = sel["subject"].to_numpy() if "subject" in sel else None
-        return BP.BandBaseline(sel["onset"].to_numpy(float), self.bl_t0.value(),
-                               self.bl_t1.value(), self.bl_mode.currentData(), name,
-                               subjects)
+        spec = W.BaselineSpec(name, self.bl_t0.value(), self.bl_t1.value(),
+                              self.bl_mode.currentData(), self.bl_query.text())
+        W.band_baseline(self.pl.event_table, spec)  # raises ValueError when invalid
+        return spec
 
     def compute_bp(self, then=None):
         groups = self._need_groups()
@@ -954,70 +939,25 @@ class AnalysisTab(QtWidgets.QWidget):
         except ValueError as e:
             QtWidgets.QMessageBox.warning(self, "Band power", str(e))
             return False
-        s = BP.BandSettings(bands, self.bp_t0.value(), self.bp_t1.value(),
-                            self.bp_method.currentText())
         try:
-            eeg_ref, ref_label = E.resolve_erp_reference(self._ref_spec(self.bp_ref),
-                                                         list(first.ch_names))
+            E.resolve_erp_reference(self._ref_spec(self.bp_ref), list(first.ch_names))
         except ValueError as e:
             QtWidgets.QMessageBox.warning(self, "Reference", str(e))
             return False
-        mode = self.bl_norm.currentText() if base is not None else "absolute"
-        raw = self.pl.eeg_input()
-        names = list(bands)
+        spec = W.BandPowerSpec(groups=list(groups), bands=bands, tmin=self.bp_t0.value(),
+                               tmax=self.bp_t1.value(), method=self.bp_method.currentText(),
+                               roi=roi, reference=self._ref_spec(self.bp_ref),
+                               baseline=base, norm=self.bl_norm.currentText())
+        raw, table = self.pl.eeg_input(), self.pl.event_table
+        epochs, recipe = self.pl.epochs, self.pl.epoch_recipe
 
         def job():
-            notes = []
-            out = {"bp": {}, "ref": {}, "sd": {}, "norm": {}, "per": [], "bands": bands,
-                   "mode": mode, "roi": roi, "base": base, "settings": s,
-                   "reference": eeg_ref, "reference_label": ref_label}
-            eps = {g: E.reference_epochs(ep, eeg_ref) for g, ep in groups.items()}
-            ch = list(first.ch_names)
-            seg = (min(s.tmax, first.tmax) - max(s.tmin, first.tmin))
-            base_bp = owner = None
-            if base is not None:
-                base_bp, owner = BP.baseline_band_power(raw, base, s, ch, seg, ref=eeg_ref)
-                notes.append(f"baseline: {len(base_bp)} segments of {seg:.2f} s from "
-                             f"{len(np.unique(owner))} “{base.label}” event(s), "
-                             f"{base.t0:g}…{base.t1:g} s after")
-                subj_all = sorted({str(x) for ep in eps.values() if ep.metadata is not None
-                                   and "subject" in ep.metadata
-                                   for x in ep.metadata["subject"].fillna("")} - {""})
-                if subj_all:
-                    notes.append(f"normalised per subject ({len(subj_all)}: "
-                                 f"{', '.join(subj_all[:8])}{' …' if len(subj_all) > 8 else ''})")
-                    missing = BP.subjects_without_baseline(base, subj_all)
-                    if missing:
-                        notes.append("⚠ no baseline event for subject(s) "
-                                     f"{', '.join(missing)}: their epochs are left out "
-                                     "of the normalised values")
-            ridx = BP.resolve_roi(roi, ch)
-            for g, ep in eps.items():
-                bp = BP.band_power(ep, s)
-                out["bp"][g] = bp
-                if base_bp is not None:
-                    subj = (ep.metadata["subject"].to_numpy()
-                            if "subject" in ep.metadata else None)
-                    ref, sd = BP.reference_for(ep.metadata["onset"].to_numpy(float), base,
-                                               base_bp, owner, subj)
-                else:
-                    ref = sd = None
-                out["ref"][g], out["sd"][g] = ref, sd
-                if mode == "dB" and ref is not None:
-                    # dB of ROI-mean power (averaging dB across channels is biased)
-                    val = 10 * np.log10(BP.roi_mean(bp, ridx) / BP.roi_mean(ref, ridx))
-                else:
-                    val = BP.roi_mean(BP.normalise(bp, ref, sd, mode), ridx)
-                out["norm"][g] = BP.normalise(bp, ref, sd, mode)
-                df = pd.DataFrame(val, columns=names)
-                df.insert(0, "group", g)
-                df.insert(1, "onset", ep.metadata["onset"].to_numpy(float))
-                out["per"].append(df)
-            per = pd.concat(out["per"], ignore_index=True)
-            out["per_epoch"] = per
-            out["table"] = ST.comparison_table(per, names, list(eps))
-            out["notes"] = notes
-            return out
+            res = W.run_bandpower(epochs, raw, table, spec)
+            res["recipe"] = recipe
+            # the baseline came from the same data and events as the epochs
+            res["consistent"] = recipe is not None and raw is recipe["data"] \
+                and table is recipe["table"]
+            return res
 
         def done(res):
             self.bp = res
@@ -1071,33 +1011,10 @@ class AnalysisTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.information(self, "Time course", "Compute band power first.")
             return False
         band = self.tc_band.currentText()
-        rng = r["bands"][band]
-        groups = {g: self.pl.epochs[g] for g in r["bp"] if g in self.pl.epochs}
-        raw = self.pl.eeg_input()
-        base, mode, roi = r["base"], r["mode"], r["roi"]
+        epochs, raw = self.pl.epochs, self.pl.eeg_input()
 
         def job():
-            out = {"band": band, "mode": mode, "curves": {}}
-            levels = None
-            if base is not None and mode != "absolute":
-                levels = BP.baseline_timecourse_levels(   # per subject
-                    raw, base, rng, roi, ref=r["reference"],
-                    ch_names=list(next(iter(groups.values())).ch_names))
-            for g, ep in groups.items():
-                t, pw = BP.band_timecourse(E.reference_epochs(ep, r["reference"]), rng, roi)
-                if levels is not None:
-                    subj = BP._subject_keys(ep.metadata["subject"].to_numpy()
-                                            if ep.metadata is not None
-                                            and "subject" in ep.metadata else None, len(pw))
-                    if set(levels) == {""}:
-                        subj[:] = ""
-                    lvl = np.array([levels.get(x, (np.nan, np.nan))[0] for x in subj])[:, None]
-                    sd = np.array([levels.get(x, (np.nan, np.nan))[1] for x in subj])[:, None]
-                    with np.errstate(divide="ignore", invalid="ignore"):
-                        pw = {"dB": 10 * np.log10(pw / lvl), "% change": 100 * (pw - lvl) / lvl,
-                              "ratio": pw / lvl, "z": (pw - lvl) / sd}[mode]
-                out["curves"][g] = (t, np.nanmean(pw, 0), _sem(pw))
-            return out
+            return W.run_timecourse(r, epochs, raw, band)
 
         def done(res):
             self.tc = res
@@ -1233,6 +1150,10 @@ class AnalysisTab(QtWidgets.QWidget):
         bb = QtWidgets.QPushButton("Export…")
         bb.clicked.connect(self.idx_export)
         row.addWidget(bb)
+        bs = QtWidgets.QPushButton("Export script…")
+        bs.setToolTip("A Python script that repeats these indices from loading onwards")
+        bs.clicked.connect(lambda: self.export_script("indices"))
+        row.addWidget(bs)
         lv.addLayout(row)
         lv.addStretch()
         right = QtWidgets.QVBoxLayout()
@@ -1261,33 +1182,18 @@ class AnalysisTab(QtWidgets.QWidget):
         if self.bp is None or set(self.bp["bp"]) != set(self.groups()):
             return self.compute_bp(then=lambda: self.compute_idx(then))
         r = self.bp
-        rois = self.rois()
         chosen = [self.idx_list.item(i).text() for i in range(self.idx_list.count())
                   if self.idx_list.item(i).checkState() == QtCore.Qt.Checked]
-        rec = self.pl.rec
-        gev = self.pl.gaze_events
-        s = r["settings"]
+        spec = W.IndicesSpec(rois=self.rois(), measures=chosen)
+        rec, gev, epochs = self.pl.rec, self.pl.gaze_events, self.pl.epochs
 
         def job():
-            per, notes = [], []
-            for g, bp in r["bp"].items():
-                ep = self.pl.epochs[g]
-                df, n = BP.eeg_indices(bp, list(ep.ch_names), r["bands"], rois, r["ref"][g])
-                notes += [x for x in n if x not in notes]
-                on = ep.metadata["onset"].to_numpy(float)
-                gm = BP.gaze_metrics(on, max(s.tmin, ep.tmin), min(s.tmax, ep.tmax),
-                                     rec.gaze if rec is not None else None, gev)
-                df = pd.concat([df, gm], axis=1)
-                df.insert(0, "group", g)
-                df.insert(1, "onset", on)
-                per.append(df)
-            per = pd.concat(per, ignore_index=True)
-            cols = [c for c in chosen if c in per.columns and per[c].notna().any()]
-            missing = [c for c in chosen if c not in cols]
-            if missing:
-                notes.append("not available: " + ", ".join(missing))
-            table = ST.comparison_table(per, cols, list(r["bp"]))
-            return dict(per_epoch=per, table=table, measures=cols, notes=notes)
+            res = W.run_indices(r, epochs, rec.gaze if rec is not None else None, gev, spec)
+            res["recipe"] = r.get("recipe")
+            res["bp"] = r
+            res["consistent"] = r.get("consistent", False) and gev is \
+                (r.get("recipe") or {}).get("gaze_events", gev)
+            return res
 
         def done(res):
             self.idx = res

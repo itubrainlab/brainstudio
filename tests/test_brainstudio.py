@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from brainstudio import eeg as E
+from brainstudio import events as EV
 from brainstudio import gaze as G
 from brainstudio.demo import simulate, write_bids, write_xdf_demo
 from brainstudio.io import load_bids_run, load_xdf, scan_bids
@@ -728,3 +729,60 @@ def test_subject_spans_merge_runs():
         ("sub-01", 0.0, 20), ("sub-02", 20.0, 35)]
     assert segment_label(segs[1]) == "sub-01 · run-2"
     assert subject_spans([{"start": 0, "end": 5}]) == []
+
+
+def test_script_literals_are_exact_python():
+    from brainstudio import script as SC
+    from brainstudio import workflow as W
+    spec = W.GroupSpec("A", ["stimulus", "x" * 40], query="cond == 'AI'",
+                       conditions=[["subject", "=", "01"]],
+                       recordings={"file": [f"sub-{i:02d}_task-x_eeg.vhdr" for i in range(9)]})
+    code = SC.assign("spec = ", spec)
+    assert max(len(line) for line in code.splitlines()) <= SC.WIDTH
+    ns = {"W": W}
+    exec(code, ns)
+    assert ns["spec"] == spec
+    assert SC.lit(np.float64(0.1)) == "0.1" and SC.lit(np.int64(3)) == "3"
+
+
+def test_exported_script_reproduces_the_erp(tmp_path):
+    """The script exported for an ERP gives the app's preprocessed data, epochs and
+    tables exactly."""
+    import runpy
+
+    from brainstudio import epoching as EP
+    from brainstudio import io as bio
+    from brainstudio import preprocessing as P
+    from brainstudio import script as SC
+    from brainstudio import workflow as W
+    from brainstudio.demo import write_bids
+    root = tmp_path / "bids"
+    write_bids(root, subjects=("01", "02"))
+    runs = bio.scan_bids(root)
+    rec = bio.load_bids_runs(root, runs, None)
+    det = G.DetectionParams()
+    gev = G.detect_events(rec.gaze, det)
+    table = EV.build_event_table(rec, gev, None)
+    ip = P.ICAParams(n_components=8, clean="threshold", iclabel=False)
+    ica, fit_raw = P.fit_ica(rec.raw, [], None, 50.0, ip)
+    pp = P.PreprocParams(ica_exclude=[0])
+    clean = P.run_preprocessing(rec.raw, pp, ica)
+    specs = [W.GroupSpec("stim", ["stimulus"]), W.GroupSpec("resp", ["response"])]
+    st = EP.EpochSettings(autoreject=False)
+    epochs, _ = EP.build_group_epochs(
+        clean, {g.label: W.select_events(table, g) for g in specs}, st, gev.blinks)
+    spec = W.ErpSpec(["stim", "resp"], E.COMPONENT_PRESETS["P300"], (-0.1, 0.0), "average")
+    res = W.run_erp(epochs, spec)
+    load = {"steps": [{"kind": "load_bids", "root": str(root),
+                       "runs": [list(r.key) for r in runs], "screen_size": None}],
+            "gaze": {"params": det, "aois": {}}}
+    recipe = {"load": load, "groups": specs, "settings": st,
+              "pre": {"load": load, "params": pp,
+                      "ica": {"steps": fit_raw.fit_steps}}}
+    path = tmp_path / "erp.py"
+    path.write_text(SC.build_script("erp", recipe, spec, list(epochs["stim"].ch_names)))
+    g = runpy.run_path(str(path), run_name="exported")
+    assert np.array_equal(g["clean"].get_data(), clean.get_data())
+    assert np.array_equal(g["epochs"]["stim"].get_data(), epochs["stim"].get_data())
+    pd.testing.assert_frame_equal(g["summary_table"], res["summary"])
+    pd.testing.assert_frame_equal(g["per_subject"], res["group"]["subjects"])

@@ -125,13 +125,12 @@ def apply_autoreject(epochs: dict[str, mne.Epochs], summary: pd.DataFrame,
     cannot be repaired are dropped. Needs electrode positions and ≥ 10 epochs."""
     import warnings
 
-    from .preprocessing import _has_positions
     summary = summary.copy()
     summary["rejected (AutoReject)"] = 0
     summary["interpolated (AutoReject)"] = 0
     every = list(epochs.values())
     n = sum(len(e) for e in every)
-    if not _has_positions(every[0]):
+    if not E.has_positions(every[0]):
         summary.attrs["autoreject"] = "not applied: the EEG channels have no positions"
         return epochs, summary
     if n < 10:

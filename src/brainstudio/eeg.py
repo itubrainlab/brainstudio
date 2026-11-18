@@ -19,6 +19,14 @@ class FilterParams:
     reference: str | list[str] | None = None
 
 
+def has_positions(inst) -> bool:
+    """True if at least 4 EEG channels of an MNE object have sensor locations."""
+    locs = np.array([ch["loc"][:3] for ch in inst.info["chs"]
+                     if ch["kind"] == mne.io.constants.FIFF.FIFFV_EEG_CH])
+    return len(locs) > 0 and int((np.isfinite(locs).all(1) &
+                                  (np.abs(locs).sum(1) > 0)).sum()) >= 4
+
+
 def eeg_picks(raw: mne.io.BaseRaw) -> np.ndarray:
     picks = mne.pick_types(raw.info, eeg=True, eog=True, ecg=True, emg=True,
                            misc=False, stim=False, exclude=[])
@@ -669,19 +677,6 @@ def _peak(ev: mne.Evoked, chans: list[str], comp: "Component") -> tuple[float, f
     return float(amp) * 1e6, float(lat) * 1000
 
 
-def _rm_anova(y: np.ndarray) -> tuple[float, float, float, float]:
-    """One-way repeated-measures ANOVA on y (subjects × conditions): F, df1, df2, p."""
-    from scipy import stats as sst
-    n, k = y.shape
-    gm = y.mean()
-    ss_c = n * ((y.mean(0) - gm) ** 2).sum()
-    ss_s = k * ((y.mean(1) - gm) ** 2).sum()
-    ss_e = ((y - gm) ** 2).sum() - ss_c - ss_s
-    d1, d2 = k - 1, (k - 1) * (n - 1)
-    f = (ss_c / d1) / (ss_e / d2) if ss_e > 0 else np.nan
-    return float(f), float(d1), float(d2), float(sst.f.sf(f, d1, d2)) if np.isfinite(f) else np.nan
-
-
 def group_component_analysis(groups: dict[str, mne.BaseEpochs], comp: "Component") -> dict:
     """ERP component across subjects, as in group ERP studies: average the epochs of each
     subject first (one Evoked per subject and group), then average those Evokeds with equal
@@ -782,7 +777,10 @@ def group_component_analysis(groups: dict[str, mne.BaseEpochs], comp: "Component
         common = sorted(set.intersection(*[set(v) for v in vals.values()]))
         if len(common) >= 2:
             y = np.array([[vals[g][s] for g in labels] for s in common])
-            f, d1, d2, p = _rm_anova(y)
+            from mne.stats import f_mway_rm
+            fv, pv = f_mway_rm(y[:, :, None], [len(labels)], effects="A", correction=False)
+            f, p = float(fv[0]), float(pv[0])
+            d1, d2 = float(len(labels) - 1), float((len(labels) - 1) * (len(common) - 1))
             fr = sst.friedmanchisquare(*y.T)
             summary.append({"group": "all groups", "subjects": len(common),
                             "test": "repeated-measures ANOVA", "F": f, "df": d1, "df2": d2,

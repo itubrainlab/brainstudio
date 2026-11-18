@@ -195,6 +195,8 @@ class MontageDialog(QtWidgets.QDialog):
     def _accept(self):
         try:
             self.montage = self._get_montage()
+            self.montage_source = None if self.rb_none.isChecked() else (
+                self.builtin.currentText() if self.rb_builtin.isChecked() else self.path.text())
             self.names_out = self.new_names()
             self._trial()
         except Exception as e:

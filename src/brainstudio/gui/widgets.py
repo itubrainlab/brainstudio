@@ -7,6 +7,7 @@ import pandas as pd
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
+from .. import eeg as E
 from .theme import THEME
 
 
@@ -52,12 +53,7 @@ def fill_table(table: QtWidgets.QTableWidget, df: pd.DataFrame, fmt="{:.3g}"):
         table.setUpdatesEnabled(True)
 
 
-def has_positions(inst) -> bool:
-    """True if at least 4 EEG channels of an MNE object have sensor locations."""
-    locs = np.array([ch["loc"][:3] for ch in inst.info["chs"]
-                     if ch["kind"] == 2])  # FIFFV_EEG_CH
-    return len(locs) > 0 and int((np.isfinite(locs).all(1) &
-                                  (np.abs(locs).sum(1) > 0)).sum()) >= 4
+has_positions = E.has_positions
 
 
 NO_POS = ("The EEG channels have no electrode positions. Use File ▸ Channel names & "

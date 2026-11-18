@@ -162,14 +162,19 @@ class ScreenView(pg.PlotWidget):
         for name in list(self.aois):
             self.remove_aoi(name)
 
-    def pygaze_aois(self) -> dict:
-        """Convert ROIs into PyGaze AOI objects."""
+    def aoi_specs(self) -> dict:
+        """AOIs as ``{name: (kind, position, size)}`` in PyGaze's convention
+        (rectangles: top-left corner; ellipses: centre)."""
         out = {}
         for name, roi in self.aois.items():
             (x, y), (w, h) = roi.pos(), roi.size()
             if roi.aoi_kind == "rectangle":
-                out[name] = G.make_aoi("rectangle", (float(x), float(y)), (int(w), int(h)))
+                out[name] = ("rectangle", (float(x), float(y)), (int(w), int(h)))
             else:  # PyGaze ellipses are centred
-                out[name] = G.make_aoi("ellipse", (float(x + w / 2), float(y + h / 2)),
-                                       (int(w), int(h)))
+                out[name] = ("ellipse", (float(x + w / 2), float(y + h / 2)), (int(w), int(h)))
         return out
+
+    def pygaze_aois(self) -> dict:
+        """Convert ROIs into PyGaze AOI objects."""
+        from .. import workflow as W
+        return W.make_aois(self.aoi_specs())

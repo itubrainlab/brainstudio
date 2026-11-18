@@ -304,9 +304,11 @@ class PreprocessTab(QtWidgets.QWidget):
             ba = P.blink_locked_average(clean, blinks, fp)
             return clean, before, after, bb, ba
 
+        recipe = self.pl.snapshot_pre_recipe(p, ica)
+
         def done(res):
             clean, before, after, self._blink_before, self._blink_after = res
-            self.pl.set_clean(clean, p, before, after)
+            self.pl.set_clean(clean, p, before, after, recipe=recipe)
             if then:
                 then()
 
@@ -460,6 +462,8 @@ class PreprocessTab(QtWidgets.QWidget):
         def done(res):
             self.pl.ica, self.pl.ica_fit_raw, self.pl.ica_scores, self.pl.ica_sources = res
             self.pl.ica_key = (tuple(bads), h, notch, tmin)
+            self.pl.ica_spec = dict(bads=list(bads), h_freq=h, notch=notch, params=ip,
+                                    tmin=tmin, steps=dict(self.pl.ica_fit_raw.fit_steps))
             self._fill_ica_table(use_suggested=True)
             self.pl.mark_stale("preprocessing")
             if self.ica_table.rowCount():

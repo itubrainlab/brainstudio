@@ -7,6 +7,7 @@ import pandas as pd
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
+from .. import workflow as W
 from ..epoching import EpochSettings, build_group_epochs
 from .eventselect import EventSelector
 from .theme import THEME
@@ -318,15 +319,22 @@ class EpochTab(QtWidgets.QWidget):
         return {lst.item(i).data(QtCore.Qt.UserRole) for i in range(lst.count())
                 if lst.item(i).checkState() == QtCore.Qt.Checked}
 
+    def group_spec(self, sel: EventSelector) -> W.GroupSpec:
+        """A group as plain settings: ticked names, filters and the ticked
+        subjects/sessions/runs/files."""
+        recs = {}
+        for col, lst in self._rec_lists.items():
+            keep = self.rec_selection(col)
+            if keep is not None and lst.count():
+                recs[col] = sorted(keep)
+        return W.GroupSpec(label=sel.label(), names=sorted(sel.checked_names()),
+                           text=sel.text.text(), query=sel.query.text(),
+                           conditions=[list(c) for c in sel.conditions()], recordings=recs)
+
     def rows_for(self, sel: EventSelector):
         """A group's events, limited to the ticked subjects/sessions/runs/files
         (raises ValueError for invalid filters)."""
-        df = sel.selected()
-        for col, lst in self._rec_lists.items():
-            keep = self.rec_selection(col)
-            if col in df and keep is not None and lst.count():
-                df = df[df[col].fillna("").astype(str).isin(keep)]
-        return df
+        return W.select_events(sel.table, self.group_spec(sel))
 
     def _recordings_changed(self, *_):
         for s in self._selectors:
@@ -375,9 +383,10 @@ class EpochTab(QtWidgets.QWidget):
         if len(set(labels)) != len(labels):
             QtWidgets.QMessageBox.warning(self, "Epochs", "Group labels must be unique.")
             return False
-        groups, desc = {}, {}
+        groups, desc, specs = {}, {}, []
         for s in self._selectors:
             try:
+                specs.append(self.group_spec(s))
                 rows = self.rows_for(s)
             except ValueError as e:
                 QtWidgets.QMessageBox.warning(self, "Event filter", f"{s.label()}: {e}")
@@ -401,10 +410,12 @@ class EpochTab(QtWidgets.QWidget):
                 return False
         blinks = self.pl.gaze_events.blinks if self.pl.gaze_events is not None else None
         self._selected = groups
+        # what these epochs come from, for scripts that reproduce them
+        recipe = self.pl.snapshot_epoch_recipe(raw, specs, st)
 
         def done(res):
             epochs, summary = res
-            self.pl.set_epochs(epochs, summary, st, desc)
+            self.pl.set_epochs(epochs, summary, st, desc, recipe=recipe)
             if not epochs:
                 QtWidgets.QMessageBox.warning(self, "Epochs", "All epochs were dropped — check "
                                               "the rejection threshold and the selection.")

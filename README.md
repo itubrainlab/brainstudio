@@ -467,6 +467,32 @@ How groups are compared:
   statistics**.
 - Every result exports to CSV or FIF, with a text file recording the settings used.
 
+**Export script…** (ERP, band power and indices) saves a Python script that repeats
+the analysis from the files onwards, in four `# %%` cells: **Loading**,
+**Preprocessing**, **Epoching** and **Analysis**.
+
+- It uses the settings the results on screen were computed with: the files, stream
+  roles, montage, trigger events and gaze offset; the gaze detection and AOIs; the
+  bad channels, filters and the ICA fit with the components removed; the event groups
+  and epoch settings; and the analysis settings. Settings edited afterwards without
+  re-running don't change the script.
+- The standard steps are plain MNE, AutoReject and scipy code: the ICA fit
+  (`mne.preprocessing.ICA` on AutoReject-cleaned 1 s segments), `ica.apply`, the
+  reference and baseline, one `Evoked` per subject, `mne.grand_average`, the paired
+  t-test and `plot_compare_evokeds`. brAInStudio functions are used only where no
+  standard library does the job:
+  - reading XDF with stream roles and clock alignment;
+  - gaze event detection;
+  - the event table and its groups;
+  - the high-pass below 0.5 Hz (MNE's `filter_data` on each stretch between
+    boundaries, because `Raw.filter`'s IIR fails on a boundary at the first sample);
+  - the app's own measure tables (component statistics, band power with per-subject
+    baselines, cognitive indices).
+- The app runs the same functions (`brainstudio.workflow`), and a test checks that an
+  exported script gives the app's preprocessed data, epochs and tables exactly.
+- If the results mix epochs with newer preprocessing or events, the export asks you to
+  compute them again first.
+
 ## The Gaze tab
 
 - Fixation, saccade and blink summary.
@@ -609,6 +635,10 @@ src/brainstudio/
   epoching.py        event groups → mne.Epochs, EEG delay, rejection report
   bandpower.py       band power, baselines, cognitive indices, gaze metrics
   stats.py           group comparisons (Welch, Mann-Whitney, ANOVA, Hedges g, FDR)
+  workflow.py        the app's steps as functions: groups, montage, triggers, ERP,
+                     band power, time course, indices (the app and scripts call them)
+  script.py          exported analysis scripts (Loading / Preprocessing / Epoching /
+                     Analysis)
   montages/          channel layouts (gtec_64, gtec_unicorn)
   demo.py            synthetic EEG + gaze dataset (BIDS and XDF)
   gui/               PySide6 app: main window, Data/EEG/Gaze tabs, pipeline state,

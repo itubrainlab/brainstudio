@@ -149,8 +149,13 @@ def _iir_highpass(raw: mne.io.BaseRaw, l_freq: float, picks) -> None:
             iir_params=IIR_PARAMS, verbose="error")
 
 
-def _filtered(raw: mne.io.BaseRaw, l_freq, h_freq, notch, picks=None,
-              tmin: float | None = None) -> mne.io.BaseRaw:
+def filtered_copy(raw: mne.io.BaseRaw, l_freq, h_freq, notch, picks=None,
+                  tmin: float | None = None) -> mne.io.BaseRaw:
+    """A filtered copy of ``raw`` (``picks`` only, from ``tmin`` s): MNE's ``Raw.filter``
+    and ``Raw.notch_filter`` on the EEG/EOG/ECG/EMG channels. A high-pass below 0.5 Hz
+    is a zero-phase 4th-order Butterworth applied with MNE's ``filter_data`` to each
+    stretch between boundaries (``Raw.filter``'s IIR path fails on a boundary at the
+    first sample, which joined BIDS runs and cropped data have)."""
     out = raw.copy().load_data()
     if picks is not None:
         out.pick(picks)
@@ -208,6 +213,7 @@ def fit_ica(raw: mne.io.BaseRaw, bads=(), h_freq=None, notch=None,
     if len(chans) < 3:
         raise ValueError("ICA needs at least 3 good EEG channels")
     h = p.h_freq if h_freq is None else h_freq
+    start = _start_sample(raw, tmin) / raw.info["sfreq"]
     fit_raw = _filtered(raw, max(p.l_freq, 0.1), h, notch, picks=chans, tmin=tmin)
     # ``chans`` are the channels the user kept: the file's own bad list (e.g. BIDS
     # channels.tsv) must not drop any of them again inside ICA.fit
@@ -215,7 +221,7 @@ def fit_ica(raw: mne.io.BaseRaw, bads=(), h_freq=None, notch=None,
     # average reference, as ICLabel expects (it does not change what ICA removes: the
     # common mode is not a component of average-referenced data)
     fit_raw.set_eeg_reference("average", projection=False, verbose="error")
-    fit_raw.recording_t0 = _start_sample(raw, tmin) / raw.info["sfreq"]
+    fit_raw.recording_t0 = start
     decim = max(1, int(fit_raw.info["sfreq"] // p.target_sfreq))
     if decim > 1:
         fit_raw.resample(fit_raw.info["sfreq"] / decim, verbose="error")
@@ -227,35 +233,33 @@ def fit_ica(raw: mne.io.BaseRaw, bads=(), h_freq=None, notch=None,
             import picard  # noqa: F401
         except ImportError:
             method = "infomax"
+    fit_params = (dict(ortho=False, extended=True) if method == "picard" else
+                  dict(extended=True) if method == "infomax" else None)
     ica = mne.preprocessing.ICA(n_components=nc, method=method, rng=p.seed,
-                                max_iter=p.max_iter,
-                                fit_params=dict(ortho=False, extended=True)
-                                if method == "picard" else
-                                dict(extended=True) if method == "infomax" else None)
-    fit_raw.fit_note = ""
+                                max_iter=p.max_iter, fit_params=fit_params)
     notes = []
     # 1 s segments; bad ones (AutoReject, or a peak-to-peak threshold) are left out
-    events = mne.make_fixed_length_events(fit_raw, duration=1.0)
-    seg = mne.Epochs(fit_raw, events, tmin=0.0, tmax=1.0, baseline=None, preload=True,
-                     reject_by_annotation=True, verbose="error")
-    good = np.ones(len(seg), bool)
-    if p.clean == "autoreject" and len(seg) >= 20 and _has_positions(seg):
+    seg = ica_segments(fit_raw)
+    how = "all"
+    if p.clean == "autoreject" and len(seg) >= 20 and E.has_positions(seg):
         try:
-            good = ~autoreject_bad_segments(seg, p)
+            good = ~autoreject_bad_segments(seg, p.seed, p.autoreject_max_epochs)
+            how = "autoreject"
             notes.append(f"AutoReject left out {int((~good).sum())} of {len(seg)} 1 s "
                          "segments")
         except Exception as e:  # noqa: BLE001
             notes.append(f"AutoReject failed ({type(e).__name__}), threshold used")
-            good = _ptp_good(seg, p.reject_uv)
+            good, how = ptp_good_segments(seg, p.reject_uv), "threshold"
     else:
         if p.clean == "autoreject":
             notes.append("AutoReject needs electrode positions and ≥ 20 segments: "
                          "peak-to-peak threshold used")
-        good = _ptp_good(seg, p.reject_uv)
+        good, how = ptp_good_segments(seg, p.reject_uv), "threshold"
     if good.sum() < max(10, len(good) // 10):
         notes.insert(0, f"only {int(good.sum())} of {len(good)} 1 s segments were clean "
                         "(noisy channels kept?), so ICA was fitted on all of them")
         good[:] = True
+        how = "all"
     fit_on = seg[np.flatnonzero(good)]
     every = max(p.decim, int(np.ceil(len(fit_on) * len(fit_on.times) / p.max_samples)))
     if every > p.decim:
@@ -271,42 +275,51 @@ def fit_ica(raw: mne.io.BaseRaw, bads=(), h_freq=None, notch=None,
         except Exception as e:  # noqa: BLE001
             notes.append(f"ICLabel not run: {e}")
     fit_raw.fit_note = "; ".join(notes)
+    # every decision taken, so an exported script can repeat exactly this fit
+    fit_raw.fit_steps = dict(
+        chans=list(chans), l_freq=max(p.l_freq, 0.1), h_freq=h, notch=notch,
+        tmin=start or None, resample=(fit_raw.info["sfreq"] if decim > 1 else None),
+        n_components=nc, method=method, fit_params=fit_params, max_iter=p.max_iter,
+        seed=p.seed, segments=how, reject_uv=p.reject_uv,
+        autoreject_max=p.autoreject_max_epochs, decim=every)
     return ica, fit_raw
 
 
-def _has_positions(inst) -> bool:
-    locs = np.array([ch["loc"][:3] for ch in inst.info["chs"]])
-    return bool(len(locs)) and int((np.isfinite(locs).all(1) &
-                                    (np.abs(locs).sum(1) > 0)).sum()) >= 4
+def ica_segments(fit_raw: mne.io.BaseRaw) -> mne.Epochs:
+    """The ICA data cut into 1 s segments (ERP guide)."""
+    events = mne.make_fixed_length_events(fit_raw, duration=1.0)
+    return mne.Epochs(fit_raw, events, tmin=0.0, tmax=1.0, baseline=None, preload=True,
+                      reject_by_annotation=True, verbose="error")
 
 
-def _ptp_good(seg: mne.BaseEpochs, reject_uv) -> np.ndarray:
-    if not reject_uv:
-        return np.ones(len(seg), bool)
-    x = seg.get_data()
-    return np.ptp(x, axis=2).max(1) <= reject_uv * 1e-6
+def ptp_good_segments(seg: mne.BaseEpochs, reject_uv) -> np.ndarray:
+    """Segments within a peak-to-peak threshold (MNE's ``drop_bad``)."""
+    good = np.ones(len(seg), bool)
+    if reject_uv:
+        kept = seg.copy().drop_bad(reject=dict(eeg=reject_uv * 1e-6), verbose="error")
+        good[:] = False
+        good[np.searchsorted(seg.selection, kept.selection)] = True
+    return good
 
 
-def autoreject_bad_segments(epochs: mne.BaseEpochs, p: ICAParams) -> np.ndarray:
+def autoreject_bad_segments(epochs: mne.BaseEpochs, seed: int = 42,
+                            max_fit: int = 600) -> np.ndarray:
     """AutoReject (``n_interpolate=[1, 2, 4]``, ``random_state=42``) marks bad segments;
-    fitted on at most ``p.autoreject_max_epochs`` of them so long recordings stay quick."""
-    from autoreject import AutoReject
-    ar = AutoReject(n_interpolate=[1, 2, 4], random_state=p.seed, n_jobs=1, verbose=False,
-                    picks=mne.pick_types(epochs.info, eeg=True, eog=False))
+    fitted on at most ``max_fit`` of them so long recordings stay quick."""
     import warnings
+
+    from autoreject import AutoReject
+    ar = AutoReject(n_interpolate=[1, 2, 4], random_state=seed, n_jobs=1, verbose=False,
+                    picks=mne.pick_types(epochs.info, eeg=True, eog=False))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return _autoreject_fit(ar, epochs, p)
-
-
-def _autoreject_fit(ar, epochs, p) -> np.ndarray:
-    n = len(epochs)
-    if n > p.autoreject_max_epochs:
-        pick = np.random.default_rng(p.seed).choice(n, p.autoreject_max_epochs, replace=False)
-        ar.fit(epochs[np.sort(pick)])
-    else:
-        ar.fit(epochs)
-    return np.asarray(ar.get_reject_log(epochs).bad_epochs, bool)
+        n = len(epochs)
+        if n > max_fit:
+            ar.fit(epochs[np.sort(np.random.default_rng(seed).choice(n, max_fit,
+                                                                     replace=False))])
+        else:
+            ar.fit(epochs)
+        return np.asarray(ar.get_reject_log(epochs).bad_epochs, bool)
 
 
 #: ICLabel classes (MNE-ICALabel)
@@ -320,7 +333,7 @@ def iclabel(raw: mne.io.BaseRaw, ica: mne.preprocessing.ICA, chans: list[str], n
     trained on 1–100 Hz, average-referenced data, so it gets such a copy of the channels
     the ICA was fitted on."""
     from mne_icalabel import label_components
-    if not _has_positions(raw.copy().pick(chans)):
+    if not E.has_positions(raw.copy().pick(chans)):
         raise ValueError("the EEG channels have no electrode positions (load a montage)")
     nyq = raw.info["sfreq"] / 2
     lab_raw = _filtered(raw, 1.0, min(100.0, nyq - 1), notch, picks=chans, tmin=tmin)
@@ -502,3 +515,6 @@ def blink_locked_average(raw: mne.io.BaseRaw, blinks: pd.DataFrame, channels,
     seg = np.stack([x[o + i0:o + i1] for o in on[:2000]])
     seg -= seg[:, : -i0].mean(1, keepdims=True) if i0 < 0 else 0
     return np.arange(i0, i1) / sf, seg.mean(0)
+
+
+_filtered = filtered_copy  # older name
