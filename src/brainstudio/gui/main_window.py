@@ -683,7 +683,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_events()
         self._rebuild_event_table()
         self.gaze_tab.update_gaze_stats()
-        if rec.raw is not None:  # default preprocessing (1–40 Hz) so the viewer is filtered
+        if rec.raw is not None:  # default preprocessing (0.1–30 Hz, 50 Hz notch) for the viewer
             self.pre_tab.run()
         win = min(self.win_len.value(), max(rec.duration, 0.5))
         if rec.raw is None and rec.has_gaze:

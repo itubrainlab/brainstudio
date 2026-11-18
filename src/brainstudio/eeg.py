@@ -12,9 +12,9 @@ import pandas as pd
 
 @dataclass
 class FilterParams:
-    l_freq: float | None = 1.0
-    h_freq: float | None = 40.0
-    notch: float | None = None  # e.g. 50 or 60 Hz
+    l_freq: float | None = 0.1
+    h_freq: float | None = 30.0
+    notch: float | None = 50.0  # 50 or 60 Hz (None = off)
     # None (keep as recorded), "average", or channel name(s): "Cz" / "M1, M2"
     reference: str | list[str] | None = None
 

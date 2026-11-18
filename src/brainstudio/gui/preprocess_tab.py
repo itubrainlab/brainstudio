@@ -99,14 +99,15 @@ class PreprocessTab(QtWidgets.QWidget):
         # ---------------------------------------------------------------- filters
         box = QtWidgets.QGroupBox("Filtering && reference")
         f = QtWidgets.QFormLayout(box)
-        self.hp = _spin(0, 100, 1.0, 0.05, 3, " Hz")
+        self.hp = _spin(0, 100, 0.1, 0.05, 3, " Hz")
         self.hp.setToolTip("High-pass cut-off; 0 = no high-pass (DC kept). Below 0.5 Hz a "
                            "zero-phase 4th-order Butterworth (IIR) is used, above it MNE's FIR.")
-        self.lp = _spin(0, 1000, 40.0, 1, 1, " Hz")
+        self.lp = _spin(0, 1000, 30.0, 1, 1, " Hz")
         self.hp.setSpecialValueText("0 Hz (off)")
         self.lp.setSpecialValueText("off")
         self.notch = QtWidgets.QComboBox()
         self.notch.addItems(["off", "50 Hz", "60 Hz"])
+        self.notch.setCurrentText("50 Hz")  # default; a BIDS PowerLineFrequency overrides it
         f.addRow("High-pass", self.hp)
         f.addRow("Low-pass", self.lp)
         f.addRow("Notch", self.notch)

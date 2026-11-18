@@ -29,9 +29,9 @@ class BadChannelParams:
     window: float = 1.0           # s
     max_bad_fraction: float = 0.2  # channel is bad above this fraction of bad windows
     z_thresh: float = 4.0         # robust z of log median ptp across channels
-    l_freq: float | None = 1.0    # band-pass before measuring, so drifts and line
-    h_freq: float | None = 40.0   # noise don't count as "noisy"
-    notch: float | None = None
+    l_freq: float | None = 0.1    # band-pass before measuring, so drifts and line
+    h_freq: float | None = 30.0   # noise don't count as "noisy"
+    notch: float | None = 50.0
 
 
 def _eeg_idx(raw: mne.io.BaseRaw) -> np.ndarray:
@@ -329,9 +329,9 @@ def score_blink_components(ica: mne.preprocessing.ICA, fit_raw: mne.io.BaseRaw,
 @dataclass
 class PreprocParams:
     bads: list[str] = field(default_factory=list)
-    l_freq: float | None = 1.0
-    h_freq: float | None = 40.0
-    notch: float | None = None
+    l_freq: float | None = 0.1    # default band-pass 0.1–30 Hz with a 50 Hz notch
+    h_freq: float | None = 30.0
+    notch: float | None = 50.0
     reference: str | list[str] | None = None
     ica_exclude: list[int] = field(default_factory=list)
     interpolate_bads: bool = False

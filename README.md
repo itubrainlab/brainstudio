@@ -305,6 +305,8 @@ The **EEG** tab is a three-stage pipeline:
   - Bad channels are left out of ICA, the average reference, epochs and statistics, or
     are interpolated with spherical splines.
 - **Filtering and reference.**
+  - Default: **0.1–30 Hz** band-pass with a **50 Hz** notch. A BIDS dataset's
+    `PowerLineFrequency` sets the notch (e.g. 60 Hz).
   - High-pass from **0 Hz (off)** upwards. Below 0.5 Hz it is a zero-phase 4th-order
     Butterworth (IIR); above that, MNE's FIR.
   - Low-pass and notch.

@@ -498,7 +498,7 @@ def test_iir_highpass_with_boundary_at_data_edge():
     for onset in (0.0, raw.times[-1] + 1 / sf):
         r = raw.copy()
         r.set_annotations(mne.Annotations([onset], [0], ["EDGE boundary"]))
-        out = P.run_preprocessing(r, P.PreprocParams(l_freq=0.1, h_freq=40))
+        out = P.run_preprocessing(r, P.PreprocParams(l_freq=0.1, h_freq=40, notch=None))
         assert np.allclose(out.get_data(), ref.get_data(), atol=1e-12)
 
 
