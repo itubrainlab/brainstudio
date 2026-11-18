@@ -629,3 +629,31 @@ def test_epoch_summary_counts_each_reason():
     assert r["kept"] + r["outside recording"] + r["same sample"] + r["over cap"] \
         + r["rejected (amplitude)"] + r["rejected (BAD annotation)"] == r["selected"]
     assert "outside/dup" not in summ
+
+
+def test_erp_reference_from_the_literature(demo):
+    """Each component gets its conventional reference; mastoids fall back to average."""
+    import mne
+    from brainstudio import epoching as EP
+    from brainstudio import events as EV
+    assert E.resolve_erp_reference("literature", ["Cz", "TP9", "TP10"], "P300")[0] == \
+        ["TP9", "TP10"]
+    assert E.resolve_erp_reference("literature", ["Cz", "TP9", "TP10"], "N170")[0] == "average"
+    ref, label = E.resolve_erp_reference("literature", ["Fz", "Cz", "Pz"], "N400")
+    assert ref == "average" and "no good mastoid pair" in label
+    assert E.resolve_erp_reference("recorded", ["Cz"])[0] is None
+    with pytest.raises(ValueError, match="not among"):
+        E.resolve_erp_reference("M1, M2", ["Cz", "Pz"])
+    rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
+    raw = rec.raw.copy().load_data().pick("eeg")
+    tab = EV.build_event_table(rec)
+    eps, _ = EP.build_group_epochs(raw, {"s": tab[tab.name == "stimulus"]},
+                                   EP.EpochSettings(-0.2, 0.8, None))
+    avg = E.reference_epochs(eps["s"], "average")
+    assert np.allclose(avg.get_data().mean(1), 0, atol=1e-12)        # average reference
+    assert E.reference_epochs(eps["s"], None) is eps["s"]             # as recorded
+    assert np.allclose(eps["s"].get_data().mean(1), eps["s"].get_data().mean(1))
+    pair = E.reference_epochs(eps["s"], ["T7", "T8"])
+    assert np.allclose(pair.get_data(picks=["T7"]) + pair.get_data(picks=["T8"]), 0,
+                       atol=1e-12)                                    # mean of T7/T8 = 0
+    _ = mne

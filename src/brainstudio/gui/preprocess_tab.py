@@ -107,17 +107,12 @@ class PreprocessTab(QtWidgets.QWidget):
         self.lp.setSpecialValueText("off")
         self.notch = QtWidgets.QComboBox()
         self.notch.addItems(["off", "50 Hz", "60 Hz"])
-        self.ref = QtWidgets.QComboBox()
-        self.ref.setEditable(True)
-        self.ref.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
-        self.ref.setToolTip("keep = as recorded · average = common average (bad channels "
-                            "left out) · a channel, or several separated by commas (their "
-                            "mean, e.g. M1, M2)")
-        self.ref.addItems(["keep", "average"])
         f.addRow("High-pass", self.hp)
         f.addRow("Low-pass", self.lp)
         f.addRow("Notch", self.notch)
-        f.addRow("Reference", self.ref)
+        f.addRow(hint("The data keep their recorded reference here. Each analysis chooses "
+                      "its own: ERPs the reference conventional for the component, band "
+                      "power the average reference (③ Analysis)."))
         lay.addWidget(box)
 
         # ---------------------------------------------------------------- ICA
@@ -188,8 +183,7 @@ class PreprocessTab(QtWidgets.QWidget):
         stale = lambda *_: self.pl.mark_stale("preprocessing")  # noqa: E731
         for w in (self.hp, self.lp):
             w.valueChanged.connect(stale)
-        for w in (self.notch, self.ref):
-            w.currentTextChanged.connect(stale)
+        self.notch.currentTextChanged.connect(stale)
         for w in (self.interp, self.ica_on):
             w.toggled.connect(stale)
         self.ica_table.itemChanged.connect(stale)
@@ -252,7 +246,7 @@ class PreprocessTab(QtWidgets.QWidget):
         exclude = self.ica_excluded() if self.ica_on.isChecked() else []
         return P.PreprocParams(bads=self.bads(), l_freq=self.hp.value() or None,
                                h_freq=self.lp.value() or None, notch=notch,
-                               reference=self.ref.currentText(), ica_exclude=exclude,
+                               reference=None, ica_exclude=exclude,
                                interpolate_bads=self.interp.isChecked())
 
     def run(self, then=None) -> bool:
@@ -260,16 +254,6 @@ class PreprocessTab(QtWidgets.QWidget):
         if raw is None:
             return False
         p = self.params()
-        try:
-            E.parse_reference(p.reference, raw)
-        except ValueError as e:
-            QtWidgets.QMessageBox.warning(self, "Reference", str(e))
-            return False
-        ref_names = E.parse_reference(p.reference, raw)
-        if isinstance(ref_names, list) and set(ref_names) & set(p.bads):
-            QtWidgets.QMessageBox.warning(self, "Reference",
-                                          "The reference channel is marked bad.")
-            return False
         if p.interpolate_bads and p.bads and not has_positions(raw):
             QtWidgets.QMessageBox.information(self, "Interpolation", NO_POS)
             p.interpolate_bads = False
@@ -399,17 +383,10 @@ class PreprocessTab(QtWidgets.QWidget):
                                z_thresh=self.ptp_z.value() or np.inf,
                                l_freq=self.hp.value() or None, h_freq=self.lp.value() or None,
                                notch=notch)
-        ref = self.ref.currentText()
 
         def done(df):
             self._stats = df
-            try:  # never flag the chosen reference channel(s) for being flat
-                refs = E.parse_reference(ref, raw)
-            except ValueError:
-                refs = None
             bads = df.loc[df["bad"], "channel"].tolist()
-            if isinstance(refs, list):
-                bads = [b for b in bads if b not in refs]
             # detection adds to the channels the dataset already marks bad
             keep = [b for b in self.bads() if b in self.dataset_bads()]
             self.pl.params.bads = keep + [b for b in bads if b not in keep]
@@ -423,22 +400,7 @@ class PreprocessTab(QtWidgets.QWidget):
 
     # ================================================================== reference
     def refresh_reference_choices(self):
-        cur = self.ref.currentText()
-        raw = self.pl.raw
-        names = ([raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude=[])]
-                 if raw is not None else [])
-        self.ref.blockSignals(True)
-        self.ref.clear()
-        self.ref.addItems(["keep", "average"])
-        if names:
-            self.ref.insertSeparator(2)
-            self.ref.addItems(names)
-        try:
-            ok = raw is not None and E.parse_reference(cur, raw) is not None
-        except ValueError:
-            ok = False
-        self.ref.setCurrentText(cur if ok or cur in ("keep", "average") else "keep")
-        self.ref.blockSignals(False)
+        """Kept for callers: the reference is chosen in the analyses now."""
 
     # ================================================================== ICA
     def _frontal(self, raw, bads):

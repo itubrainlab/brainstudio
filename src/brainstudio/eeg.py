@@ -621,3 +621,81 @@ def rejection_causes(epochs: mne.BaseEpochs) -> dict[str, int]:
             if r in epochs.ch_names:
                 counts[r] = counts.get(r, 0) + 1
     return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
+# =========================================================================== ERP references
+#: Mastoid-like channel pairs, in order of preference (10-05 names)
+MASTOID_PAIRS = (("M1", "M2"), ("TP9", "TP10"), ("A1", "A2"), ("P9", "P10"))
+
+#: Conventional reference per ERP component, with where it comes from. ERP CORE
+#: (Kappenman et al., 2021) references every component to the average of P9/P10 (near
+#: the mastoids) except the N170, which uses the average reference.
+COMPONENT_REFERENCE = {
+    "P1": ("average", "average reference, usual for posterior visual components "
+                      "(Luck, 2014)"),
+    "N1": ("mastoids", "averaged mastoids (Luck, 2014; Näätänen & Picton, 1987)"),
+    "N170": ("average", "average reference (ERP CORE, Kappenman et al., 2021; Joyce & "
+                        "Rossion, 2005: the N170 depends strongly on the reference)"),
+    "P2": ("mastoids", "averaged mastoids (Luck, 2014)"),
+    "N2": ("mastoids", "averaged mastoids (ERP CORE, Kappenman et al., 2021)"),
+    "MMN": ("mastoids", "averaged mastoids, where the MMN inverts (ERP CORE; Näätänen "
+                        "et al., 2007; a nose reference is the alternative)"),
+    "P300": ("mastoids", "linked/averaged mastoids (ERP CORE; Polich, 2007)"),
+    "N400": ("mastoids", "averaged mastoids (ERP CORE; Kutas & Federmeier, 2011)"),
+    "LPP": ("mastoids", "averaged mastoids (Hajcak et al., 2010)"),
+}
+
+
+def mastoid_channels(ch_names: list[str]) -> list[str] | None:
+    """The first mastoid-like pair present (M1/M2, TP9/TP10, A1/A2, P9/P10)."""
+    lower = {c.lower(): c for c in ch_names}
+    for a, b in MASTOID_PAIRS:
+        if a.lower() in lower and b.lower() in lower:
+            return [lower[a.lower()], lower[b.lower()]]
+    return None
+
+
+def resolve_erp_reference(spec: str, ch_names: list[str], component: str = ""
+                          ) -> tuple[str | list[str] | None, str]:
+    """Turn a reference choice into what ``set_eeg_reference`` needs, plus a label.
+
+    ``spec``: "literature" (the component's conventional reference), "recorded",
+    "average", "mastoids", or channel name(s) "Cz" / "M1, M2". The data are the
+    epochs' (good) channels, so a bad mastoid is simply not found. Without a
+    mastoid pair, mastoids fall back to the average reference (said in the label).
+    """
+    s = (spec or "").strip()
+    why = ""
+    if s.lower() == "literature":
+        kind, why = COMPONENT_REFERENCE.get(component, ("average", "average reference "
+                                                                    "(custom component)"))
+        s = kind
+    low = s.lower()
+    if low in ("recorded", "keep", "as recorded", ""):
+        return None, "as recorded"
+    if low in ("average", "avg", "car"):
+        return "average", why or "average reference"
+    if low == "mastoids":
+        pair = mastoid_channels(ch_names)
+        if pair is None:
+            return "average", ("average reference — no good mastoid pair (M1/M2, TP9/TP10, "
+                               "A1/A2, P9/P10) among the channels"
+                               + (f"; the literature uses {why}" if why else ""))
+        return pair, f"mean of {'+'.join(pair)}" + (f" — {why}" if why else "")
+    names = [n for n in s.replace(";", ",").replace(",", " ").split() if n]
+    lower = {c.lower(): c for c in ch_names}
+    missing = [n for n in names if n.lower() not in lower]
+    if missing:
+        raise ValueError(f"Reference channel(s) not among the epochs' channels (bad, or "
+                         f"another name?): {', '.join(missing)}")
+    chans = [lower[n.lower()] for n in names]
+    return chans, f"mean of {'+'.join(chans)}" if len(chans) > 1 else chans[0]
+
+
+def reference_epochs(epochs: mne.BaseEpochs, ref) -> mne.BaseEpochs:
+    """A re-referenced copy (``ref`` from :func:`resolve_erp_reference`)."""
+    if ref is None:
+        return epochs
+    out = epochs.copy()
+    out.set_eeg_reference(ref, projection=False, verbose="error")
+    return out

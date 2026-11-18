@@ -130,10 +130,15 @@ def baseline_epochs(raw: mne.io.BaseRaw, base: BandBaseline, seg_len: float,
 
 
 def baseline_band_power(raw: mne.io.BaseRaw, base: BandBaseline, settings: BandSettings,
-                        ch_names: list[str], seg_len: float
+                        ch_names: list[str], seg_len: float, ref=None
                         ) -> tuple[np.ndarray, np.ndarray]:
-    """Band power of baseline segments: (n_segments, n_ch, n_bands) and segment owners."""
+    """Band power of baseline segments: (n_segments, n_ch, n_bands) and segment owners.
+
+    ``ref`` (see :func:`brainstudio.eeg.resolve_erp_reference`) re-references the
+    segments the same way as the epochs they are compared with."""
+    from .eeg import reference_epochs
     ep, owner = baseline_epochs(raw, base, seg_len, ch_names)
+    ep = reference_epochs(ep, ref)
     s = BandSettings(settings.bands, None, None, settings.method)
     return band_power(ep, s), owner
 
@@ -289,10 +294,15 @@ def band_timecourse(epochs: mne.BaseEpochs, band: tuple[float, float], picks: li
 
 def baseline_timecourse_level(raw: mne.io.BaseRaw, base: BandBaseline,
                               band: tuple[float, float], picks: list[str],
-                              seg_len: float = 4.0) -> tuple[float, float]:
-    """Mean and SD of the same Morlet band power in the baseline window (edges trimmed)."""
+                              seg_len: float = 4.0, ref=None,
+                              ch_names: list[str] | None = None) -> tuple[float, float]:
+    """Mean and SD of the same Morlet band power in the baseline window (edges trimmed).
+    With ``ref``, segments over ``ch_names`` are re-referenced like the epochs first."""
+    from .eeg import reference_epochs
     picks = [c for c in picks if c in raw.ch_names and c not in raw.info["bads"]]
-    ep, _ = baseline_epochs(raw, base, max(seg_len, 6.0 / band[0]), picks)
+    chans = [c for c in (ch_names or picks) if c in raw.ch_names]
+    ep, _ = baseline_epochs(raw, base, max(seg_len, 6.0 / band[0]), chans)
+    ep = reference_epochs(ep, ref)
     p = morlet_band(ep.get_data(picks=picks), ep.info["sfreq"], band)
     trim = int(np.ceil(1.5 / band[0] * ep.info["sfreq"]))
     core = p[:, trim:-trim] if p.shape[1] > 2 * trim + 2 else p

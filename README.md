@@ -308,7 +308,9 @@ The **EEG** tab is a three-stage pipeline:
   - High-pass from **0 Hz (off)** upwards. Below 0.5 Hz it is a zero-phase 4th-order
     Butterworth (IIR); above that, MNE's FIR.
   - Low-pass and notch.
-  - Reference: keep, average, one channel, or the mean of several (`M1, M2`).
+  - The data keep their **recorded reference**. Re-referencing happens in each analysis:
+    ERPs use the reference conventional for the component, band power the average
+    reference.
 - **ICA blink removal** (`mne.preprocessing.ICA`, picard).
   - It is fitted on a ≥ 1 Hz copy of the good, non-flat channels, at most 300,000
     samples spread over the whole recording (long or combined recordings are subsampled,
@@ -365,6 +367,23 @@ The **EEG** tab is a three-stage pipeline:
 - **Component presets** set the time window, polarity and channel cluster: P1, N1,
   N170, P2, N2, MMN, P300, N400, LPP. They are conventional starting points; any edit
   makes the component *Custom*.
+- **Reference**: by default *literature (per component)*, the reference conventional
+  for the component:
+
+  | Component | Reference | Sources |
+  |---|---|---|
+  | N170 | average reference | ERP CORE (Kappenman et al., 2021); Joyce & Rossion (2005) |
+  | P1 | average reference | Luck (2014) |
+  | N1, P2 | averaged mastoids | Luck (2014) |
+  | N2, MMN, P300, N400 | averaged mastoids | ERP CORE; Näätänen et al. (2007); Polich (2007); Kutas & Federmeier (2011) |
+  | LPP | averaged mastoids | Hajcak et al. (2010) |
+  | Custom | average reference | |
+
+  - Mastoids are the first good pair present: M1/M2, TP9/TP10, A1/A2 (earlobes), or
+    P9/P10 (ERP CORE's mastoid substitute).
+  - Without one, the average reference is used, and the note next to the choice says so.
+  - You can also choose *average*, *mastoids*, *as recorded*, or channel names.
+  - The reference is applied to copies of the epochs, before the baseline.
 - **Component statistics** per group:
   - window mean amplitude ± SEM on the cluster mean;
   - peak amplitude and latency of the average ERP (`Evoked.get_peak`).
@@ -384,6 +403,8 @@ The **EEG** tab is a three-stage pipeline:
 
 - Editable bands.
 - Power in a window of the epoch, from `Epochs.compute_psd` (Welch or multitaper).
+- **Reference**: the average reference by default (or mastoids, as recorded, channels).
+  The baseline segments and the time course are re-referenced the same way.
 - **Baseline**: a window **after a baseline event**, e.g. 5…115 s after
   `BASELINE_START`.
   - It is cut into segments as long as the analysis window.
@@ -497,7 +518,7 @@ bad = P.detect_bad_channels(rec.raw, P.BadChannelParams(ptp_max_uv=250, notch=50
 bads = bad.loc[bad.bad, "channel"].tolist()
 ica, fit_raw = P.fit_ica(rec.raw, bads, h_freq=40, notch=50)
 scores = P.score_blink_components(ica, fit_raw, ev.blinks)      # blink-locked + EOG/frontal
-pp = P.PreprocParams(bads=bads, l_freq=0.1, h_freq=40, notch=50, reference="average",
+pp = P.PreprocParams(bads=bads, l_freq=0.1, h_freq=40, notch=50,
                      ica_exclude=scores.loc[scores.suggested, "component"].tolist())
 clean = P.run_preprocessing(rec.raw, pp, ica)
 
@@ -507,7 +528,8 @@ groups = {"AI": fx[fx.cond == "AI"], "NoAI": fx[fx.cond == "NoAI"]}
 epochs, summary = EP.build_group_epochs(clean, groups, EP.EpochSettings(-0.5, 1.5, 150))
 
 # 3a ERP component (pre-event baseline), as in Rhino ERP
-erp = {g: e.copy().apply_baseline((-0.2, 0)) for g, e in epochs.items()}
+ref, why = E.resolve_erp_reference("literature", epochs["AI"].ch_names, "P300")  # mastoids
+erp = {g: E.reference_epochs(e, ref).apply_baseline((-0.2, 0)) for g, e in epochs.items()}
 comp_summary, per_epoch = E.component_analysis(erp, E.COMPONENT_PRESETS["P300"])
 
 # 3b band power and indices (baseline: 5–115 s after BASELINE_START)

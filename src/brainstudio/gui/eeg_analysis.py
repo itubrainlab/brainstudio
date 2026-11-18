@@ -86,6 +86,7 @@ class AnalysisTab(QtWidgets.QWidget):
                 self.group_list.addItem(it)
             self.group_list.blockSignals(False)
             self._fix_baseline_range()
+            self._fill_reference_channels()
         if what in ("events", "recording"):
             self._fill_baseline_events()
         self._on_state()
@@ -175,6 +176,12 @@ class AnalysisTab(QtWidgets.QWidget):
         g.addWidget(self.erp_bl0, 0, 1)
         g.addWidget(QtWidgets.QLabel("to"), 0, 2)
         g.addWidget(self.erp_bl1, 0, 3)
+        self.erp_ref = self._reference_combo(literature=True)
+        self.erp_ref_note = hint("")
+        self.erp_ref.currentTextChanged.connect(lambda _: self._update_ref_note())
+        g.addWidget(QtWidgets.QLabel("reference"), 0, 4)
+        g.addWidget(self.erp_ref, 0, 5)
+        g.addWidget(self.erp_ref_note, 0, 6, 1, 2)
         g.addWidget(QtWidgets.QLabel("component"), 1, 0)
         g.addWidget(self.erp_comp, 1, 1)
         g.addWidget(self.erp_pol, 1, 2, 1, 2)
@@ -189,6 +196,7 @@ class AnalysisTab(QtWidgets.QWidget):
         g.setColumnStretch(7, 1)
         lay.addLayout(g)
         self.erp_comp.currentTextChanged.connect(self._apply_component_preset)
+        self.erp_comp.currentTextChanged.connect(lambda _: self._update_ref_note())
         for sig in (self.erp_m0.valueChanged, self.erp_m1.valueChanged,
                     self.erp_pol.currentIndexChanged, self.erp_roi.textEdited):
             sig.connect(self._component_edited)
@@ -235,6 +243,54 @@ class AnalysisTab(QtWidgets.QWidget):
         self.tabs.addTab(w, "ERP")
         self.erp_comp.setCurrentText("P300")
 
+    REF_LITERATURE = "literature (per component)"
+
+    def _reference_combo(self, literature: bool) -> QtWidgets.QComboBox:
+        c = QtWidgets.QComboBox()
+        c.setEditable(True)
+        c.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        c.addItems(([self.REF_LITERATURE] if literature else [])
+                   + ["average", "mastoids", "as recorded"])
+        c.setToolTip("literature: the reference conventional for the ERP component "
+                     "(see the note) · average: common average of the good channels · "
+                     "mastoids: mean of M1/M2, TP9/TP10, A1/A2 or P9/P10 (the first pair "
+                     "present) · as recorded · or channel name(s), e.g. Cz or “M1, M2”")
+        return c
+
+    def _fill_reference_channels(self):
+        names = list(next(iter(self.pl.epochs.values())).ch_names) if self.pl.epochs else []
+        for c in (self.erp_ref, self.bp_ref):
+            cur = c.currentText()
+            fixed = [c.itemText(i) for i in range(c.count())
+                     if c.itemText(i) in (self.REF_LITERATURE, "average", "mastoids",
+                                          "as recorded")]
+            c.blockSignals(True)
+            c.clear()
+            c.addItems(fixed)
+            if names:
+                c.insertSeparator(len(fixed))
+                c.addItems(names)
+            c.setCurrentText(cur)
+            c.blockSignals(False)
+        self._update_ref_note()
+
+    def _ref_spec(self, combo) -> str:
+        t = combo.currentText().strip()
+        return "literature" if t == self.REF_LITERATURE else (
+            "recorded" if t == "as recorded" else t)
+
+    def _update_ref_note(self):
+        names = list(next(iter(self.pl.epochs.values())).ch_names) if self.pl.epochs else []
+        comp = self.erp_comp.currentText()
+        try:
+            _, label = E.resolve_erp_reference(self._ref_spec(self.erp_ref), names or
+                                               ["M1", "M2"], comp)
+            self.erp_ref_note.setText(("→ " + label) if names else
+                                      "→ " + E.COMPONENT_REFERENCE.get(
+                                          comp, ("average", "average reference"))[1])
+        except ValueError as e:
+            self.erp_ref_note.setText(f"⚠ {e}")
+
     def _apply_component_preset(self, name: str):
         comp = E.COMPONENT_PRESETS.get(name)
         if comp is None:
@@ -253,6 +309,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self.erp_comp.blockSignals(True)
             self.erp_comp.setCurrentText("Custom")
             self.erp_comp.blockSignals(False)
+        self._update_ref_note()
 
     def component(self, available: list[str]) -> E.Component:
         found, _ = parse_channels(self.erp_roi.text(), available)
@@ -287,6 +344,13 @@ class AnalysisTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Baseline", "The baseline end must be after "
                                           "its start.")
             return False
+        try:
+            ref, ref_label = E.resolve_erp_reference(self._ref_spec(self.erp_ref),
+                                                     list(first.ch_names),
+                                                     self.erp_comp.currentText())
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self, "Reference", str(e))
+            return False
         comp = self.component(list(first.ch_names))
         if comp.tmax <= comp.tmin:
             QtWidgets.QMessageBox.warning(self, "Component", "The window must start before it "
@@ -295,8 +359,9 @@ class AnalysisTab(QtWidgets.QWidget):
 
         def job():
             notes = []
+            eps = {g: E.reference_epochs(ep, ref) for g, ep in groups.items()}
             eps = {g: (ep.copy().apply_baseline(bl, verbose="error") if bl else ep)
-                   for g, ep in groups.items()}
+                   for g, ep in eps.items()}
             evokeds = {}
             for g, ep in eps.items():
                 ev = ep.average()
@@ -313,7 +378,7 @@ class AnalysisTab(QtWidgets.QWidget):
                     notes.append(f"⚠ {ov} events are in both groups (tests assume independence)")
             return dict(eps=eps, evokeds=evokeds, summary=summary, per_epoch=per,
                         diff=diff, roi=list(comp.channels), comp=comp,
-                        baseline=bl, notes=notes)
+                        baseline=bl, notes=notes, reference=ref_label)
 
         def done(res):
             self.erp = res
@@ -421,6 +486,7 @@ class AnalysisTab(QtWidgets.QWidget):
             f"{comp.name} {comp.tmin * 1000:.0f}–{comp.tmax * 1000:.0f} ms, "
             f"{'positive' if comp.polarity > 0 else 'negative'} peak, cluster "
             f"{'+'.join(roi) if len(roi) <= 8 else f'{len(roi)} channels'}  ·  baseline {bl}"
+            f"  ·  reference: {r.get('reference', 'as recorded')}"
             f"{welch}  ·  click the plot to set a latency for the topomaps"
             + ("\n" + "; ".join(r["notes"]) if r["notes"] else "")
             + "\nTrials are the observations: single-subject statistics, valid if the window "
@@ -549,6 +615,9 @@ class AnalysisTab(QtWidgets.QWidget):
         self.bp_method = QtWidgets.QComboBox()
         self.bp_method.addItems(["welch", "multitaper"])
         f.addRow("PSD (MNE)", self.bp_method)
+        self.bp_ref = self._reference_combo(literature=False)
+        self.bp_ref.setCurrentText("average")
+        f.addRow("Reference", self.bp_ref)
         self.bp_roi = QtWidgets.QLineEdit()
         self.bp_roi.setPlaceholderText("ROI (empty = all good channels)")
         f.addRow("ROI", self.bp_roi)
@@ -706,6 +775,12 @@ class AnalysisTab(QtWidgets.QWidget):
             return False
         s = BP.BandSettings(bands, self.bp_t0.value(), self.bp_t1.value(),
                             self.bp_method.currentText())
+        try:
+            eeg_ref, ref_label = E.resolve_erp_reference(self._ref_spec(self.bp_ref),
+                                                         list(first.ch_names))
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self, "Reference", str(e))
+            return False
         mode = self.bl_norm.currentText() if base is not None else "absolute"
         raw = self.pl.eeg_input()
         names = list(bands)
@@ -713,17 +788,19 @@ class AnalysisTab(QtWidgets.QWidget):
         def job():
             notes = []
             out = {"bp": {}, "ref": {}, "sd": {}, "norm": {}, "per": [], "bands": bands,
-                   "mode": mode, "roi": roi, "base": base, "settings": s}
+                   "mode": mode, "roi": roi, "base": base, "settings": s,
+                   "reference": eeg_ref, "reference_label": ref_label}
+            eps = {g: E.reference_epochs(ep, eeg_ref) for g, ep in groups.items()}
             ch = list(first.ch_names)
             seg = (min(s.tmax, first.tmax) - max(s.tmin, first.tmin))
             base_bp = owner = None
             if base is not None:
-                base_bp, owner = BP.baseline_band_power(raw, base, s, ch, seg)
+                base_bp, owner = BP.baseline_band_power(raw, base, s, ch, seg, ref=eeg_ref)
                 notes.append(f"baseline: {len(base_bp)} segments of {seg:.2f} s from "
                              f"{len(np.unique(owner))} “{base.label}” event(s), "
                              f"{base.t0:g}…{base.t1:g} s after")
             ridx = BP.resolve_roi(roi, ch)
-            for g, ep in groups.items():
+            for g, ep in eps.items():
                 bp = BP.band_power(ep, s)
                 out["bp"][g] = bp
                 if base_bp is not None:
@@ -744,7 +821,7 @@ class AnalysisTab(QtWidgets.QWidget):
                 out["per"].append(df)
             per = pd.concat(out["per"], ignore_index=True)
             out["per_epoch"] = per
-            out["table"] = ST.comparison_table(per, names, list(groups))
+            out["table"] = ST.comparison_table(per, names, list(eps))
             out["notes"] = notes
             return out
 
@@ -790,7 +867,8 @@ class AnalysisTab(QtWidgets.QWidget):
         roi_txt = ", ".join(roi) if len(roi) <= 8 else f"{len(roi)} channels"
         self.bp_info.setText(f"ROI: {roi_txt}  ·  window {r['settings'].tmin:g}…"
                              f"{r['settings'].tmax:g} s  ·  {r['settings'].method}  ·  "
-                             f"{r['mode']}" + ("\n" + "; ".join(r["notes"])
+                             f"{r['mode']}  ·  reference: {r['reference_label']}"
+                             + ("\n" + "; ".join(r["notes"])
                                                if r["notes"] else ""))
 
     def compute_tc(self, then=None):
@@ -808,9 +886,11 @@ class AnalysisTab(QtWidgets.QWidget):
             out = {"band": band, "mode": mode, "curves": {}}
             lvl = sd = None
             if base is not None and mode != "absolute":
-                lvl, sd = BP.baseline_timecourse_level(raw, base, rng, roi)
+                lvl, sd = BP.baseline_timecourse_level(
+                    raw, base, rng, roi, ref=r["reference"],
+                    ch_names=list(next(iter(groups.values())).ch_names))
             for g, ep in groups.items():
-                t, pw = BP.band_timecourse(ep, rng, roi)
+                t, pw = BP.band_timecourse(E.reference_epochs(ep, r["reference"]), rng, roi)
                 if lvl is not None:
                     with np.errstate(divide="ignore", invalid="ignore"):
                         pw = {"dB": 10 * np.log10(pw / lvl), "% change": 100 * (pw - lvl) / lvl,
