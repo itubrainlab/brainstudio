@@ -195,3 +195,13 @@ def filter_events(df: pd.DataFrame, text: str = "", query: str = "",
     if names is not None:
         out = out[out["name"].isin(names)]
     return out
+
+
+def first_event_time(table: pd.DataFrame) -> float | None:
+    """Onset of the first marker (not gaze events, file boundaries or BAD_ spans)."""
+    if table is None or not len(table) or "kind" not in table:
+        return None
+    m = table[(table["kind"] == "marker")]
+    name = m["name"].astype(str)
+    m = m[~name.str.upper().str.startswith(("BAD", "EDGE"))]
+    return float(m["onset"].min()) if len(m) else None

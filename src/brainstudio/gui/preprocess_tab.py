@@ -8,6 +8,7 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
 from .. import eeg as E
+from .. import events as EV
 from .. import preprocessing as P
 from .icaview import ICAComponentView
 from .theme import THEME
@@ -40,6 +41,14 @@ class PreprocessTab(QtWidgets.QWidget):
         split.addWidget(scroll)
 
         # ---------------------------------------------------------------- channels
+        self.from_event = QtWidgets.QCheckBox("Ignore the data before the first event")
+        self.from_event.setChecked(True)
+        self.from_event.setToolTip(
+            "Bad-channel detection and the ICA fit use the recording from the first marker "
+            "on (set-up, calibration and impedance checks before it are left out). The "
+            "filters and the ICA are still applied to the whole recording.")
+        lay.addWidget(self.from_event)
+
         box = QtWidgets.QGroupBox("Channels — automated peak-to-peak rejection")
         v = QtWidgets.QVBoxLayout(box)
         g = QtWidgets.QGridLayout()
@@ -191,7 +200,21 @@ class PreprocessTab(QtWidgets.QWidget):
         self.ica_table.itemChanged.connect(self._ica_item_changed)
 
     # ================================================================== pipeline
+    def first_event(self) -> float | None:
+        """Start of the data used for bad channels and ICA (None = whole recording)."""
+        if not self.from_event.isChecked():
+            return None
+        return EV.first_event_time(self.pl.event_table)
+
+    def _update_first_event_label(self):
+        t = EV.first_event_time(self.pl.event_table)
+        self.from_event.setText("Ignore the data before the first event"
+                                + (f" ({t:.1f} s)" if t is not None else " (no events)"))
+        self.from_event.setEnabled(t is not None and t > 0)
+
     def _on_pipeline(self, what):
+        if what in ("events", "recording"):
+            self._update_first_event_label()
         if what == "recording":
             self._stats = None
             self._blink_before = self._blink_after = None
@@ -348,6 +371,7 @@ class PreprocessTab(QtWidgets.QWidget):
         raw = self.pl.raw
         if raw is None:
             return
+        tmin = self.first_event()
         notch = {"off": None, "50 Hz": 50.0, "60 Hz": 60.0}[self.notch.currentText()]
         p = P.BadChannelParams(ptp_max_uv=self.ptp_max.value(), ptp_min_uv=self.ptp_min.value(),
                                window=self.ptp_win.value(),
@@ -373,7 +397,7 @@ class PreprocessTab(QtWidgets.QWidget):
             self.pl.mark_stale("preprocessing")
 
         self.worker.run("Measuring peak-to-peak per channel…",
-                        lambda: P.detect_bad_channels(raw, p), done)
+                        lambda: P.detect_bad_channels(raw, p, tmin), done)
 
     # ================================================================== reference
     def refresh_reference_choices(self):
@@ -404,6 +428,7 @@ class PreprocessTab(QtWidgets.QWidget):
         raw = self.pl.raw
         if raw is None:
             return
+        tmin = self.first_event()
         bads = self.bads()
         notch = {"off": None, "50 Hz": 50.0, "60 Hz": 60.0}[self.notch.currentText()]
         ip = P.ICAParams(n_components=self.ica_n.value(), method=self.ica_method.currentText(),
@@ -413,14 +438,14 @@ class PreprocessTab(QtWidgets.QWidget):
         eog = [raw.ch_names[i] for i in mne.pick_types(raw.info, eog=True)]
 
         def job():
-            ica, fit_raw = P.fit_ica(raw, bads, h, notch, ip)
+            ica, fit_raw = P.fit_ica(raw, bads, h, notch, ip, tmin=tmin)
             scores = P.score_blink_components(ica, fit_raw, blinks, eog)
             sources = ica.get_sources(fit_raw).get_data()
             return ica, fit_raw, scores, sources
 
         def done(res):
             self.pl.ica, self.pl.ica_fit_raw, self.pl.ica_scores, self.pl.ica_sources = res
-            self.pl.ica_key = (tuple(bads), h, notch)
+            self.pl.ica_key = (tuple(bads), h, notch, tmin)
             self._fill_ica_table(use_suggested=True)
             self.pl.mark_stale("preprocessing")
             if self.ica_table.rowCount():

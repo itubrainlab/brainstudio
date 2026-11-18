@@ -89,7 +89,8 @@ class ICAComponentView(QtWidgets.QWidget):
         ax_psd.grid(alpha=0.3)
 
         # blink-locked average (eye tracker)
-        t = fit_raw.times
+        from ..preprocessing import fit_times
+        t = fit_times(fit_raw)  # recording time (the fit may start at the first event)
         if blinks is not None and len(blinks):
             on = np.searchsorted(t, blinks["onset"].to_numpy(float))
             i0, i1 = int(-0.3 * sf), int(0.6 * sf)

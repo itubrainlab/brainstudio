@@ -39,27 +39,29 @@ def _eeg_idx(raw: mne.io.BaseRaw) -> np.ndarray:
     return idx if len(idx) else E.eeg_picks(raw)
 
 
-def detect_bad_channels(raw: mne.io.BaseRaw, p: BadChannelParams | None = None
-                        ) -> pd.DataFrame:
+def detect_bad_channels(raw: mne.io.BaseRaw, p: BadChannelParams | None = None,
+                        tmin: float | None = None) -> pd.DataFrame:
     """Peak-to-peak statistics per EEG channel and a suggested ``bad`` flag.
 
     The data are cut into ``p.window`` s windows (after a ``p.l_freq`` high-pass).
     The data are band-passed (and notched) like the preprocessing will do.
     A channel is flagged when more than ``p.max_bad_fraction`` of its windows
     exceed ``p.ptp_max_uv`` or fall below ``p.ptp_min_uv``, or when its median
-    peak-to-peak amplitude is a robust-z outlier among channels.
+    peak-to-peak amplitude is a robust-z outlier among channels. Data before
+    ``tmin`` (s, e.g. the first event) are ignored.
     """
     p = p or BadChannelParams()
     picks = _eeg_idx(raw)
     sf = raw.info["sfreq"]
     win = max(int(round(p.window * sf)), 2)
-    n_win = raw.n_times // win
+    first = _start_sample(raw, tmin)
+    n_win = (raw.n_times - first) // win
     if n_win < 1:
         raise ValueError("Recording is shorter than one window")
     rows = []
     for start in range(0, len(picks), 8):  # blocks of channels bound memory use
         block = picks[start:start + 8]
-        x = raw.get_data(picks=block) * 1e6
+        x = raw.get_data(picks=block, start=first) * 1e6
         h = p.h_freq if p.h_freq and p.h_freq < sf / 2 else None
         lf = p.l_freq if p.l_freq and p.l_freq > 0 else None
         if lf and highpass_method(lf):
@@ -119,10 +121,14 @@ def highpass_method(l_freq) -> dict:
     return {}
 
 
-def _filtered(raw: mne.io.BaseRaw, l_freq, h_freq, notch, picks=None) -> mne.io.BaseRaw:
+def _filtered(raw: mne.io.BaseRaw, l_freq, h_freq, notch, picks=None,
+              tmin: float | None = None) -> mne.io.BaseRaw:
     out = raw.copy().load_data()
     if picks is not None:
         out.pick(picks)
+    a = _start_sample(raw, tmin)
+    if a:
+        out.crop(tmin=a / raw.info["sfreq"], include_tmax=True)
     fp = mne.pick_types(out.info, eeg=True, eog=True, ecg=True, emg=True, exclude=[])
     nyq = out.info["sfreq"] / 2
     h = h_freq if h_freq and h_freq < nyq else None
@@ -138,25 +144,43 @@ def _filtered(raw: mne.io.BaseRaw, l_freq, h_freq, notch, picks=None) -> mne.io.
     return out
 
 
-def ica_channels(raw: mne.io.BaseRaw, bads=()) -> list[str]:
+def _start_sample(raw: mne.io.BaseRaw, tmin: float | None) -> int:
+    """Sample index of recording time ``tmin`` (0 when None or outside the data)."""
+    if not tmin or tmin <= 0:
+        return 0
+    i = int(round(tmin * raw.info["sfreq"]))
+    return i if i < raw.n_times - int(raw.info["sfreq"]) else 0  # keep ≥ 1 s of data
+
+
+def ica_channels(raw: mne.io.BaseRaw, bads=(), tmin: float | None = None) -> list[str]:
     """Good, non-flat EEG channels (a reference channel is flat and would break ICA)."""
     names = [raw.ch_names[i] for i in _eeg_idx(raw) if raw.ch_names[i] not in set(bads)]
-    sd = raw.get_data(picks=names, start=0, stop=min(raw.n_times, int(60 * raw.info["sfreq"])))
+    a = _start_sample(raw, tmin)
+    sd = raw.get_data(picks=names, start=a, stop=min(raw.n_times, a + int(60 * raw.info["sfreq"])))
     return [n for n, s in zip(names, sd.std(1)) if s > 1e-12]
 
 
+def fit_times(fit_raw: mne.io.BaseRaw) -> np.ndarray:
+    """Recording times of the samples ICA was fitted on (it may start at an event)."""
+    return fit_raw.times + getattr(fit_raw, "recording_t0", 0.0)
+
+
 def fit_ica(raw: mne.io.BaseRaw, bads=(), h_freq=None, notch=None,
-            p: ICAParams | None = None) -> tuple[mne.preprocessing.ICA, mne.io.BaseRaw]:
+            p: ICAParams | None = None, tmin: float | None = None
+            ) -> tuple[mne.preprocessing.ICA, mne.io.BaseRaw]:
     """Fit ICA on good EEG channels of a ≥ 1 Hz high-passed copy of ``raw``.
 
-    Returns the ICA and the (decimated) data it was fitted on, which is what
-    :func:`score_blink_components` and MNE's ICA plots need.
+    Data before ``tmin`` (s, e.g. the first event) are left out of the fit; the
+    ICA is still applied to the whole recording. Returns the ICA and the
+    (decimated) data it was fitted on, which :func:`score_blink_components` and
+    MNE's ICA plots need (:func:`fit_times` gives its recording times).
     """
     p = p or ICAParams()
-    chans = ica_channels(raw, bads)
+    chans = ica_channels(raw, bads, tmin)
     if len(chans) < 3:
         raise ValueError("ICA needs at least 3 good EEG channels")
-    fit_raw = _filtered(raw, max(p.l_freq, 0.1), h_freq, notch, picks=chans)
+    fit_raw = _filtered(raw, max(p.l_freq, 0.1), h_freq, notch, picks=chans, tmin=tmin)
+    fit_raw.recording_t0 = _start_sample(raw, tmin) / raw.info["sfreq"]
     decim = max(1, int(fit_raw.info["sfreq"] // p.target_sfreq))
     if decim > 1:
         fit_raw.resample(fit_raw.info["sfreq"] / decim, verbose="error")
@@ -243,7 +267,7 @@ def score_blink_components(ica: mne.preprocessing.ICA, fit_raw: mne.io.BaseRaw,
     else:
         df["eog_score"] = np.nan
     src = ica.get_sources(fit_raw).get_data()
-    t_score = blink_locked_score(src, fit_raw.info["sfreq"], fit_raw.times, blinks)
+    t_score = blink_locked_score(src, fit_raw.info["sfreq"], fit_times(fit_raw), blinks)
     if t_score is not None:
         df["blink_t"] = t_score
         mad = np.median(np.abs(t_score - np.median(t_score))) * 1.4826 or 1e-9

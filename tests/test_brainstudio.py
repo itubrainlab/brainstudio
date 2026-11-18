@@ -462,3 +462,23 @@ def test_gtec_unicorn_layout():
     rep = E.apply_montage(raw, m, list(m.ch_names) + extra)
     assert rep["n_positioned"] == 8 and not rep["missing"]
     assert set(raw.get_channel_types(extra)) == {"misc"}
+
+
+def test_bad_channels_and_ica_ignore_data_before_first_event(demo):
+    """Noise before the first event marks no channel bad when that part is ignored,
+    and ICA is fitted from the first event on (blinks still align)."""
+    from brainstudio import events as EV
+    from brainstudio import preprocessing as P
+    rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
+    ev = G.detect_events(rec.gaze)
+    t0 = EV.first_event_time(EV.build_event_table(rec, ev))
+    assert t0 == pytest.approx(3.0, abs=0.01)
+    raw = rec.raw.copy().load_data()
+    n0 = int(t0 * raw.info["sfreq"])
+    raw._data[raw.ch_names.index("Cz"), :n0] += np.random.default_rng(0).normal(0, 2e-3, n0)
+    p = P.BadChannelParams(max_bad_fraction=0.02)  # 3 noisy s of 120 = 2.5 % of the windows
+    assert "Cz" in set(P.detect_bad_channels(raw, p).query("bad").channel)
+    assert "Cz" not in set(P.detect_bad_channels(raw, p, tmin=t0).query("bad").channel)
+    ica, fit_raw = P.fit_ica(raw, [], 40.0, None, P.ICAParams(n_components=8), tmin=t0)
+    assert P.fit_times(fit_raw)[0] == pytest.approx(t0, abs=0.01)
+    assert P.score_blink_components(ica, fit_raw, ev.blinks).suggested.any()

@@ -253,6 +253,11 @@ The **EEG** tab is a three-stage pipeline:
 
 ![Preprocessing with ICA](docs/preprocessing.png)
 
+- **Ignore the data before the first event** (on by default): bad-channel detection and
+  the ICA fit use the recording from the first marker on. Set-up, calibration and
+  impedance checks before it are left out. Filters and ICA are still applied to the
+  whole recording. Gaze events, file boundaries and `BAD_` spans don't count as the
+  first event.
 - **Channels: automated peak-to-peak rejection.**
   - The data are cut into windows, band-passed and notched like the output will be.
   - A channel is bad when more than a set share of its windows are *noisy* (above a
