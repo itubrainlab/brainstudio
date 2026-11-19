@@ -1178,15 +1178,15 @@ def detect_gaze_events(gaze, p: DetectionParams = DetectionParams()) -> GazeEven
 
     import polars as pl
     import pymovements as pm
-    t, xy = gaze["t"].to_numpy(), gaze[["x", "y"]].to_numpy().T
-    sf = gaze_rate(gaze)
-    n = lambda s, least=1: max(int(round(s * sf)), least)  # noqa: E731  seconds → samples
+    sf, t = gaze_rate(gaze), gaze["t"].to_numpy()
+    n = lambda seconds, least=1: max(int(round(seconds * sf)), least)  # noqa: E731  → samples
+    xy = gaze[["x", "y"]].to_numpy().T
+    pupil = gaze["pupil"].to_numpy(float) if "pupil" in gaze else \
+        np.where(np.isfinite(xy).all(0), 1.0, np.nan)  # NaN = tracking lost
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # "no events were detected" and the like
         pg = pm.gaze.from_numpy(time=np.arange(len(t), dtype=np.int64), time_unit="ms",
                                 pixel=xy, position=xy, experiment=pm.Experiment(sampling_rate=sf))
-        pupil = gaze["pupil"].to_numpy(float) if "pupil" in gaze else \
-            np.where(np.isfinite(xy).all(0), 1.0, np.nan)  # NaN = tracking lost
         pg.samples = pg.samples.with_columns(pl.Series("pupil", pupil))
         pg.pos2vel(method=p.velocity_method)
         pg.detect("idt", dispersion_threshold=p.fix_dispersion,
@@ -1195,27 +1195,23 @@ def detect_gaze_events(gaze, p: DetectionParams = DetectionParams()) -> GazeEven
                   minimum_duration=n(p.sac_min_dur), name="saccade")
         pg.detect("blink", minimum_duration=n(p.blink_min_dur),
                   maximum_duration=n(p.blink_max_dur), minimum_gap=n(0.005))
-        names = set(pg.events.frame["name"].to_list())
-        if "fixation" in names:
+        found = set(pg.events.frame["name"].to_list())
+        if "fixation" in found:
             pg.compute_event_properties("location", name="fixation")
-        if "saccade" in names:
+        if "saccade" in found:
             pg.compute_event_properties(["amplitude", "peak_velocity"], name="saccade")
     ev = pg.events.frame
-    at = lambda i: t[np.clip(np.asarray(i, np.int64), 0, len(t) - 1)]  # noqa: E731
 
     def table(name, extra=()):
         e = ev.filter(pl.col("name") == name)
-        on = at(e["onset"].to_numpy()) if len(e) else np.empty(0)
-        off = at(e["offset"].to_numpy()) if len(e) else np.empty(0)
-        df = pd.DataFrame({"onset": on, "offset": off, "duration": off - on})
-        for c in extra:
-            df[c] = e[c].to_numpy().astype(float) if len(e) and c in e.columns else np.nan
-        return df
-    fix = table("fixation")
-    loc = ev.filter(pl.col("name") == "fixation")
-    xy_f = np.array(loc["location"].to_list(), float).reshape(-1, 2) if len(loc) and \
-        "location" in loc.columns else np.empty((0, 2))
-    fix["x"], fix["y"] = xy_f[:, 0], xy_f[:, 1]
+        on, off = (t[np.clip(e[c].to_numpy().astype(np.int64), 0, len(t) - 1)] for c in
+                   ("onset", "offset"))
+        return pd.DataFrame({"onset": on, "offset": off, "duration": off - on, **{
+            c: e[c].to_numpy().astype(float) if len(e) and c in e.columns else np.nan
+            for c in extra}})
+    fix, loc = table("fixation"), ev.filter(pl.col("name") == "fixation")
+    fix[["x", "y"]] = np.array(loc["location"].to_list(), float).reshape(-1, 2) \
+        if len(loc) and "location" in loc.columns else np.empty((0, 2))
     return GazeEvents(fix, table("saccade", ("amplitude", "peak_velocity")), table("blink"))
 
 
@@ -1393,24 +1389,15 @@ def event_table(markers, gaze_events: GazeEvents | None = None, aois=None,
     tables = [pd.DataFrame(rows)] if rows else []
     attr_cols = sorted({k for r in rows for k in r} - set(BASE_COLUMNS))
 
-    if gaze_events is not None:
-        f = gaze_events.fixations.copy()
-        if len(f):
-            f["name"] = "fixation"
-            f["kind"] = "fixation"
-            f["description"] = "fixation"
-            if aois is not None:  # pymovements AOI table
-                f["aoi"] = fixation_aois(f, aois)
-            tables.append(f.drop(columns=["offset"]))
-        s = gaze_events.saccades.copy()
-        if len(s):
-            s["name"] = s["kind"] = s["description"] = "saccade"
-            tables.append(s.drop(columns=[c for c in ("offset", "x0", "y0", "x1", "y1")
-                                          if c in s]))
-        b = gaze_events.blinks.copy()
-        if len(b):
-            b["name"] = b["kind"] = b["description"] = "blink"
-            tables.append(b.drop(columns=["offset"]))
+    for kind, df in (("fixation", "fixations"), ("saccade", "saccades"), ("blink", "blinks")) \
+            if gaze_events is not None else ():
+        df = getattr(gaze_events, df)
+        if len(df):
+            df = df.drop(columns=[c for c in ("offset", "x0", "y0", "x1", "y1") if c in df]) \
+                .assign(name=kind, kind=kind, description=kind)
+            if kind == "fixation" and aois is not None:  # pymovements AOI table
+                df["aoi"] = fixation_aois(df, aois)
+            tables.append(df)
 
     if not tables:
         return pd.DataFrame(columns=BASE_COLUMNS + ["phase"])
@@ -1447,7 +1434,6 @@ def event_table(markers, gaze_events: GazeEvents | None = None, aois=None,
     # ---- which file / subject / session / run each event comes from
     seg_cols: list[str] = []
     if segments:
-        
         for k, v in segment_columns(df["onset"].to_numpy(float), segments).items():
             if k in df:  # an event's own value wins
                 own = df[k]
