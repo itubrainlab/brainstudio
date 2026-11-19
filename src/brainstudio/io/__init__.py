@@ -1,80 +1,127 @@
-"""Data loaders: BIDS datasets, XDF files, and standalone eye-tracking files."""
+"""Loading, for the app: :mod:`brainstudio.core` reads the files; this wraps the result in
+the :class:`~brainstudio.model.Recording` the app works with."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import mne
-
+from .. import core as C
+from ..core import BidsRun, describe_streams, entities_from_path, scan_bids  # noqa: F401
 from ..model import GazeData, Recording
-from .bids import BidsRun, gaze_from_raw, load_bids_run, read_bids_eyetrack, scan_bids
-from .multi import concatenate, entities_from_path, set_segments
-from .xdf import describe_streams, load_xdf
-
-__all__ = [
-    "BidsRun", "scan_bids", "load_bids_run", "read_bids_eyetrack", "gaze_from_raw",
-    "load_xdf", "describe_streams", "load", "load_many", "load_bids_runs",
-    "load_eyetracking_file", "concatenate", "entities_from_path",
-]
 
 
-def load_eyetracking_file(path: str | Path, screen_size=(1920, 1080)) -> GazeData:
-    """Load a standalone gaze file: EyeLink .asc, BIDS physio TSV, or XDF."""
-    path = Path(path)
-    name = path.name.lower()
-    if name.endswith(".asc"):
-        raw = mne.io.read_raw_eyelink(path, verbose="error")
-        g = gaze_from_raw(raw, screen_size, drop=False)
-        if g is None:
-            raise ValueError("No gaze channels in EyeLink file")
-        return g
-    if ".tsv" in name:
-        return read_bids_eyetrack(path, screen_size=screen_size)[0]
-    if name.endswith((".xdf", ".xdfz")):
-        rec = load_xdf(path, screen_size)
-        if rec.gaze is None:
-            raise ValueError("No gaze stream in XDF file")
-        return rec.gaze
-    raise ValueError(f"Unsupported eye-tracking file: {path.name}")
+def gaze_data(g) -> GazeData | None:
+    """A core gaze table as GazeData (the tracker's own channels in ``extra``)."""
+    if g is None:
+        return None
+    return GazeData(g["t"].to_numpy(), g["x"].to_numpy(), g["y"].to_numpy(),
+                    g["pupil"].to_numpy() if "pupil" in g else None, g.attrs.get("sfreq"),
+                    tuple(g.attrs.get("screen", (1920, 1080))), g.attrs.get("label", "gaze"),
+                    {c[3:]: g[c].to_numpy() for c in g.columns if c.startswith("ch_")})
 
 
-def load(path: str | Path, screen_size=(1920, 1080), roles=None, options=None) -> Recording:
-    """Load a single file (XDF, any MNE-readable EEG file, EyeLink .asc).
+def recording(raw, events, gaze, info, source=None, annotate=False) -> Recording:
+    rec = Recording(raw=raw, gaze=gaze_data(gaze), events=events.reset_index(drop=True),
+                    source=Path(source) if source else None)
+    rec.streams = info.get("streams", [])
+    rec.metadata = info.get("metadata", {})
+    rec.description = "\n".join(x for x in [info.get("description", "")] + info.get("notes", [])
+                                if x)
+    if annotate and raw is not None and len(events):  # XDF markers inside the EEG
+        import mne
+        inside = (events.onset >= 0) & (events.onset <= raw.times[-1])
+        raw.set_annotations(raw.annotations + mne.Annotations(
+            events.onset[inside].to_numpy(), events.duration[inside].to_numpy(),
+            events.description[inside].to_numpy()))
+        rec.events = events[~inside].reset_index(drop=True)
+    return rec
 
-    ``roles`` (XDF only): stream id → EEG / gaze / markers / ignore overrides.
-    The recording gets one segment with the BIDS entities of the file name."""
-    rec = _load_one(path, screen_size, roles, options)
-    rec.sources = [Path(path)]
-    if rec.raw is not None:  # e.g. EDF readers type every channel as EEG
-        from ..eeg import type_channels_by_name
-        changed = type_channels_by_name(rec.raw)
+
+def _read(path, screen, roles=None, options=None):
+    if Path(path).name.lower().endswith((".xdf", ".xdfz")):
+        return C.read_xdf(path, screen, roles, options)
+    return C.read_file(path, screen)
+
+
+def load(path, screen_size=(1920, 1080), roles=None, options=None) -> Recording:
+    """One file: XDF, any file MNE reads, or an EyeLink .asc."""
+    raw, events, gaze, info = _read(path, screen_size, roles, options)
+    if raw is not None:
+        changed = C.type_channels_by_name(raw)
         if changed:
-            note = "channel types from names: " + ", ".join(f"{c}→{t}" for c, t in changed.items())
-            rec.description = (rec.description + "\n" if rec.description else "") + note
-    return set_segments(rec, entities_from_path(path))
+            info.setdefault("notes", []).append("channel types from names: " + ", ".join(
+                f"{c}→{t}" for c, t in changed.items()))
+    rec = recording(raw, events, gaze, info, path,
+                    annotate=Path(path).name.lower().endswith((".xdf", ".xdfz")))
+    rec.sources = [Path(path)]
+    rec.segments = [{"start": 0.0, "end": float(rec.duration),
+                     **{k: v for k, v in entities_from_path(path).items() if v}}]
+    return rec
+
+
+def _joined(recs: list[Recording], first: Recording) -> Recording:
+    """Recordings joined end to end (:func:`brainstudio.core.join`)."""
+    if len(recs) == 1:
+        return recs[0]
+    parts = []
+    for r in recs:
+        events = r.all_events() if r.raw is not None else r.events
+        if r.raw is not None:
+            r.raw.set_annotations(r.raw.annotations[
+                C.is_data_annotation(r.raw.annotations.to_data_frame()["description"])
+                .to_numpy()] if len(r.raw.annotations) else r.raw.annotations)
+            events = events[~C.is_data_annotation(events["description"])]
+        parts.append((r.raw, events, gaze_table(r.gaze), {"segments": r.segments}))
+    raw, events, gaze, segments, notes = C.join(parts)
+    out = recording(raw, events, gaze, {"streams": first.streams}, first.source)
+    out.segments, out.sources = segments, [r.source for r in recs]
+    if any(r.metadata for r in recs):  # first file's info; bad channels from all files
+        out.metadata = dict(recs[0].metadata)
+        out.metadata["bad_channels"] = {c: why for r in recs
+                                        for c, why in r.metadata.get("bad_channels", {}).items()}
+    out.description = "\n".join(
+        [f"{len(recs)} files combined" + (": " + "; ".join(notes) if notes else "")]
+        + [f"[{s.get('file', r.source)} @ {s['start']:.1f} s] {r.description}"
+           for s, r in zip(segments, recs)])
+    return out
+
+
+def gaze_table(g: GazeData | None):
+    if g is None:
+        return None
+    import pandas as pd
+    t = pd.DataFrame({"t": g.times, "x": g.x, "y": g.y})
+    if g.pupil is not None:
+        t["pupil"] = g.pupil
+    for k, v in g.extra.items():
+        t["ch_" + k] = v
+    t.attrs.update(sfreq=g.sfreq, screen=tuple(g.screen_size), label=g.label)
+    return t
 
 
 def load_many(paths, screen_size=(1920, 1080), roles_by_name=None,
               options_by_name=None) -> Recording:
-    """Load several files and join them (:func:`brainstudio.io.multi.concatenate`).
-
-    For XDF, roles and options are given per stream *name*, so they apply to
-    the same stream in every file."""
-    paths = [Path(p) for p in paths]
+    """Several files joined; for XDF, roles and options are given per stream name."""
     recs = []
-    for p in paths:
+    for p in map(Path, paths):
         roles = options = None
         if p.name.lower().endswith((".xdf", ".xdfz")) and (roles_by_name or options_by_name):
-            keys = {s["name"]: s["key"] for s in describe_streams(p).rename(
-                columns={"stream_id": "key"}).astype({"key": str}).to_dict("records")}
-            roles = {keys[n]: r for n, r in (roles_by_name or {}).items() if n in keys}
-            options = {keys[n]: o for n, o in (options_by_name or {}).items() if n in keys}
-        recs.append(load(p, screen_size, roles or None, options or None))
-    return concatenate(recs)
+            keys = {s["name"]: str(s["stream_id"]) for s in
+                    describe_streams(p).to_dict("records")}
+            roles = {keys[n]: r for n, r in (roles_by_name or {}).items() if n in keys} or None
+            options = {keys[n]: o for n, o in (options_by_name or {}).items()
+                       if n in keys} or None
+        recs.append(load(p, screen_size, roles, options))
+    return _joined(recs, recs[0])
+
+
+def load_bids_run(root, run, screen_size=None) -> Recording:
+    raw, events, gaze, info = C.read_bids_run(root, run, screen_size)
+    return recording(raw, events, gaze, info, run.eeg or (run.gaze[0] if run.gaze else root))
 
 
 def load_bids_runs(root, runs, screen_size=None) -> Recording:
-    """Load and join several BIDS runs, each segment carrying its entities."""
+    """BIDS runs joined, each keeping its subject/session/task/acq/run/file."""
     recs = []
     for run in runs:
         r = load_bids_run(root, run, screen_size)
@@ -82,24 +129,30 @@ def load_bids_runs(root, runs, screen_size=None) -> Recording:
                                                    ("bids_task", "task"), ("acq", "acquisition"),
                                                    ("run", "run"))}
         ent["file"] = Path(run.eeg or (run.gaze[0] if run.gaze else root)).name
-        recs.append(set_segments(r, ent))
-    return concatenate(recs)
+        r.segments = [{"start": 0.0, "end": float(r.duration),
+                       **{k: v for k, v in ent.items() if v not in (None, "")}}]
+        recs.append(r)
+    return _joined(recs, recs[0])
 
 
-def _load_one(path, screen_size, roles, options) -> Recording:
-    path = Path(path)
-    name = path.name.lower()
-    if name.endswith((".xdf", ".xdfz")):
-        return load_xdf(path, screen_size, roles=roles, options=options)
-    if name.endswith(".asc"):
-        raw = mne.io.read_raw_eyelink(path, verbose="error")
-        rec = Recording(gaze=gaze_from_raw(raw, screen_size, drop=False), source=path)
-        a = raw.annotations
-        import pandas as pd
-        rec.events = pd.DataFrame({"onset": a.onset - (raw.first_time if a.orig_time else 0),
-                                   "duration": a.duration, "description": a.description})
-        return rec
-    raw = mne.io.read_raw(path, preload=True, verbose="error")
-    rec = Recording(raw=raw, source=path)
-    rec.gaze = gaze_from_raw(raw, screen_size)
-    return rec
+def load_eyetracking_file(path, screen_size=(1920, 1080)) -> GazeData:
+    """Gaze from an EyeLink .asc, a BIDS eye-tracking TSV or an XDF file."""
+    name = Path(path).name.lower()
+    if name.endswith(".asc") or name.endswith((".xdf", ".xdfz")):
+        g = _read(path, screen_size)[2]
+    elif ".tsv" in name:
+        g = C.read_bids_eyetrack(path, screen=screen_size)[0]
+    else:
+        raise ValueError(f"Unsupported eye-tracking file: {Path(path).name}")
+    if g is None:
+        raise ValueError("No gaze in this file")
+    return gaze_data(g)
+
+
+def load_xdf(path, screen_size=(1920, 1080), roles=None, options=None) -> Recording:
+    """An XDF file (see :func:`brainstudio.core.read_xdf`)."""
+    return load(path, screen_size, roles, options)
+
+
+def concatenate(recs: list[Recording]) -> Recording:
+    return _joined(recs, recs[0])

@@ -559,7 +559,7 @@ def test_bids_dataset_info_bads_and_positions(tmp_path):
     # electrodes.tsv at subject level with a space- entity (no task/run)
     el = run.eeg.with_name("sub-01_space-CapTrak_electrodes.tsv")
     el.write_text("name\tx\ty\tz\nCz\t0\t0\t0.1\n")
-    assert B._electrodes_file(run.eeg) == el
+    assert __import__("brainstudio.core", fromlist=["x"]).electrodes_file(run.eeg) == el
 
 
 def test_ica_uses_the_kept_channels_not_the_file_bad_list(demo):
