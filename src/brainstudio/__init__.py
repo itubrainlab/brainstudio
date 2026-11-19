@@ -3,4 +3,4 @@
 from .model import GazeData, GazeEvents, Recording
 
 __all__ = ["GazeData", "GazeEvents", "Recording"]
-__version__ = "0.1.4"
+__version__ = "0.1.5"
