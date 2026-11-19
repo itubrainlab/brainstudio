@@ -2684,17 +2684,10 @@ def comparison_table(per_epoch: pd.DataFrame, measures: list[str], groups: list[
 # =========================================================================== band power
 DEFAULT_BANDS = {"delta": (1.0, 4.0), "theta": (4.0, 8.0), "alpha": (8.0, 13.0),
                  "beta": (13.0, 30.0), "gamma": (30.0, 45.0)}
-
-
-DEFAULT_ROIS = {
-    "frontal midline": ["Fz", "FCz", "F1", "F2", "AFz"],
-    "parietal": ["Pz", "P3", "P4", "POz", "CPz"],
-    "engagement": ["Cz", "Pz", "P3", "P4"],
-    "left frontal": ["F3"],
-    "right frontal": ["F4"],
-}
-
-
+DEFAULT_ROIS = {"frontal midline": ["Fz", "FCz", "F1", "F2", "AFz"],
+                "parietal": ["Pz", "P3", "P4", "POz", "CPz"],
+                "engagement": ["Cz", "Pz", "P3", "P4"],
+                "left frontal": ["F3"], "right frontal": ["F4"]}
 NORMALISATIONS = ("absolute", "dB", "% change", "ratio", "z")
 
 
@@ -2708,10 +2701,9 @@ class BandSettings:
 
 @dataclass
 class BandBaseline:
-    """Band-power baseline: ``t0``…``t1`` s after each baseline event onset.
-
-    ``subjects`` (one per onset) makes the normalisation per subject: an epoch is
-    only ever compared with baseline segments of its own subject."""
+    """Band-power baseline: ``t0``…``t1`` s after each baseline event onset. With
+    ``subjects`` (one per onset) an epoch is only compared with its own subject's
+    baseline."""
     onsets: np.ndarray             # baseline event onsets (s, recording time)
     t0: float = 0.0
     t1: float = 10.0
@@ -2720,50 +2712,36 @@ class BandBaseline:
     subjects: np.ndarray | None = None
 
 
-def _integrate(psd: np.ndarray, freqs: np.ndarray, bands: dict) -> np.ndarray:
-    """(…, n_freqs) V²/Hz → (…, n_bands) µV²."""
+def band_power(epochs, settings: BandSettings) -> np.ndarray:
+    """Absolute band power per epoch, channel and band, (epochs, channels, bands) µV²:
+    ``Epochs.compute_psd`` (Welch: ≤ 2 s segments, 50 % overlap) summed over each band."""
+    bands, sf = settings.bands, epochs.info["sfreq"]
+    tmin = max(settings.tmin if settings.tmin is not None else epochs.tmin, epochs.tmin)
+    tmax = min(settings.tmax if settings.tmax is not None else epochs.tmax, epochs.tmax)
+    if tmax - tmin <= 0:
+        raise ValueError("The band-power window lies outside the epochs")
+    seg = min(int(round((tmax - tmin) * sf)) + 1, int(2 * sf))
+    kw = dict(n_fft=seg, n_per_seg=seg, n_overlap=seg // 2) if settings.method == "welch" else {}
+    psd, freqs = epochs.compute_psd(
+        method=settings.method, fmin=min(lo for lo, _ in bands.values()),
+        fmax=min(max(hi for _, hi in bands.values()), sf / 2), tmin=tmin, tmax=tmax,
+        picks="eeg", exclude=(), **kw).get_data(return_freqs=True)
     df = float(np.median(np.diff(freqs))) if len(freqs) > 1 else 1.0
     out = []
     for lo, hi in bands.values():
         m = (freqs >= lo) & (freqs < hi)
-        if not m.any():
+        if not m.any():  # a band narrower than the resolution: the nearest frequency
             m = np.abs(freqs - (lo + hi) / 2) == np.abs(freqs - (lo + hi) / 2).min()
         out.append(psd[..., m].sum(-1) * df)
-    return np.stack(out, -1) * 1e12
-
-
-def band_power(epochs: mne.BaseEpochs, settings: BandSettings) -> np.ndarray:
-    """Absolute band power per epoch, channel and band: (n_epochs, n_ch, n_bands) µV²."""
-    bands = settings.bands
-    fmin = min(lo for lo, _ in bands.values())
-    fmax = min(max(hi for _, hi in bands.values()), epochs.info["sfreq"] / 2)
-    tmin = settings.tmin if settings.tmin is not None else epochs.tmin
-    tmax = settings.tmax if settings.tmax is not None else epochs.tmax
-    tmin, tmax = max(tmin, epochs.tmin), min(tmax, epochs.tmax)
-    if tmax - tmin <= 0:
-        raise ValueError("The band-power window lies outside the epochs")
-    n = int(round((tmax - tmin) * epochs.info["sfreq"])) + 1
-    kw = {}
-    if settings.method == "welch":
-        seg = min(n, int(2 * epochs.info["sfreq"]))  # ≤ 2 s segments, 50 % overlap
-        kw = dict(n_fft=seg, n_per_seg=seg, n_overlap=seg // 2)
-    psd = epochs.compute_psd(method=settings.method, fmin=fmin, fmax=fmax, tmin=tmin,
-                             tmax=tmax, picks="eeg", exclude=(), **kw)
-    data, freqs = psd.get_data(return_freqs=True)
-    bp = _integrate(data, freqs, bands)
+    bp = np.stack(out, -1) * 1e12
     bp[bp <= 0] = np.nan  # flat (reference) channels
     return bp
 
 
-def baseline_epochs(raw: mne.io.BaseRaw, base: BandBaseline, seg_len: float,
-                    ch_names: list[str]) -> tuple[mne.Epochs, np.ndarray]:
-    """Cut ``t0``…``t1`` after each baseline onset into ``seg_len`` s segments.
-
-    Returns the segments (as Epochs, tmin=0) and, per segment, the index of the
-    baseline event it came from.
-    """
-    seg_len = max(seg_len, 0.25)
-    sf = raw.info["sfreq"]
+def baseline_epochs(raw, base: BandBaseline, seg_len: float, ch_names):
+    """``t0``…``t1`` after each baseline onset cut into ``seg_len`` s segments (Epochs,
+    tmin=0), and for each segment the baseline event it came from."""
+    seg_len, sf = max(seg_len, 0.25), raw.info["sfreq"]
     starts, owner = [], []
     for k, on in enumerate(np.asarray(base.onsets, float)):
         t = on + base.t0
@@ -2772,134 +2750,104 @@ def baseline_epochs(raw: mne.io.BaseRaw, base: BandBaseline, seg_len: float,
             owner.append(k)
             t += seg_len
     if not starts:
-        raise ValueError("The baseline window is shorter than one analysis window "
+        raise ValueError(f"The baseline window is shorter than one analysis window "
                          f"({seg_len:.2f} s)")
     samples = np.round(np.asarray(starts) * sf).astype(int) + raw.first_samp
     ok = (samples >= raw.first_samp) & (samples + int(seg_len * sf) <= raw.last_samp)
     if not ok.any():
         raise ValueError("The baseline window falls outside the recording")
-    samples, owner = samples[ok], np.asarray(owner)[ok]
-    events = np.column_stack([samples, np.zeros_like(samples), np.ones_like(samples)])
-    picks = [c for c in ch_names if c in raw.ch_names]
-    ep = mne.Epochs(raw, events, {"baseline": 1}, tmin=0.0, tmax=seg_len - 1 / sf,
-                    baseline=None, picks=picks, preload=True, reject_by_annotation=True)
-    owner = owner[[i for i, d in enumerate(ep.drop_log) if not d]]
+    ep = mne.Epochs(raw, np.c_[samples[ok], np.zeros(ok.sum(), int), np.ones(ok.sum(), int)],
+                    {"baseline": 1}, tmin=0.0, tmax=seg_len - 1 / sf, baseline=None,
+                    picks=[c for c in ch_names if c in raw.ch_names], preload=True,
+                    reject_by_annotation=True)
     if not len(ep):
         raise ValueError("All baseline segments overlap BAD annotations")
-    return ep, owner
+    return ep, np.asarray(owner)[ok][[i for i, d in enumerate(ep.drop_log) if not d]]
 
 
-def baseline_band_power(raw: mne.io.BaseRaw, base: BandBaseline, settings: BandSettings,
-                        ch_names: list[str], seg_len: float, ref=None
-                        ) -> tuple[np.ndarray, np.ndarray]:
-    """Band power of baseline segments: (n_segments, n_ch, n_bands) and segment owners.
-
-    ``ref`` (see :func:`resolve_erp_reference`) re-references the
-    segments the same way as the epochs they are compared with."""
+def baseline_band_power(raw, base: BandBaseline, settings: BandSettings, ch_names, seg_len,
+                        ref=None):
+    """Band power of the baseline segments, re-referenced like the epochs, and their
+    owners."""
     ep, owner = baseline_epochs(raw, base, seg_len, ch_names)
-    ep = reference_epochs(ep, ref)
-    s = BandSettings(settings.bands, None, None, settings.method)
-    return band_power(ep, s), owner
+    return band_power(reference_epochs(ep, ref), BandSettings(settings.bands, None, None,
+                                                              settings.method)), owner
 
 
-def _subject_keys(values, n: int) -> np.ndarray:
-    """Subject labels as text ("" = unknown); one subject when there are none."""
-    if values is None:
-        return np.full(n, "", dtype=object)
-    v = pd.Series(values).fillna("").astype(str).to_numpy(dtype=object)
-    return v if len(v) == n else np.full(n, "", dtype=object)
+def subject_keys(values, n: int) -> np.ndarray:
+    """Subject labels as text ("" = unknown; all "" when there are none)."""
+    v = pd.Series(values).fillna("").astype(str).to_numpy(dtype=object) \
+        if values is not None else None
+    return v if v is not None and len(v) == n else np.full(n, "", dtype=object)
 
 
-def reference_for(onsets: np.ndarray, base: BandBaseline, base_bp: np.ndarray,
-                  owner: np.ndarray, subjects=None) -> tuple[np.ndarray, np.ndarray]:
-    """Baseline mean and SD per epoch: (n_epochs, n_ch, n_bands) each.
-
-    Normalisation is **per subject**: an epoch of subject *s* only uses baseline
-    segments of baseline events of *s* (``base.subjects`` and the epochs'
-    ``subjects``); without subject labels everything is one subject.
-    ``mode="mean"`` uses all of the subject's baseline segments; ``"nearest"`` the
-    segments of the subject's most recent baseline event before the epoch (or its
-    first one). Epochs whose subject has no baseline get NaN.
-    """
-    onsets = np.asarray(onsets, float)
-    n = len(onsets)
-    b_on = np.asarray(base.onsets, float)
-    b_sub = _subject_keys(base.subjects, len(b_on))
-    e_sub = _subject_keys(subjects, n)
+def reference_for(onsets, base: BandBaseline, base_bp, owner, subjects=None):
+    """Baseline mean and SD for each epoch, (epochs, channels, bands), **per subject**:
+    an epoch of subject *s* only uses the baseline segments of *s* (without subject
+    labels everything is one subject). ``mean``: all of them; ``nearest``: those of the
+    subject's last baseline event before the epoch (or its first). Epochs whose subject
+    has no baseline get NaN."""
+    import warnings
+    onsets, b_on = np.asarray(onsets, float), np.asarray(base.onsets, float)
+    b_sub, e_sub = subject_keys(base.subjects, len(b_on)), subject_keys(subjects, len(onsets))
     if not (b_sub != "").any() or not (e_sub != "").any():  # no subject information
-        b_sub, e_sub = np.full(len(b_on), "", object), np.full(n, "", object)
+        b_sub, e_sub = np.full(len(b_on), "", object), np.full(len(onsets), "", object)
     seg_sub = b_sub[owner]
-    shape = base_bp.shape[1:]
-    mean = np.full((n, *shape), np.nan)
-    sd = np.full((n, *shape), np.nan)
-    with np.errstate(invalid="ignore"):
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            for subj in np.unique(e_sub):
-                ei = np.flatnonzero(e_sub == subj)
-                si = seg_sub == subj
-                if not si.any():
-                    continue  # no baseline for this subject: leave NaN
-                if base.mode == "nearest":
-                    ks = np.flatnonzero(b_sub == subj)          # this subject's events
-                    pos = np.searchsorted(b_on[ks], onsets[ei], side="right") - 1
-                    pick = ks[np.clip(pos, 0, len(ks) - 1)]
-                    for e, k in zip(ei, pick):
-                        own = owner == k
-                        if not own.any():
-                            own = si
-                        mean[e] = np.nanmean(base_bp[own], 0)
-                        sd[e] = np.nanstd(base_bp[own if own.sum() > 1 else si], 0)
-                else:
-                    mean[ei] = np.nanmean(base_bp[si], 0)
-                    sd[ei] = np.nanstd(base_bp[si], 0)
+    mean = np.full((len(onsets), *base_bp.shape[1:]), np.nan)
+    sd = mean.copy()
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for subj in np.unique(e_sub):
+            ei, si = np.flatnonzero(e_sub == subj), seg_sub == subj
+            if not si.any():
+                continue  # no baseline for this subject
+            if base.mode != "nearest":
+                mean[ei], sd[ei] = np.nanmean(base_bp[si], 0), np.nanstd(base_bp[si], 0)
+                continue
+            ks = np.flatnonzero(b_sub == subj)          # this subject's baseline events
+            pick = ks[np.clip(np.searchsorted(b_on[ks], onsets[ei], side="right") - 1, 0,
+                              len(ks) - 1)]
+            for e, k in zip(ei, pick):
+                own = owner == k if (owner == k).any() else si
+                mean[e] = np.nanmean(base_bp[own], 0)
+                sd[e] = np.nanstd(base_bp[own if own.sum() > 1 else si], 0)
     return mean, sd
 
 
 def subjects_without_baseline(base: BandBaseline, subjects) -> list[str]:
     """Subjects of the epochs that have no baseline event."""
-    b = set(_subject_keys(base.subjects, len(base.onsets)))
-    e = set(_subject_keys(subjects, len(subjects) if subjects is not None else 0))
-    if b == {""} or e <= {""}:
-        return []
-    return sorted(e - b)
+    b = set(subject_keys(base.subjects, len(base.onsets)))
+    e = set(subject_keys(subjects, len(subjects) if subjects is not None else 0))
+    return [] if b == {""} or e <= {""} else sorted(e - b)
 
 
-def normalise(bp: np.ndarray, ref: np.ndarray | None, sd: np.ndarray | None,
-              mode: str) -> np.ndarray:
+def normalise(bp, ref, sd, mode: str):
     if mode == "absolute" or ref is None:
         return bp
+    if mode not in NORMALISATIONS:
+        raise ValueError(f"Unknown normalisation {mode!r}")
     with np.errstate(divide="ignore", invalid="ignore"):
-        if mode == "dB":
-            return 10 * np.log10(bp / ref)
-        if mode == "% change":
-            return 100 * (bp - ref) / ref
-        if mode == "ratio":
-            return bp / ref
-        if mode == "z":
-            return (bp - ref) / sd
-    raise ValueError(f"Unknown normalisation {mode!r}")
+        return {"dB": lambda: 10 * np.log10(bp / ref), "% change": lambda: 100 * (bp - ref) / ref,
+                "ratio": lambda: bp / ref, "z": lambda: (bp - ref) / sd}[mode]()
 
 
 def unit(mode: str) -> str:
     return {"absolute": "µV²", "dB": "dB", "% change": "%", "ratio": "×", "z": "z"}[mode]
 
 
-def resolve_roi(names, ch_names: list[str]) -> list[int]:
+def resolve_roi(names, ch_names) -> list[int]:
     lower = {c.lower(): i for i, c in enumerate(ch_names)}
     return [lower[n.lower()] for n in names if n.lower() in lower]
 
 
-def roi_mean(bp: np.ndarray, idx: list[int]) -> np.ndarray:
-    """Mean over ROI channels: (n_epochs, n_ch, n_bands) → (n_epochs, n_bands)."""
+def roi_mean(bp, idx) -> np.ndarray:
+    """Mean over ROI channels: (epochs, channels, bands) → (epochs, bands)."""
+    import warnings
     if not idx:
         return np.full((bp.shape[0], bp.shape[2]), np.nan)
-    with np.errstate(invalid="ignore"):
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            return np.nanmean(bp[:, idx, :], axis=1)
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmean(bp[:, idx, :], axis=1)
 
 
 INDEX_INFO = {
@@ -2917,137 +2865,100 @@ INDEX_INFO = {
 }
 
 
-def eeg_indices(bp: np.ndarray, ch_names: list[str], bands: dict,
-                rois: dict | None = None, ref: np.ndarray | None = None
-                ) -> tuple[pd.DataFrame, list[str]]:
-    """Per-epoch cognitive-state indices from absolute band power.
-
-    ``ref`` (same shape as ``bp``) is the baseline band power used for ERD/ERS.
-    Returns the table and notes about missing bands/channels.
-    """
+def eeg_indices(bp, ch_names, bands: dict, rois=None, ref=None):
+    """Cognitive-state indices per epoch from absolute band power; ``ref`` (the baseline
+    band power, same shape) gives ERD/ERS. Returns the table and notes."""
     rois = {**DEFAULT_ROIS, **(rois or {})}
+    idx = {k: resolve_roi(v, ch_names) for k, v in rois.items()}
+    notes = [f"no channel of ROI “{k}” ({', '.join(rois[k])})" for k, v in idx.items() if not v]
     names = [b.lower() for b in bands]
-    notes = []
-
-    def band(b):
-        return names.index(b) if b in names else None
-
-    th, al, be = band("theta"), band("alpha"), band("beta")
-    roi_idx = {k: resolve_roi(v, ch_names) for k, v in rois.items()}
-    for k, v in roi_idx.items():
-        if not v:
-            notes.append(f"no channel of ROI “{k}” ({', '.join(rois[k])})")
-    allidx = list(range(len(ch_names)))
-    r = {k: roi_mean(bp, v) for k, v in roi_idx.items()}
-    r["all"] = roi_mean(bp, allidx)
-    n = bp.shape[0]
-    nan = np.full(n, np.nan)
-    out = {}
+    if not {"theta", "alpha", "beta"} <= set(names):
+        return pd.DataFrame(index=range(bp.shape[0])), \
+            notes + ["indices need bands named theta, alpha and beta"]
+    th, al, be = (names.index(b) for b in ("theta", "alpha", "beta"))
+    r = {k: roi_mean(bp, v) for k, v in idx.items()}
+    r["all"] = roi_mean(bp, list(range(len(ch_names))))
+    fr = roi_mean(bp, idx["frontal midline"] + idx["left frontal"] + idx["right frontal"])
     with np.errstate(divide="ignore", invalid="ignore"):
-        if None in (th, al, be):
-            notes.append("indices need bands named theta, alpha and beta")
+        out = {"engagement β/(α+θ)": r["engagement"][:, be] / (r["engagement"][:, al]
+                                                                + r["engagement"][:, th]),
+               "workload FMθ/Pα": r["frontal midline"][:, th] / r["parietal"][:, al],
+               "θ/α": r["all"][:, th] / r["all"][:, al],
+               "θ/β frontal": fr[:, th] / fr[:, be],
+               "FAA ln α(F4)−ln α(F3)": (np.log(r["right frontal"][:, al])
+                                         - np.log(r["left frontal"][:, al]))}
+        if ref is not None:
+            rp, rf = roi_mean(ref, idx["parietal"]), roi_mean(ref, idx["frontal midline"])
+            out["α ERD % (parietal)"] = 100 * (r["parietal"][:, al] - rp[:, al]) / rp[:, al]
+            out["FMθ ERS % (frontal)"] = 100 * (r["frontal midline"][:, th] - rf[:, th]) / rf[:, th]
         else:
-            e = r["engagement"]
-            out["engagement β/(α+θ)"] = e[:, be] / (e[:, al] + e[:, th])
-            out["workload FMθ/Pα"] = r["frontal midline"][:, th] / r["parietal"][:, al]
-            out["θ/α"] = r["all"][:, th] / r["all"][:, al]
-            fr = roi_mean(bp, roi_idx["frontal midline"] + roi_idx["left frontal"] +
-                          roi_idx["right frontal"])
-            out["θ/β frontal"] = fr[:, th] / fr[:, be]
-            out["FAA ln α(F4)−ln α(F3)"] = (np.log(r["right frontal"][:, al])
-                                             - np.log(r["left frontal"][:, al]))
-            if ref is not None:
-                rp = roi_mean(ref, roi_idx["parietal"])
-                rf = roi_mean(ref, roi_idx["frontal midline"])
-                out["α ERD % (parietal)"] = 100 * (r["parietal"][:, al] - rp[:, al]) / rp[:, al]
-                out["FMθ ERS % (frontal)"] = 100 * (r["frontal midline"][:, th] - rf[:, th]) / rf[:, th]
-            else:
-                notes.append("ERD/ERS indices need a band-power baseline")
-    df = pd.DataFrame({k: (v if v is not None else nan) for k, v in out.items()})
-    return df, notes
+            notes.append("ERD/ERS indices need a band-power baseline")
+    return pd.DataFrame(out), notes
 
 
-def morlet_band(data: np.ndarray, sfreq: float, band: tuple[float, float]) -> np.ndarray:
-    """(n, n_ch, n_times) V → Morlet power averaged over the band's frequencies and the
-    channels: (n, n_times) µV²."""
+def morlet_band(data, sfreq, band) -> np.ndarray:
+    """(n, channels, times) V → Morlet power averaged over the band's frequencies and the
+    channels, (n, times) µV²."""
     lo, hi = band
     freqs = np.arange(lo, hi + 1e-9, max((hi - lo) / 6, 0.5))
-    if len(freqs) < 2:
-        freqs = np.array([lo, hi])
-    n_cycles = np.maximum(freqs / 2.0, 3.0)
-    p = mne.time_frequency.tfr_array_morlet(data, sfreq, freqs, n_cycles=n_cycles,
-                                            output="power")
+    freqs = freqs if len(freqs) >= 2 else np.array([lo, hi])
+    p = mne.time_frequency.tfr_array_morlet(data, sfreq, freqs, output="power",
+                                            n_cycles=np.maximum(freqs / 2.0, 3.0))
     with np.errstate(invalid="ignore"):
         return np.nanmean(p, axis=(1, 2)) * 1e12
 
 
-def band_timecourse(epochs: mne.BaseEpochs, band: tuple[float, float], picks: list[str]
-                    ) -> tuple[np.ndarray, np.ndarray]:
-    """Band power over epoch time on a channel set: times, (n_epochs, n_times) µV²."""
+def band_timecourse(epochs, band, picks):
+    """Band power over epoch time on a channel set: times, (epochs, times) µV²."""
     picks = [c for c in picks if c in epochs.ch_names]
     if not picks:
         raise ValueError("None of the time-course channels are in the epochs")
-    x = epochs.get_data(picks=picks)
-    return epochs.times, morlet_band(x, epochs.info["sfreq"], band)
+    return epochs.times, morlet_band(epochs.get_data(picks=picks), epochs.info["sfreq"], band)
 
 
-def baseline_timecourse_levels(raw: mne.io.BaseRaw, base: BandBaseline,
-                               band: tuple[float, float], picks: list[str],
-                               seg_len: float = 4.0, ref=None,
-                               ch_names: list[str] | None = None
-                               ) -> dict[str, tuple[float, float]]:
+def baseline_timecourse_levels(raw, base: BandBaseline, band, picks, seg_len=4.0, ref=None,
+                               ch_names=None) -> dict:
     """Mean and SD of the same Morlet band power in the baseline window (edges trimmed),
-    **per subject** (key "" when there are no subject labels). With ``ref``, segments
-    over ``ch_names`` are re-referenced like the epochs first."""
+    per subject ("" without subject labels), re-referenced like the epochs."""
     picks = [c for c in picks if c in raw.ch_names and c not in raw.info["bads"]]
-    chans = [c for c in (ch_names or picks) if c in raw.ch_names]
-    ep, owner = baseline_epochs(raw, base, max(seg_len, 6.0 / band[0]), chans)
+    ep, owner = baseline_epochs(raw, base, max(seg_len, 6.0 / band[0]),
+                                [c for c in (ch_names or picks) if c in raw.ch_names])
     ep = reference_epochs(ep, ref)
     p = morlet_band(ep.get_data(picks=picks), ep.info["sfreq"], band)
     trim = int(np.ceil(1.5 / band[0] * ep.info["sfreq"]))
-    core = p[:, trim:-trim] if p.shape[1] > 2 * trim + 2 else p
-    seg_sub = _subject_keys(base.subjects, len(base.onsets))[owner]
-    return {str(s): (float(np.nanmean(core[seg_sub == s])),
-                     float(np.nanstd(core[seg_sub == s].mean(1))))
+    p = p[:, trim:-trim] if p.shape[1] > 2 * trim + 2 else p
+    seg_sub = subject_keys(base.subjects, len(base.onsets))[owner]
+    return {str(s): (float(np.nanmean(p[seg_sub == s])), float(np.nanstd(p[seg_sub == s].mean(1))))
             for s in np.unique(seg_sub)}
 
 
-def gaze_metrics(onsets: np.ndarray, tmin: float, tmax: float, gaze=None, gaze_events=None,
-                 pupil=None, pupil_baseline=(-0.2, 0.0)) -> pd.DataFrame:
-    """Per-epoch eye metrics in [onset+tmin, onset+tmax]:
-
-    * pupil dilation (task-evoked, vs ``pupil_baseline`` before the event) — load
-    * blink rate (/min) and mean fixation duration (ms) inside the window
-    """
+def gaze_metrics(onsets, tmin, tmax, gaze=None, gaze_events=None, pupil=None,
+                 pupil_baseline=(-0.2, 0.0)) -> pd.DataFrame:
+    """Eye metrics per epoch in [onset+tmin, onset+tmax]: pupil dilation (vs
+    ``pupil_baseline`` before the event), blink rate (/min) and mean fixation duration
+    (ms)."""
+    import warnings
     n = len(onsets)
     out = {"pupil dilation": np.full(n, np.nan), "blink rate /min": np.full(n, np.nan),
            "mean fixation ms": np.full(n, np.nan)}
-    if gaze is not None:
-        p = pupil if pupil is not None else gaze.pupil
-        if p is not None and np.isfinite(p).any():
-            t = gaze.times
-            for i, on in enumerate(onsets):
-                b = (t >= on + pupil_baseline[0]) & (t < on + pupil_baseline[1])
-                w = (t >= on + max(tmin, 0)) & (t <= on + tmax)
-                if b.any() and w.any():
-                    with np.errstate(invalid="ignore"):
-                        import warnings
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore", RuntimeWarning)
-                            out["pupil dilation"][i] = np.nanmean(p[w]) - np.nanmean(p[b])
+    p = (pupil if pupil is not None else gaze.pupil) if gaze is not None else None
+    if p is not None and np.isfinite(p).any():
+        t = gaze.times
+        for i, on in enumerate(onsets):
+            b = (t >= on + pupil_baseline[0]) & (t < on + pupil_baseline[1])
+            w = (t >= on + max(tmin, 0)) & (t <= on + tmax)
+            if b.any() and w.any():
+                with np.errstate(invalid="ignore"), warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    out["pupil dilation"][i] = np.nanmean(p[w]) - np.nanmean(p[b])
     if gaze_events is not None:
-        dur_min = (tmax - tmin) / 60.0
-        bl = gaze_events.blinks["onset"].to_numpy(float) if len(gaze_events.blinks) else \
-            np.array([])
-        fx = gaze_events.fixations
-        fo = fx["onset"].to_numpy(float) if len(fx) else np.array([])
-        fd = fx["duration"].to_numpy(float) if len(fx) else np.array([])
+        bl = gaze_events.blinks["onset"].to_numpy(float)
+        fo, fd = (gaze_events.fixations[c].to_numpy(float) for c in ("onset", "duration"))
         for i, on in enumerate(onsets):
             a, b = on + tmin, on + tmax
-            out["blink rate /min"][i] = ((bl >= a) & (bl < b)).sum() / dur_min
-            m = (fo >= a) & (fo < b)
-            if m.any():
-                out["mean fixation ms"][i] = fd[m].mean() * 1000
+            out["blink rate /min"][i] = ((bl >= a) & (bl < b)).sum() / ((tmax - tmin) / 60.0)
+            if ((fo >= a) & (fo < b)).any():
+                out["mean fixation ms"][i] = fd[(fo >= a) & (fo < b)].mean() * 1000
     return pd.DataFrame(out)
 
 
@@ -3064,10 +2975,10 @@ class GroupSpec:
     recordings: dict = field(default_factory=dict)
 
 
-def select_events(table: pd.DataFrame, spec: GroupSpec) -> pd.DataFrame:
+def select_events(table, spec: GroupSpec) -> pd.DataFrame:
     """Rows of the event table in a group (raises ValueError for invalid filters)."""
     df = filter_events(table, spec.text, spec.query, set(spec.names),
-                          [tuple(c) for c in spec.conditions])
+                       [tuple(c) for c in spec.conditions])
     for col, keep in spec.recordings.items():
         if col in df:
             df = df[df[col].fillna("").astype(str).isin(keep)]
@@ -3082,57 +2993,50 @@ class ErpSpec:
     reference: str = "recorded"   # average | mastoids | recorded | channel names
 
 
-def run_erp(epochs: dict[str, mne.BaseEpochs], spec: ErpSpec) -> dict:
-    """ERP component analysis. With several subjects: one Evoked per subject and group,
-    grand average of those, subjects as observations (:func:`eeg.group_component_analysis`);
-    otherwise trials are the observations (:func:`eeg.component_analysis`)."""
-    groups = {g: epochs[g] for g in spec.groups}
-    first = next(iter(groups.values()))
-    ref, ref_label = resolve_erp_reference(spec.reference, list(first.ch_names))
+def run_erp(epochs: dict, spec: ErpSpec) -> dict:
+    """The ERP component: re-reference, baseline, average. With several subjects one
+    Evoked per subject and group and their grand average, subjects as observations
+    (:func:`group_component_analysis`); otherwise trials as observations
+    (:func:`component_analysis`)."""
     comp, bl = spec.component, spec.baseline
-    notes = []
-    eps = {g: reference_epochs(ep, ref) for g, ep in groups.items()}
-    eps = {g: (ep.copy().apply_baseline(bl) if bl else ep)
-           for g, ep in eps.items()}
-    evokeds = {}
-    for g, ep in eps.items():
-        ev = ep.average()
-        ev.comment = g
-        evokeds[g] = ev
+    ref, ref_label = resolve_erp_reference(spec.reference,
+                                           list(epochs[spec.groups[0]].ch_names))
+    eps = {g: reference_epochs(epochs[g], ref) for g in spec.groups}
+    eps = {g: ep.copy().apply_baseline(bl) if bl else ep for g, ep in eps.items()}
     summary, per = component_analysis(eps, comp)
     subj = {g: epoch_subjects(ep) for g, ep in eps.items()}
     if any(k is not None for k in subj.values()):
-        per.insert(1, "subject", np.concatenate(
-            [k if k is not None else np.full(len(ep), "", object)
-             for k, ep in zip(subj.values(), eps.values())]))
-    group = None
+        per.insert(1, "subject", np.concatenate([k if k is not None else np.full(len(ep), "", object)
+                                                 for k, ep in zip(subj.values(), eps.values())]))
+    out = dict(eps=eps, per_epoch=per, roi=list(comp.channels), comp=comp, baseline=bl,
+               notes=[], reference=ref_label, group=None, spec=spec)
     if len(subjects_in(eps)) >= 2:
         group = group_component_analysis(eps, comp)
         unknown = sum(int((k == "").sum()) for k in subj.values() if k is not None)
         if unknown:
-            notes.append(f"⚠ {unknown} epochs without a subject are left out of the "
-                         "subject averages")
-        return dict(eps=eps, evokeds=group["grand"], summary=group["summary"],
-                    per_epoch=per, diff=group["grand_diff"], roi=list(comp.channels),
-                    comp=comp, baseline=bl, notes=notes, reference=ref_label, group=group,
-                    spec=spec)
+            out["notes"].append(f"⚠ {unknown} epochs without a subject are left out of the "
+                                "subject averages")
+        return {**out, "evokeds": group["grand"], "summary": group["summary"],
+                "diff": group["grand_diff"], "group": group}
+    evokeds = {g: ep.average() for g, ep in eps.items()}
+    for g, ev in evokeds.items():
+        ev.comment = g
     diff = None
     if len(eps) == 2:
         (la, a), (lb, b) = eps.items()
         diff = mne.combine_evoked([evokeds[la], evokeds[lb]], weights=[1, -1])
         diff.comment = f"{la} − {lb}"
-        ov = len(set(a.events[:, 0]) & set(b.events[:, 0]))
-        if ov:
-            notes.append(f"⚠ {ov} events are in both groups (tests assume independence)")
-    return dict(eps=eps, evokeds=evokeds, summary=summary, per_epoch=per, diff=diff,
-                roi=list(comp.channels), comp=comp, baseline=bl, notes=notes,
-                reference=ref_label, group=None, spec=spec)
+        both = len(set(a.events[:, 0]) & set(b.events[:, 0]))
+        if both:
+            out["notes"].append(f"⚠ {both} events are in both groups (tests assume "
+                                "independence)")
+    return {**out, "evokeds": evokeds, "summary": summary, "diff": diff}
 
 
 @dataclass
 class BaselineSpec:
     """Baseline after a baseline event: ``t0``…``t1`` s after each ``event`` matching
-    ``query``; ``mode`` "all" or "nearest" (see :class:`bandpower.BandBaseline`)."""
+    ``query``; ``mode`` "all" or "nearest" (see :class:`BandBaseline`)."""
     event: str
     t0: float
     t1: float
@@ -3140,20 +3044,18 @@ class BaselineSpec:
     query: str = ""
 
 
-def band_baseline(table: pd.DataFrame, spec: BaselineSpec | None) -> BandBaseline | None:
+def band_baseline(table, spec: BaselineSpec | None) -> BandBaseline | None:
     if spec is None:
         return None
     sel = table[table["name"].astype(str) == spec.event]
-    if spec.query.strip():
-        sel = filter_events(sel, query=spec.query)
+    sel = filter_events(sel, query=spec.query) if spec.query.strip() else sel
     if not len(sel):
         raise ValueError(f"No “{spec.event}” events match the baseline filter")
     if spec.t1 <= spec.t0:
         raise ValueError("The baseline end must be after its start")
     sel = sel.sort_values("onset")
-    subjects = sel["subject"].to_numpy() if "subject" in sel else None
-    return BandBaseline(sel["onset"].to_numpy(float), spec.t0, spec.t1, spec.mode,
-                           spec.event, subjects)
+    return BandBaseline(sel["onset"].to_numpy(float), spec.t0, spec.t1, spec.mode, spec.event,
+                        sel["subject"].to_numpy() if "subject" in sel else None)
 
 
 @dataclass
@@ -3169,109 +3071,84 @@ class BandPowerSpec:
     norm: str = "dB"                                # used only with a baseline
 
 
-def run_bandpower(epochs: dict[str, mne.BaseEpochs], raw: mne.io.BaseRaw,
-                  table: pd.DataFrame, spec: BandPowerSpec) -> dict:
+def run_bandpower(epochs: dict, raw, table, spec: BandPowerSpec) -> dict:
     """Band power per epoch (``Epochs.compute_psd``), normalised per subject against the
     baseline after a baseline event, on the ROI mean; group comparisons per band."""
-    groups = {g: epochs[g] for g in spec.groups}
-    first = next(iter(groups.values()))
-    bands = dict(spec.bands)
+    first = epochs[spec.groups[0]]
+    ch, names = list(first.ch_names), list(spec.bands)
     base = band_baseline(table, spec.baseline)
-    roi = list(spec.roi) or list(first.ch_names)
-    s = BandSettings(bands, spec.tmin, spec.tmax, spec.method)
-    eeg_ref, ref_label = resolve_erp_reference(spec.reference, list(first.ch_names))
+    s = BandSettings(dict(spec.bands), spec.tmin, spec.tmax, spec.method)
+    ref, ref_label = resolve_erp_reference(spec.reference, ch)
     mode = spec.norm if base is not None else "absolute"
-    names = list(bands)
-    notes = []
-    out = {"bp": {}, "ref": {}, "sd": {}, "norm": {}, "per": [], "bands": bands,
-           "mode": mode, "roi": roi, "base": base, "settings": s,
-           "reference": eeg_ref, "reference_label": ref_label, "spec": spec}
-    eps = {g: reference_epochs(ep, eeg_ref) for g, ep in groups.items()}
-    ch = list(first.ch_names)
-    seg = (min(s.tmax, first.tmax) - max(s.tmin, first.tmin))
-    base_bp = owner = None
+    eps = {g: reference_epochs(epochs[g], ref) for g in spec.groups}
+    out = {"bp": {}, "ref": {}, "sd": {}, "norm": {}, "bands": s.bands, "mode": mode,
+           "roi": list(spec.roi) or ch, "base": base, "settings": s, "reference": ref,
+           "reference_label": ref_label, "spec": spec, "notes": []}
+    seg = min(s.tmax, first.tmax) - max(s.tmin, first.tmin)
     if base is not None:
-        base_bp, owner = baseline_band_power(raw, base, s, ch, seg, ref=eeg_ref)
-        notes.append(f"baseline: {len(base_bp)} segments of {seg:.2f} s from "
-                     f"{len(np.unique(owner))} “{base.label}” event(s), "
-                     f"{base.t0:g}…{base.t1:g} s after")
-        subj_all = sorted({str(x) for ep in eps.values() if ep.metadata is not None
+        base_bp, owner = baseline_band_power(raw, base, s, ch, seg, ref=ref)
+        out["notes"].append(f"baseline: {len(base_bp)} segments of {seg:.2f} s from "
+                            f"{len(np.unique(owner))} “{base.label}” event(s), "
+                            f"{base.t0:g}…{base.t1:g} s after")
+        subjects = sorted({str(x) for ep in eps.values() if ep.metadata is not None
                            and "subject" in ep.metadata
                            for x in ep.metadata["subject"].fillna("")} - {""})
-        if subj_all:
-            notes.append(f"normalised per subject ({len(subj_all)}: "
-                         f"{', '.join(subj_all[:8])}{' …' if len(subj_all) > 8 else ''})")
-            missing = subjects_without_baseline(base, subj_all)
+        if subjects:
+            out["notes"].append(f"normalised per subject ({len(subjects)}: "
+                                f"{', '.join(subjects[:8])}{' …' if len(subjects) > 8 else ''})")
+            missing = subjects_without_baseline(base, subjects)
             if missing:
-                notes.append("⚠ no baseline event for subject(s) "
-                             f"{', '.join(missing)}: their epochs are left out "
-                             "of the normalised values")
-    ridx = resolve_roi(roi, ch)
+                out["notes"].append(f"⚠ no baseline event for subject(s) {', '.join(missing)}: "
+                                    "their epochs are left out of the normalised values")
+    ridx, per = resolve_roi(out["roi"], ch), []
     for g, ep in eps.items():
-        bp = band_power(ep, s)
-        out["bp"][g] = bp
-        if base_bp is not None:
-            subj = (ep.metadata["subject"].to_numpy()
-                    if "subject" in ep.metadata else None)
-            ref, sd = reference_for(ep.metadata["onset"].to_numpy(float), base,
-                                       base_bp, owner, subj)
-        else:
-            ref = sd = None
-        out["ref"][g], out["sd"][g] = ref, sd
-        if mode == "dB" and ref is not None:
-            # dB of ROI-mean power (averaging dB across channels is biased)
-            val = 10 * np.log10(roi_mean(bp, ridx) / roi_mean(ref, ridx))
-        else:
-            val = roi_mean(normalise(bp, ref, sd, mode), ridx)
-        out["norm"][g] = normalise(bp, ref, sd, mode)
-        df = pd.DataFrame(val, columns=names)
-        df.insert(0, "group", g)
-        df.insert(1, "onset", ep.metadata["onset"].to_numpy(float))
-        out["per"].append(df)
-    per = pd.concat(out["per"], ignore_index=True)
-    out["per_epoch"] = per
-    out["table"] = comparison_table(per, names, list(eps))
-    out["notes"] = notes
+        bp = out["bp"][g] = band_power(ep, s)
+        r = sd = None
+        if base is not None:
+            r, sd = reference_for(ep.metadata["onset"].to_numpy(float), base, base_bp, owner,
+                                  ep.metadata["subject"].to_numpy()
+                                  if "subject" in ep.metadata else None)
+        out["ref"][g], out["sd"][g] = r, sd
+        out["norm"][g] = normalise(bp, r, sd, mode)
+        # dB of the ROI-mean power (averaging dB across channels is biased)
+        val = 10 * np.log10(roi_mean(bp, ridx) / roi_mean(r, ridx)) \
+            if mode == "dB" and r is not None else roi_mean(out["norm"][g], ridx)
+        per.append(pd.DataFrame(val, columns=names).assign(
+            group=g, onset=ep.metadata["onset"].to_numpy(float))[["group", "onset", *names]])
+    out["per_epoch"] = pd.concat(per, ignore_index=True)
+    out["table"] = comparison_table(out["per_epoch"], names, list(eps))
     return out
 
 
-def sem(x: np.ndarray, axis=0) -> np.ndarray:
+def sem(x, axis=0) -> np.ndarray:
     """``scipy.stats.sem`` ignoring NaNs; NaN where fewer than two values (no warnings)."""
     import warnings
-
-    from scipy import stats
     with warnings.catch_warnings(), np.errstate(all="ignore"):
         warnings.simplefilter("ignore")
-        return np.asarray(stats.sem(np.asarray(x, float), axis=axis, nan_policy="omit"),
+        return np.asarray(scipy_stats.sem(np.asarray(x, float), axis=axis, nan_policy="omit"),
                           float)
 
 
-def run_timecourse(bp: dict, epochs: dict[str, mne.BaseEpochs], raw: mne.io.BaseRaw,
-                   band: str) -> dict:
+def run_timecourse(bp: dict, epochs: dict, raw, band: str) -> dict:
     """Morlet power time course of one band (ERD/ERS) on the band-power result's ROI,
     reference and baseline (per subject)."""
-    rng = bp["bands"][band]
+    rng, mode, roi = bp["bands"][band], bp["mode"], bp["roi"]
     groups = {g: epochs[g] for g in bp["bp"] if g in epochs}
-    base, mode, roi = bp["base"], bp["mode"], bp["roi"]
+    levels = baseline_timecourse_levels(
+        raw, bp["base"], rng, roi, ref=bp["reference"],
+        ch_names=list(next(iter(groups.values())).ch_names)) \
+        if bp["base"] is not None and mode != "absolute" else None
     out = {"band": band, "mode": mode, "curves": {}}
-    levels = None
-    if base is not None and mode != "absolute":
-        levels = baseline_timecourse_levels(   # per subject
-            raw, base, rng, roi, ref=bp["reference"],
-            ch_names=list(next(iter(groups.values())).ch_names))
     for g, ep in groups.items():
         t, pw = band_timecourse(reference_epochs(ep, bp["reference"]), rng, roi)
         if levels is not None:
-            subj = _subject_keys(ep.metadata["subject"].to_numpy()
-                                    if ep.metadata is not None
-                                    and "subject" in ep.metadata else None, len(pw))
+            subj = subject_keys(ep.metadata["subject"].to_numpy() if ep.metadata is not None
+                                and "subject" in ep.metadata else None, len(pw))
             if set(levels) == {""}:
                 subj[:] = ""
-            lvl = np.array([levels.get(x, (np.nan, np.nan))[0] for x in subj])[:, None]
-            sd = np.array([levels.get(x, (np.nan, np.nan))[1] for x in subj])[:, None]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                pw = {"dB": 10 * np.log10(pw / lvl), "% change": 100 * (pw - lvl) / lvl,
-                      "ratio": pw / lvl, "z": (pw - lvl) / sd}[mode]
+            lvl, sd = (np.array([levels.get(x, (np.nan, np.nan))[i] for x in subj])[:, None]
+                       for i in (0, 1))
+            pw = normalise(pw, lvl, sd, mode)
         out["curves"][g] = (t, np.nanmean(pw, 0), sem(pw))
     return out
 
@@ -3282,26 +3159,19 @@ class IndicesSpec:
     measures: list[str]
 
 
-def run_indices(bp: dict, epochs: dict[str, mne.BaseEpochs], gaze, gaze_events,
-                spec: IndicesSpec) -> dict:
+def run_indices(bp: dict, epochs: dict, gaze, gaze_events, spec: IndicesSpec) -> dict:
     """Cognitive indices per epoch from the band-power result, plus eye metrics."""
-    s = bp["settings"]
-    per, notes = [], []
+    s, per, notes = bp["settings"], [], []
     for g, b in bp["bp"].items():
-        ep = epochs[g]
+        ep, on = epochs[g], epochs[g].metadata["onset"].to_numpy(float)
         df, n = eeg_indices(b, list(ep.ch_names), bp["bands"], spec.rois, bp["ref"][g])
         notes += [x for x in n if x not in notes]
-        on = ep.metadata["onset"].to_numpy(float)
-        gm = gaze_metrics(on, max(s.tmin, ep.tmin), min(s.tmax, ep.tmax), gaze,
-                             gaze_events)
-        df = pd.concat([df, gm], axis=1)
-        df.insert(0, "group", g)
-        df.insert(1, "onset", on)
-        per.append(df)
+        gm = gaze_metrics(on, max(s.tmin, ep.tmin), min(s.tmax, ep.tmax), gaze, gaze_events)
+        per.append(pd.concat([df, gm], axis=1).assign(group=g, onset=on))
     per = pd.concat(per, ignore_index=True)
+    per = per[["group", "onset"] + [c for c in per.columns if c not in ("group", "onset")]]
     cols = [c for c in spec.measures if c in per.columns and per[c].notna().any()]
-    missing = [c for c in spec.measures if c not in cols]
-    if missing:
-        notes.append("not available: " + ", ".join(missing))
-    table = comparison_table(per, cols, list(bp["bp"]))
-    return dict(per_epoch=per, table=table, measures=cols, notes=notes, spec=spec)
+    if [c for c in spec.measures if c not in cols]:
+        notes.append("not available: " + ", ".join(c for c in spec.measures if c not in cols))
+    return dict(per_epoch=per, table=comparison_table(per, cols, list(bp["bp"])),
+                measures=cols, notes=notes, spec=spec)
