@@ -16,7 +16,7 @@ from pathlib import Path
 import mne
 import numpy as np
 
-from .eeg import set_standard_montage
+from .core import set_standard_montage
 
 SCREEN = (1920, 1080)
 CH_NAMES = ["Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8", "FC5", "FC1", "FC2", "FC6",

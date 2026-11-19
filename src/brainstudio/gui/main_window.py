@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .. import core as C
+from .. import session as S
 import traceback
 from pathlib import Path
 
@@ -11,11 +13,8 @@ import pandas as pd
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import eeg as E
-from .. import events as EV
-from .. import gaze as G
 from .. import io as bio
-from ..io.multi import subject_spans
+from ..core import subject_spans
 from ..model import Recording
 from . import icons, style
 from .eeg_analysis import AnalysisTab
@@ -436,11 +435,11 @@ class MainWindow(QtWidgets.QMainWindow):
         box = QtWidgets.QGroupBox("Gaze event detection")
         self.gaze_box = box
         f = QtWidgets.QFormLayout(box)
-        p = G.DetectionParams()
+        p = C.DetectionParams()
         # presets: "Automatic" picks one from the data at load (Gazepoint FPOG vs raw)
         self.p_preset = QtWidgets.QComboBox()
         self.p_preset.addItem("Automatic (from the data)", "auto")
-        for key, (label, _, why) in G.PRESETS.items():
+        for key, (label, _, why) in C.PRESETS.items():
             self.p_preset.addItem(label, key)
             self.p_preset.setItemData(self.p_preset.count() - 1, why, QtCore.Qt.ToolTipRole)
         self.p_preset.addItem("Custom", "custom")
@@ -621,7 +620,7 @@ class MainWindow(QtWidgets.QMainWindow):
             runs = bio.scan_bids(root)
         self.bids_root = root
         self.tree.clear()
-        desc = bio.bids.dataset_description(root)
+        desc = C.dataset_description(root)
         top = QtWidgets.QTreeWidgetItem([desc.get("Name", root.name)])
         self.tree.addTopLevelItem(top)
         nodes = {}
@@ -877,7 +876,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if raw is None:
             return
         self.trig_ch.addItems(raw.ch_names)
-        guess = E.guess_trigger_channel(raw)
+        guess = C.guess_trigger_channel(raw)
         if guess:
             self.trig_ch.setCurrentText(guess)
             if not self.rec.streams:  # EDF/BDF/…: open the box when a trigger is likely
@@ -889,7 +888,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ch = self.trig_ch.currentText()
         try:
             mask, mode = self.trig_mask.value() or None, self.trig_mode.currentData()
-            found = E.trigger_codes(self.rec.raw, ch, mask, mode)
+            found = C.trigger_codes(self.rec.raw, ch, mask, mode)
         except Exception as e:
             self._error("Trigger channel", e)
             return
@@ -959,7 +958,7 @@ class MainWindow(QtWidgets.QMainWindow):
             name.setFlags(name.flags() & ~QtCore.Qt.ItemIsEditable)
             t.setItem(i, 0, name)
             combo = QtWidgets.QComboBox()
-            combo.addItems(list(bio.xdf.ROLES))
+            combo.addItems(list(C.ROLES))
             combo.setCurrentText(st["role"])
             combo.setToolTip(f"automatic: {st['auto_role']}")
             combo.currentTextChanged.connect(lambda _=None: self._roles_edited())
@@ -1123,7 +1122,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         raw = self.display_raw.copy()
         if self.gaze_events is not None:
-            E.add_gaze_annotations(raw, self.gaze_events, ("blinks", "saccades"))
+            C.add_gaze_annotations(raw, self.gaze_events, ("blinks", "saccades"))
         t0, t1 = self.eeg_plot.window()
         raw.plot(start=max(t0, 0), duration=t1 - t0, block=False, show=True,
                  scalings=dict(eeg=self.eeg_scale.value() * 1e-6,
@@ -1134,11 +1133,11 @@ class MainWindow(QtWidgets.QMainWindow):
         else the values in the Controls panel."""
         key = self.p_preset.currentData()
         if key == "auto":
-            return G.PRESETS[G.suggest_preset(gaze if gaze is not None else
+            return C.PRESETS[S.suggest_preset(gaze if gaze is not None else
                                               (self.rec.gaze if self.rec else None))][1]
-        if key in G.PRESETS:
-            return G.PRESETS[key][1]
-        return G.DetectionParams(
+        if key in C.PRESETS:
+            return C.PRESETS[key][1]
+        return C.DetectionParams(
             blink_min_dur=self.p_blink_min.value(), blink_max_dur=self.p_blink_max.value(),
             fix_dispersion=self.p_fix_disp.value(), fix_min_dur=self.p_fix_dur.value(),
             sac_threshold_factor=self.p_sac_lambda.value(), sac_min_dur=self.p_sac_dur.value(),
@@ -1157,11 +1156,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.p_velocity.setCurrentIndex(max(self.p_velocity.findData(p.velocity_method), 0))
         finally:
             self._showing_params = False
-        key = G.preset_name(p)
+        key = C.preset_name(p)
         auto = self.p_preset.currentData() == "auto"
-        self.p_preset_note.setText(f"→ {G.PRESETS[key][0]}" if auto and key else "")
-        self.p_preset_note.setToolTip(G.PRESETS[key][2] if key else "")
-        self.p_preset.setToolTip(G.PRESETS[key][2] if key else
+        self.p_preset_note.setText(f"→ {C.PRESETS[key][0]}" if auto and key else "")
+        self.p_preset_note.setToolTip(C.PRESETS[key][2] if key else "")
+        self.p_preset.setToolTip(C.PRESETS[key][2] if key else
                                  "Detection settings for the kind of gaze data.")
 
     def _preset_chosen(self):
@@ -1186,7 +1185,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _show_gaze_events(self, rebuilt: bool = True):
         ev = self.gaze_events
         self._show_params(self.session.gaze_params)
-        self.pupil_clean = (G.clean_pupil(self.rec.gaze, ev.blinks)
+        self.pupil_clean = (S.clean_pupil(self.rec.gaze, ev.blinks)
                             if self.cb_pupil_clean.isChecked() else None)
         self.gaze_plot.set_gaze(self.rec.gaze, self.pupil_clean)
         self.eeg_plot.gaze_events = ev
@@ -1207,7 +1206,7 @@ class MainWindow(QtWidgets.QMainWindow):
         df = self.event_df
         m = df[df["kind"] == "marker"] if len(df) else df
         cols = ["onset", "name", "duration", "phase"] + [
-            c for c in m.columns if c not in EV.BASE_COLUMNS + ["phase", "x", "y",
+            c for c in m.columns if c not in C.BASE_COLUMNS + ["phase", "x", "y",
                                                                 "amplitude", "peak_velocity"]
             and m[c].notna().any() and (m[c].astype(str) != "").any()]
         cols = [c for c in cols if c in m.columns]
@@ -1379,7 +1378,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _heat_toggled(self, *_):
         self.screen.show_heatmap = self.cb_heat.isChecked()
         if self.gaze_events is not None and self.rec is not None and self.rec.has_gaze:
-            hm = G.heatmap(self.gaze_events.fixations, self.screen.screen)
+            hm = C.heatmap(self.gaze_events.fixations, self.screen.screen)
             self.screen.set_heatmap(hm)
         else:
             self.screen.set_heatmap(None)

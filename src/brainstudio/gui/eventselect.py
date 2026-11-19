@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+from .. import core as C
 import pandas as pd
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import events as EV
 from .theme import THEME
 
 QUERY_HELP = ("Metadata filter — pandas / MNE epochs-metadata syntax, e.g.\n"
@@ -29,7 +29,7 @@ class _ConditionRow(QtWidgets.QWidget):
         self.col = QtWidgets.QComboBox()
         self.col.setMinimumWidth(90)
         self.op = QtWidgets.QComboBox()
-        self.op.addItems(list(EV.OPERATORS))
+        self.op.addItems(list(C.OPERATORS))
         self.op.setToolTip("= ≠ < ≤ > ≥ compare numbers (or text for = ≠); contains: text "
                            "anywhere in the value; one of: comma-separated values")
         self.value = QtWidgets.QComboBox()
@@ -97,7 +97,7 @@ class _ConditionRow(QtWidgets.QWidget):
 
 
 class EventSelector(QtWidgets.QGroupBox):
-    """Pick events from the unified event table (see :mod:`brainstudio.events`)."""
+    """Pick events from the unified event table (see :func:`brainstudio.core.event_table`)."""
 
     changed = QtCore.Signal()
 
@@ -105,7 +105,7 @@ class EventSelector(QtWidgets.QGroupBox):
                  default_names=(), parent=None):
         super().__init__(parent)
         self.color_index = color_index
-        self.table = pd.DataFrame(columns=EV.BASE_COLUMNS)
+        self.table = pd.DataFrame(columns=C.BASE_COLUMNS)
         self._checked: set[str] = set(default_names)
         self._ready = False
         lay = QtWidgets.QVBoxLayout(self)
@@ -226,13 +226,13 @@ class EventSelector(QtWidgets.QGroupBox):
 
     def selected(self) -> pd.DataFrame:
         """Rows selected by the checklist and filters (raises ValueError)."""
-        return EV.filter_events(self.table, self.text.text(), self.query.text(),
+        return C.filter_events(self.table, self.text.text(), self.query.text(),
                                 self._checked, self.conditions())
 
     def describe(self) -> str:
         parts = [", ".join(sorted(self._checked)) or "nothing"]
-        if EV.describe_conditions(self.conditions()):
-            parts.append(EV.describe_conditions(self.conditions()))
+        if C.describe_conditions(self.conditions()):
+            parts.append(C.describe_conditions(self.conditions()))
         if self.text.text().strip():
             parts.append(f"text ~ /{self.text.text().strip()}/")
         if self.query.text().strip():
@@ -272,7 +272,7 @@ class EventSelector(QtWidgets.QGroupBox):
         self.list.clear()
         err = None
         try:
-            filtered = EV.filter_events(self.table, self.text.text(), self.query.text(),
+            filtered = C.filter_events(self.table, self.text.text(), self.query.text(),
                                         conditions=self.conditions())
         except ValueError as e:
             filtered, err = self.table.iloc[0:0], str(e)

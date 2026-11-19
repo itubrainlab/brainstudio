@@ -87,16 +87,33 @@ def detection_params(gaze, preset: str | None, custom: C.DetectionParams | None 
     """Gaze detection settings: the preset's (``auto``: chosen from the data) or
     ``custom``."""
     if preset == "auto":
-        from .io import gaze_table
-        return C.PRESETS[C.suggest_preset(gaze_table(gaze))][1]
+        return C.PRESETS[suggest_preset(gaze)][1]
     if preset in C.PRESETS:
         return C.PRESETS[preset][1]
     return custom or C.DetectionParams()
 
 
-def detect_gaze_events(gaze, params: C.DetectionParams):
+# ------------------------------------------------------------------ GazeData → core
+# The views keep gaze as GazeData (arrays for plotting); core works on gaze tables.
+def suggest_preset(gaze) -> str:
+    from .io import gaze_table
+    return C.suggest_preset(gaze_table(gaze))
+
+
+def detect_gaze_events(gaze, params: C.DetectionParams = C.DetectionParams()):
     from .io import gaze_table
     return C.detect_gaze_events(gaze_table(gaze), params)
+
+
+def clean_pupil(gaze, blinks, pad: float = 0.05):
+    from .io import gaze_table
+    return C.clean_pupil(gaze_table(gaze), blinks, pad)
+
+
+def event_table(rec, gaze_events=None, aois=None):
+    """The event table of a Recording (markers, annotations and gaze events)."""
+    return C.event_table(rec.all_events() if rec is not None else None, gaze_events, aois,
+                         getattr(rec, "segments", None) if rec is not None else None)
 
 
 def trigger_events(raw, channel: str, mask: int | None, mode: str,

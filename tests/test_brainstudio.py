@@ -1,17 +1,14 @@
 """Tests on synthetic data (BIDS + XDF round trips, gaze detection, FRPs)."""
 
+from brainstudio import core as C
+from brainstudio import session as S
 import numpy as np
 import mne
 import pandas as pd
 import pytest
-
-from brainstudio import eeg as E
-from brainstudio import events as EV
-from brainstudio import gaze as G
-from brainstudio import preprocessing as P
 from brainstudio.demo import simulate, write_bids, write_xdf_demo
 from brainstudio.io import load_bids_run, load_xdf, scan_bids
-from brainstudio.io.xdf import _clean_timestamps
+from brainstudio.core import clean_timestamps as _clean_timestamps
 from brainstudio.io.xdf_writer import write_xdf
 
 
@@ -47,7 +44,7 @@ def test_fixation_detection_matches_truth():
     sim = simulate(duration=60, seed=3)
     from brainstudio.model import GazeData
     g = GazeData(sim.gaze_t, sim.gx, sim.gy, sim.pupil)
-    fix = G.detect_events(g).fixations
+    fix = S.detect_gaze_events(g).fixations
     err = np.abs(fix.onset.to_numpy()[:, None] - sim.fix_onsets[None]).min(1)
     assert np.median(err) < 0.03
     assert 0.8 < len(fix) / len(sim.fix_onsets) < 1.4
@@ -57,16 +54,16 @@ def test_aoi_stats_use_pymovements():
     import pandas as pd
     fix = pd.DataFrame({"onset": [0, 1], "offset": [.2, 1.3], "duration": [.2, .3],
                         "x": [100, 900], "y": [100, 500]})
-    st = G.aoi_statistics(fix, G.make_aois({"a": (50, 50, 100, 100)}))
+    st = C.aoi_statistics(fix, C.make_aois({"a": (50, 50, 100, 100)}))
     assert st.n_fixations.iloc[0] == 1 and st.dwell_time.iloc[0] == pytest.approx(.2)
 
 
 def test_frp_recovers_lambda_response(demo):
     rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
-    raw = P.run_preprocessing(rec.raw, P.PreprocParams(l_freq=1, h_freq=30))
-    ev = G.detect_events(rec.gaze)
+    raw = C.run_preprocessing(rec.raw, C.PreprocParams(l_freq=1, h_freq=30))
+    ev = S.detect_gaze_events(rec.gaze)
     fix = ev.fixations[ev.fixations.duration >= 0.1].assign(name="fixation")
-    evk = E.epochs_from_table(raw, fix, -0.2, 0.6).average()
+    evk = C.epochs_from_table(raw, fix, -0.2, 0.6).average()
     oz = evk.copy().pick(["Oz"]).data[0]
     assert 0.06 < evk.times[np.argmax(oz)] < 0.14  # simulated P1 at ~90 ms
 
@@ -118,8 +115,6 @@ def test_foreign_clock_samples_recover_offset(tmp_path):
 def test_event_table_parsing_and_context(demo):
     import mne
     import pandas as pd
-
-    from brainstudio import events as EV
     from brainstudio.model import Recording
 
     ev = pd.DataFrame({"onset": [1.0, 2.0, 3.0, 9.0, 10.0],
@@ -132,48 +127,46 @@ def test_event_table_parsing_and_context(demo):
     from brainstudio.model import GazeEvents
     ge = GazeEvents.empty()
     ge.fixations = fix
-    tab = EV.build_event_table(rec, ge)
+    tab = S.event_table(rec, ge)
     assert pd.api.types.is_numeric_dtype(tab["page"])
-    sel = EV.filter_events(tab, query='phase == "TASK" and cond == "AI"', names={"fixation"})
+    sel = C.filter_events(tab, query='phase == "TASK" and cond == "AI"', names={"fixation"})
     assert list(sel.onset) == [2.5]  # the 9.5 s fixation is after TASK_END
-    assert len(EV.filter_events(tab, query="page >= 3", names={"PAGE"})) == 2
+    assert len(C.filter_events(tab, query="page >= 3", names={"PAGE"})) == 2
     with pytest.raises(ValueError):
-        EV.filter_events(tab, query="cond ==")
+        C.filter_events(tab, query="cond ==")
 
 
 def test_montage_and_metadata_epochs(demo):
     import mne
-
-    from brainstudio import events as EV
 
     rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
     raw = rec.raw.copy()
     raw.set_montage(None)
     names = list(raw.ch_names)
     raw.rename_channels({n: f"ch{i}" for i, n in enumerate(names)})
-    rep = E.apply_montage(raw, E.montage_from_source("standard_1005"), names)
+    rep = C.apply_montage(raw, C.montage_from_source("standard_1005"), names)
     assert rep["n_renamed"] == len(names) and rep["n_positioned"] == 30
     assert raw.get_channel_types(["HEOG"]) == ["eog"]
 
-    ge = G.detect_events(rec.gaze)
-    tab = EV.build_event_table(rec, ge)
-    ep = E.epochs_from_table(P.run_preprocessing(raw, P.PreprocParams(l_freq=1, h_freq=30)),
-                             EV.filter_events(tab, names={"fixation", "stimulus"}), -0.2, 0.5)
+    ge = S.detect_gaze_events(rec.gaze)
+    tab = S.event_table(rec, ge)
+    ep = C.epochs_from_table(C.run_preprocessing(raw, C.PreprocParams(l_freq=1, h_freq=30)),
+                             C.filter_events(tab, names={"fixation", "stimulus"}), -0.2, 0.5)
     assert set(ep.event_id) == {"fixation", "stimulus"} and ep.metadata is not None
 
 
 def test_channel_reference(demo):
     rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
-    assert E.parse_reference("keep", rec.raw) is None
-    assert E.parse_reference("CAR", rec.raw) == "average"
-    assert E.parse_reference("cz", rec.raw) == ["Cz"]
-    assert E.parse_reference("TP9, Cz", rec.raw.copy().rename_channels({"T7": "TP9"})) == [
+    assert C.parse_reference("keep", rec.raw) is None
+    assert C.parse_reference("CAR", rec.raw) == "average"
+    assert C.parse_reference("cz", rec.raw) == ["Cz"]
+    assert C.parse_reference("TP9, Cz", rec.raw.copy().rename_channels({"T7": "TP9"})) == [
         "TP9", "Cz"]
     with pytest.raises(ValueError, match="not found"):
-        E.parse_reference("M1", rec.raw)
-    out = P.run_preprocessing(rec.raw, P.PreprocParams(l_freq=None, h_freq=None, notch=None, reference="Cz"))
+        C.parse_reference("M1", rec.raw)
+    out = C.run_preprocessing(rec.raw, C.PreprocParams(l_freq=None, h_freq=None, notch=None, reference="Cz"))
     assert np.abs(out.get_data(picks=["Cz"])).max() < 1e-12  # reference channel is flat
-    pair = P.run_preprocessing(rec.raw, P.PreprocParams(l_freq=None, h_freq=None, notch=None, reference="O1, O2"))
+    pair = C.run_preprocessing(rec.raw, C.PreprocParams(l_freq=None, h_freq=None, notch=None, reference="O1, O2"))
     o = pair.get_data(picks=["O1", "O2"])
     assert np.abs(o.sum(0)).max() < 1e-12  # linked reference: O1 = -O2
 
@@ -182,76 +175,71 @@ def test_channel_reference(demo):
 
 def test_gtec_64_layout_montage():
     import mne
-    assert "gtec_64" in E.builtin_montages()
-    m = E.montage_from_source("gtec_64")
+    assert "gtec_64" in C.builtin_montages()
+    m = C.montage_from_source("gtec_64")
     assert len(m.ch_names) == 64
     assert m.ch_names[:3] == ["Fp1", "Fpz", "Fp2"] and m.ch_names[18] == "FC3"
     assert m.ch_names[-4:] == ["F9", "F10", "A1", "A2"]
     info = mne.create_info([f"EEG{i:03d}" for i in range(1, 65)], 256.0, "eeg")
     raw = mne.io.RawArray(np.zeros((64, 10)), info, verbose="error")
-    rep = E.apply_montage(raw, m, list(m.ch_names))
+    rep = C.apply_montage(raw, m, list(m.ch_names))
     assert rep["n_renamed"] == 64 and rep["n_positioned"] == 64 and not rep["missing"]
     assert raw.ch_names[29] == "Cz"
 
 
 def test_pipeline_bads_ica_groups_bandpower(demo):
     """Preprocessing → epoching → analysis on synthetic data with real blink artifacts."""
-    from brainstudio import bandpower as BP
-    from brainstudio import epoching as EP
-    from brainstudio import events as EV
-    from brainstudio import preprocessing as P
-    from brainstudio import stats as ST
 
     rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
     raw = rec.raw.copy().load_data()
     raw._data[raw.ch_names.index("T7")] = 0.0                                   # flat
     raw._data[raw.ch_names.index("C4")] += np.random.default_rng(0).normal(
         0, 400e-6, raw.n_times)                                                  # noisy
-    bad = P.detect_bad_channels(raw)
+    bad = C.detect_bad_channels(raw)
     assert {"T7", "C4"} <= set(bad.loc[bad.bad, "channel"])
     assert bad.bad.sum() <= 4
 
-    ev = G.detect_events(rec.gaze)
+    ev = S.detect_gaze_events(rec.gaze)
     bads = ["T7", "C4"]
-    ica, fit_raw = P.fit_ica(raw, bads, 40.0, None, P.ICAParams(n_components=10))
+    ica, fit_raw = C.fit_ica(raw, bads, 40.0, None, C.ICAParams(n_components=10))
     assert not set(bads) & set(ica.ch_names)
-    sc = P.score_blink_components(ica, fit_raw, ev.blinks)
+    sc = C.score_blink_components(ica, fit_raw, ev.blinks)
     assert sc.suggested.any()
     assert sc.loc[sc.suggested, "blink_t"].max() == sc.blink_t.max()
-    params = P.PreprocParams(bads=bads, l_freq=1, h_freq=40, reference="average",
+    params = C.PreprocParams(bads=bads, l_freq=1, h_freq=40, reference="average",
                              ica_exclude=sc.loc[sc.suggested, "component"].tolist())
-    clean = P.run_preprocessing(raw, params, ica)
+    clean = C.run_preprocessing(raw, params, ica)
     assert clean.info["bads"] == bads and raw.info["bads"] == []  # input untouched
-    before = P.blink_locked_average(P.filtered_copy(raw, 1, 40, None), ev.blinks, ["Fp1", "Fp2"])
-    after = P.blink_locked_average(clean, ev.blinks, ["Fp1", "Fp2"])
+    before = C.blink_locked_average(C.filtered_copy(raw, 1, 40, None), ev.blinks, ["Fp1", "Fp2"])
+    after = C.blink_locked_average(clean, ev.blinks, ["Fp1", "Fp2"])
     assert np.ptp(after[1]) < 0.5 * np.ptp(before[1])                            # blinks gone
 
-    table = EV.build_event_table(rec, ev)
+    table = S.event_table(rec, ev)
     groups = {"stim": table[table.name == "stimulus"],
               "fix": table[table.name == "fixation"].iloc[:200]}
-    eps, summary = EP.build_group_epochs(clean, groups, EP.EpochSettings(-0.2, 1.0, None),
+    eps, summary = C.build_group_epochs(clean, groups, C.EpochSettings(-0.2, 1.0, None),
                                          ev.blinks)
     assert set(eps) == {"stim", "fix"} and (summary.kept > 0).all()
     assert eps["stim"].baseline is None and "group" in eps["stim"].metadata
     assert not set(bads) & set(eps["stim"].ch_names)
 
-    s = BP.BandSettings(tmin=0.0, tmax=1.0)
-    base = BP.BandBaseline(np.array([1.0]), 0.0, 20.0)
+    s = C.BandSettings(tmin=0.0, tmax=1.0)
+    base = C.BandBaseline(np.array([1.0]), 0.0, 20.0)
     per = []
     for g, ep in eps.items():
-        bp = BP.band_power(ep, s)
+        bp = C.band_power(ep, s)
         assert bp.shape == (len(ep), len(ep.ch_names), len(s.bands)) and np.nanmin(bp) > 0
-        bb, owner = BP.baseline_band_power(clean, base, s, ep.ch_names, 1.0)
+        bb, owner = C.baseline_band_power(clean, base, s, ep.ch_names, 1.0)
         assert len(bb) == 20 and (owner == 0).all()
-        ref, sd = BP.reference_for(ep.metadata.onset.to_numpy(), base, bb, owner)
-        assert np.isfinite(BP.normalise(bp, ref, sd, "dB")).mean() > 0.9
-        idx, _ = BP.eeg_indices(bp, ep.ch_names, s.bands, ref=ref)
+        ref, sd = C.reference_for(ep.metadata.onset.to_numpy(), base, bb, owner)
+        assert np.isfinite(C.normalise(bp, ref, sd, "dB")).mean() > 0.9
+        idx, _ = C.eeg_indices(bp, ep.ch_names, s.bands, ref=ref)
         assert idx["engagement β/(α+θ)"].notna().all()
         assert idx["α ERD % (parietal)"].notna().all()
         idx["group"] = g
         per.append(idx)
     import pandas as pd
-    tab = ST.comparison_table(pd.concat(per), ["θ/α", "α ERD % (parietal)"], ["stim", "fix"])
+    tab = C.comparison_table(pd.concat(per), ["θ/α", "α ERD % (parietal)"], ["stim", "fix"])
     assert list(tab.columns[:3]) == ["measure", "stim mean", "stim sem"]
     assert tab["q (FDR)"].notna().all() and (tab["q (FDR)"] >= tab["p"] - 1e-12).all()
 
@@ -300,7 +288,6 @@ def test_numeric_string_stream_is_gaze(tmp_path):
 def test_multicolumn_markers_pair_and_keep_every_column(tmp_path):
     """start/stop rows → events with duration; every column → an event-table column;
     gaze events inside a trial inherit its phase and attributes."""
-    from brainstudio import events as EV
     eeg_t = np.arange(0, 30, 1 / 100)
     rows = [["start", "trials", "clip1.mp4", "sad", ""], ["stop", "trials", "clip1.mp4", "sad",
                                                           "angry"],
@@ -318,7 +305,7 @@ def test_multicolumn_markers_pair_and_keep_every_column(tmp_path):
     st = next(s for s in rec.streams if s["name"] == "exp_stim")
     auto = st["auto_options"]["markers"]
     assert auto["columns"][:2] == ["flag", "name"]
-    tab = EV.build_event_table(rec)
+    tab = S.event_table(rec)
     trials = tab[tab.name == "trials"].reset_index(drop=True)
     assert list(trials.duration) == pytest.approx([3.0, 2.5])
     assert {"c3", "c4", "c5"} <= set(tab.columns)
@@ -330,7 +317,7 @@ def test_multicolumn_markers_pair_and_keep_every_column(tmp_path):
     opts = {st["key"]: {"names": ["action", "event", "stimulus", "emotion", "response"],
                         "columns": ["flag", "name", "attribute", "attribute", "ignore"],
                         "end_events": False}}
-    tab2 = EV.build_event_table(load_xdf(tmp_path / "m.xdf", options=opts))
+    tab2 = S.event_table(load_xdf(tmp_path / "m.xdf", options=opts))
     assert "emotion" in tab2 and "response" not in tab2 and "trials_end" not in set(tab2.name)
     # phase inheritance from events with a duration; "fixation" is not a *_ON phase
     assert __import__("brainstudio.core").core._START.match("fixation") is None
@@ -339,8 +326,6 @@ def test_multicolumn_markers_pair_and_keep_every_column(tmp_path):
 def test_load_many_xdf_with_entities(demo, tmp_path):
     """Several files → one recording; events carry subject/session/run from file names."""
     import shutil
-
-    from brainstudio import events as EV
     from brainstudio.io import entities_from_path, load_many
     a = tmp_path / "sub-01_ses-1_task-free_run-01_eeg.xdf"
     b = tmp_path / "sub-01_ses-2_task-free_run-02_eeg.xdf"
@@ -354,7 +339,7 @@ def test_load_many_xdf_with_entities(demo, tmp_path):
     assert "BAD boundary" in set(rec.raw.annotations.description)
     assert len(rec.segments) == 2 and rec.segments[1]["start"] == pytest.approx(
         one.raw.n_times / one.raw.info["sfreq"])
-    tab = EV.build_event_table(rec)
+    tab = S.event_table(rec)
     stim = tab[tab.name == "stimulus"]
     assert set(stim.session) == {"1", "2"} and set(stim.run) == {"01", "02"}  # text kept
     assert (stim.session == "2").sum() == (stim.session == "1").sum()
@@ -372,45 +357,41 @@ def test_trigger_channel_codes_and_mask():
     raw = mne.io.RawArray(np.vstack([data, trig * 1e-6]),
                           mne.create_info(["Fz", "Cz", "TRIG"], sf, "eeg"), verbose="error")
     raw._orig_units = {"TRIG": "uV"}        # as EDF readers keep it
-    assert E.guess_trigger_channel(raw) == "TRIG"
-    assert E.type_channels_by_name(raw) == {"TRIG": "stim"}   # re-typed on load
-    assert E.guess_trigger_channel(raw) == "TRIG"
-    ev = E.trigger_codes(raw, "TRIG")
+    assert C.guess_trigger_channel(raw) == "TRIG"
+    assert C.type_channels_by_name(raw) == {"TRIG": "stim"}   # re-typed on load
+    assert C.guess_trigger_channel(raw) == "TRIG"
+    ev = C.trigger_codes(raw, "TRIG")
     assert ev.code.tolist() == [1, 2, 1, 3, 258]
     assert ev.onset.tolist() == pytest.approx([2, 5, 8, 11, 14])
-    assert E.trigger_codes(raw, "TRIG", mask=255).code.tolist() == [1, 2, 1, 3, 2]
-    assert E.trigger_codes(raw, "TRIG", mode="threshold").onset.tolist() == pytest.approx([14])
+    assert C.trigger_codes(raw, "TRIG", mask=255).code.tolist() == [1, 2, 1, 3, 2]
+    assert C.trigger_codes(raw, "TRIG", mode="threshold").onset.tolist() == pytest.approx([14])
 
 
 def test_component_statistics_p300(demo):
     """Rhino-style component analysis finds the simulated P300 (stimulus vs fixation)."""
-    from brainstudio import epoching as EP
-    from brainstudio import events as EV
     rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
-    ev = G.detect_events(rec.gaze)
-    raw = P.run_preprocessing(rec.raw, P.PreprocParams(l_freq=0.1, h_freq=30))
-    tab = EV.build_event_table(rec, ev)
-    eps, summ = EP.build_group_epochs(
+    ev = S.detect_gaze_events(rec.gaze)
+    raw = C.run_preprocessing(rec.raw, C.PreprocParams(l_freq=0.1, h_freq=30))
+    tab = S.event_table(rec, ev)
+    eps, summ = C.build_group_epochs(
         raw, {"stim": tab[tab.name == "stimulus"], "fix": tab[tab.name == "fixation"].iloc[::4]},
-        EP.EpochSettings(-0.2, 0.8, None, delay_ms=0))
+        C.EpochSettings(-0.2, 0.8, None, delay_ms=0))
     assert "rejected by" in summ
     eps = {g: e.copy().apply_baseline((-0.2, 0)) for g, e in eps.items()}
-    comp = E.COMPONENT_PRESETS["P300"]
-    s, per = E.component_analysis(eps, comp)
+    comp = C.COMPONENT_PRESETS["P300"]
+    s, per = C.component_analysis(eps, comp)
     stim = s[s.group == "stim"].iloc[0]
     assert 250 <= stim["peak latency ms"] <= 500 and stim["peak µV"] > 0
     diff = s.iloc[-1]
     assert diff["group"] == "stim − fix" and diff["p"] < 0.01 and diff["window mean µV"] > 0
     assert set(per.group) == {"stim", "fix"} and len(per) == sum(len(e) for e in eps.values())
     with pytest.raises(ValueError, match="None of"):
-        E.component_analysis(eps, E.Component("x", 0.1, 0.2, ("Nope",), 1))
+        C.component_analysis(eps, C.Component("x", 0.1, 0.2, ("Nope",), 1))
 
 
 def test_two_edfs_with_trigger_channel(tmp_path):
     """EDF files joined; a trigger channel becomes events with session/run columns."""
     import mne
-
-    from brainstudio import events as EV
     from brainstudio.io import load_many
     sf = 256
     paths = []
@@ -429,23 +410,23 @@ def test_two_edfs_with_trigger_channel(tmp_path):
         paths.append(p)
     rec = load_many(paths)
     assert rec.raw.times[-1] == pytest.approx(60, abs=0.1)
-    ev = E.trigger_codes(rec.raw, "TRIG")
+    ev = C.trigger_codes(rec.raw, "TRIG")
     assert len(ev) == 18 and set(ev.code) == {1, 2}
     rec.events = pd.DataFrame({"onset": ev.onset, "duration": 0.0,
                                "description": [f"code{c}|trigger_code={c}" for c in ev.code]})
-    tab = EV.build_event_table(rec)
+    tab = S.event_table(rec)
     t1 = tab[tab.name == "code1"]
     assert sorted(set(t1.session)) == ["1", "2"] and len(t1) == 10
 
 
 def test_gtec_unicorn_layout():
     import mne
-    m = E.montage_from_source("gtec_unicorn")
+    m = C.montage_from_source("gtec_unicorn")
     assert m.ch_names == ["Fz", "C3", "Cz", "C4", "Pz", "PO7", "Oz", "PO8"]
     extra = ["ACC X", "GYR Z", "Battery", "Counter", "Validation"]
     raw = mne.io.RawArray(np.zeros((13, 10)), mne.create_info(
         [f"EEG {i}" for i in range(1, 9)] + extra, 250.0, "eeg"), verbose="error")
-    rep = E.apply_montage(raw, m, list(m.ch_names) + extra)
+    rep = C.apply_montage(raw, m, list(m.ch_names) + extra)
     assert rep["n_positioned"] == 8 and not rep["missing"]
     assert set(raw.get_channel_types(extra)) == {"misc"}
 
@@ -453,45 +434,41 @@ def test_gtec_unicorn_layout():
 def test_bad_channels_and_ica_ignore_data_before_first_event(demo):
     """Noise before the first event marks no channel bad when that part is ignored,
     and ICA is fitted from the first event on (blinks still align)."""
-    from brainstudio import events as EV
-    from brainstudio import preprocessing as P
     rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
-    ev = G.detect_events(rec.gaze)
-    t0 = EV.first_event_time(EV.build_event_table(rec, ev))
+    ev = S.detect_gaze_events(rec.gaze)
+    t0 = C.first_event_time(S.event_table(rec, ev))
     assert t0 == pytest.approx(3.0, abs=0.01)
     raw = rec.raw.copy().load_data()
     n0 = int(t0 * raw.info["sfreq"])
     raw._data[raw.ch_names.index("Cz"), :n0] += np.random.default_rng(0).normal(0, 2e-3, n0)
-    p = P.BadChannelParams(max_bad_fraction=0.02)  # 3 noisy s of 120 = 2.5 % of the windows
-    assert "Cz" in set(P.detect_bad_channels(raw, p).query("bad").channel)
-    assert "Cz" not in set(P.detect_bad_channels(raw, p, tmin=t0).query("bad").channel)
-    ica, fit_raw = P.fit_ica(raw, [], 40.0, None, P.ICAParams(n_components=8), tmin=t0)
-    assert P.fit_times(fit_raw)[0] == pytest.approx(t0, abs=0.01)
-    assert P.score_blink_components(ica, fit_raw, ev.blinks).suggested.any()
+    p = C.BadChannelParams(max_bad_fraction=0.02)  # 3 noisy s of 120 = 2.5 % of the windows
+    assert "Cz" in set(C.detect_bad_channels(raw, p).query("bad").channel)
+    assert "Cz" not in set(C.detect_bad_channels(raw, p, tmin=t0).query("bad").channel)
+    ica, fit_raw = C.fit_ica(raw, [], 40.0, None, C.ICAParams(n_components=8), tmin=t0)
+    assert C.fit_times(fit_raw)[0] == pytest.approx(t0, abs=0.01)
+    assert C.score_blink_components(ica, fit_raw, ev.blinks).suggested.any()
 
 
 def test_iir_highpass_with_boundary_at_data_edge():
     """A boundary annotation at the very start/end used to crash MNE's IIR path
     (0-sample stretch); the result must equal MNE's filter without the annotation."""
     import mne
-
-    from brainstudio import preprocessing as P
     sf = 250
     x = np.random.default_rng(0).normal(0, 1e-5, (3, sf * 20))
     raw = mne.io.RawArray(x, mne.create_info(["Fz", "Cz", "Pz"], sf, "eeg"), verbose="error")
-    ref = raw.copy().filter(0.1, None, method="iir", iir_params=P.IIR_PARAMS,
+    ref = raw.copy().filter(0.1, None, method="iir", iir_params=C.IIR_PARAMS,
                             verbose="error").filter(None, 40, verbose="error")
     for onset in (0.0, raw.times[-1] + 1 / sf):
         r = raw.copy()
         r.set_annotations(mne.Annotations([onset], [0], ["EDGE boundary"]))
-        out = P.run_preprocessing(r, P.PreprocParams(l_freq=0.1, h_freq=40, notch=None))
+        out = C.run_preprocessing(r, C.PreprocParams(l_freq=0.1, h_freq=40, notch=None))
         assert np.allclose(out.get_data(), ref.get_data(), atol=1e-12)
 
 
 def test_join_recordings_with_different_bad_channels():
     import mne
 
-    from brainstudio.io.multi import concatenate
+    from brainstudio.io import concatenate
     from brainstudio.model import Recording
     info = mne.create_info(["Fz", "Cz", "Pz"], 100.0, "eeg")
     a = mne.io.RawArray(np.zeros((3, 500)), info, verbose="error")
@@ -505,7 +482,6 @@ def test_join_recordings_with_different_bad_channels():
 def test_bids_dataset_info_bads_and_positions(tmp_path):
     """BIDS: bad channels (with reasons) from channels.tsv, dataset/sidecar info, and the
     subject-level space-…_electrodes.tsv found for every run."""
-    from brainstudio.io import bids as B
     from brainstudio.io import load_bids_runs
     root = tmp_path / "bids"
     write_bids(root, subjects=("01",))
@@ -529,20 +505,18 @@ def test_bids_dataset_info_bads_and_positions(tmp_path):
 
 def test_ica_uses_the_kept_channels_not_the_file_bad_list(demo):
     """Channels the file marks bad but the user keeps must be in the ICA fit."""
-    from brainstudio import preprocessing as P
     rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
     raw = rec.raw.copy().load_data()
     raw.info["bads"] = raw.ch_names[:20]          # e.g. from channels.tsv
-    ica, fit_raw = P.fit_ica(raw, bads=[], h_freq=40.0, p=P.ICAParams(n_components=20))
+    ica, fit_raw = C.fit_ica(raw, bads=[], h_freq=40.0, p=C.ICAParams(n_components=20))
     assert ica.n_components_ == 20 and len(ica.ch_names) > 20
     assert fit_raw.info["bads"] == []
 
 
 def test_ica_fit_is_bounded_on_long_data(demo):
-    from brainstudio import preprocessing as P
     rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
-    ica, fit_raw = P.fit_ica(rec.raw, ["HEOG", "VEOG"], 40.0, None,
-                             P.ICAParams(n_components=8, max_samples=5000))
+    ica, fit_raw = C.fit_ica(rec.raw, ["HEOG", "VEOG"], 40.0, None,
+                             C.ICAParams(n_components=8, max_samples=5000))
     assert ica.n_components_ == 8
     assert "fitted on every" in fit_raw.fit_note       # subsampled over the whole recording
     assert fit_raw.n_times > 5000                        # scoring still sees all the data
@@ -550,33 +524,29 @@ def test_ica_fit_is_bounded_on_long_data(demo):
 
 def test_bids_events_tsv_columns_and_column_filters(tmp_path):
     """Every events.tsv column becomes a filterable event column; column conditions."""
-    from brainstudio import events as EV
-    from brainstudio.io import bids as B
     f = tmp_path / "sub-01_task-x_run-1_events.tsv"
     f.write_text("onset\tduration\tSOA\tlabel\ttrial_type\tanswering_time\tsample\n"
                  "1.0\t0.9\t0.5\thuman\teerie\t1.5\t256\n"
                  "4.5\t1.0\t0.4\tanimated\tnot_eerie\t2.8\t1160\n"
                  "8.3\t1.1\t0.5\thuman\tnot_eerie\tn/a\t2128\n")
-    ev = B.events_from_tsv(f)
+    ev = C.bids_events(f)
     assert list(ev.onset) == [1.0, 4.5, 8.3]
     assert ev.description[0] == "eerie|SOA=0.5|label=human|answering_time=1.5"
     rec = __import__("brainstudio.model", fromlist=["x"]).Recording(events=ev)
-    t = EV.build_event_table(rec)
+    t = S.event_table(rec)
     assert {"soa", "label", "answering_time"} <= set(t.columns)
-    human = EV.filter_events(t, conditions=[("label", "=", "human")])
+    human = C.filter_events(t, conditions=[("label", "=", "human")])
     assert list(human.name) == ["eerie", "not_eerie"]
-    fast = EV.filter_events(t, conditions=[("label", "=", "human"),
+    fast = C.filter_events(t, conditions=[("label", "=", "human"),
                                            ("answering_time", "<", "2")])
     assert list(fast.name) == ["eerie"]
-    assert len(EV.filter_events(t, conditions=[("label", "one of", "human, animated")])) == 3
+    assert len(C.filter_events(t, conditions=[("label", "one of", "human, animated")])) == 3
     with pytest.raises(ValueError, match="compares numbers"):
-        EV.filter_events(t, conditions=[("label", "<", "x")])
+        C.filter_events(t, conditions=[("label", "<", "x")])
 
 
 def test_epoch_summary_counts_each_reason():
     import mne
-
-    from brainstudio import epoching as EP
     sf = 100.0
     x = np.random.default_rng(0).normal(0, 1e-6, (2, int(sf * 60)))
     x[0, int(30.3 * sf)] = 1e-3                       # spike inside the epoch at 30 s
@@ -589,8 +559,8 @@ def test_epoch_summary_counts_each_reason():
               ] + [12.0 + k for k in range(8)]         # plain events
     table = pd.DataFrame({"onset": onsets, "duration": 0.0, "name": "e", "kind": "marker",
                           "description": "e"})
-    _, summ = EP.build_group_epochs(raw, {"g": table},
-                                    EP.EpochSettings(-0.2, 0.8, reject_uv=100,
+    _, summ = C.build_group_epochs(raw, {"g": table},
+                                    C.EpochSettings(-0.2, 0.8, reject_uv=100,
                                                      autoreject=False))
     r = summ.iloc[0]
     assert r["selected"] == 13 and r["outside recording"] == 1 and r["same sample"] == 1
@@ -604,27 +574,25 @@ def test_epoch_summary_counts_each_reason():
 def test_erp_reference_choices(demo):
     """Each component selects its usual reference; mastoids fall back to as recorded."""
     import mne
-    from brainstudio import epoching as EP
-    from brainstudio import events as EV
-    assert E.COMPONENT_REFERENCE["P300"] == "mastoids" and E.COMPONENT_REFERENCE["N170"] == \
+    assert C.COMPONENT_REFERENCE["P300"] == "mastoids" and C.COMPONENT_REFERENCE["N170"] == \
         "average"
-    assert E.resolve_erp_reference("mastoids", ["Cz", "TP9", "TP10"])[0] == ["TP9", "TP10"]
-    ref, label = E.resolve_erp_reference("mastoids", ["Fz", "Cz", "Pz"])
+    assert C.resolve_erp_reference("mastoids", ["Cz", "TP9", "TP10"])[0] == ["TP9", "TP10"]
+    ref, label = C.resolve_erp_reference("mastoids", ["Fz", "Cz", "Pz"])
     assert ref is None and label.startswith("as recorded") and "no good mastoid" in label
-    assert E.resolve_erp_reference("average", ["Cz"])[0] == "average"
-    assert E.resolve_erp_reference("recorded", ["Cz"])[0] is None
+    assert C.resolve_erp_reference("average", ["Cz"])[0] == "average"
+    assert C.resolve_erp_reference("recorded", ["Cz"])[0] is None
     with pytest.raises(ValueError, match="not among"):
-        E.resolve_erp_reference("M1, M2", ["Cz", "Pz"])
+        C.resolve_erp_reference("M1, M2", ["Cz", "Pz"])
     rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
     raw = rec.raw.copy().load_data().pick("eeg")
-    tab = EV.build_event_table(rec)
-    eps, _ = EP.build_group_epochs(raw, {"s": tab[tab.name == "stimulus"]},
-                                   EP.EpochSettings(-0.2, 0.8, None))
-    avg = E.reference_epochs(eps["s"], "average")
+    tab = S.event_table(rec)
+    eps, _ = C.build_group_epochs(raw, {"s": tab[tab.name == "stimulus"]},
+                                   C.EpochSettings(-0.2, 0.8, None))
+    avg = C.reference_epochs(eps["s"], "average")
     assert np.allclose(avg.get_data().mean(1), 0, atol=1e-12)        # average reference
-    assert E.reference_epochs(eps["s"], None) is eps["s"]             # as recorded
+    assert C.reference_epochs(eps["s"], None) is eps["s"]             # as recorded
     assert np.allclose(eps["s"].get_data().mean(1), eps["s"].get_data().mean(1))
-    pair = E.reference_epochs(eps["s"], ["T7", "T8"])
+    pair = C.reference_epochs(eps["s"], ["T7", "T8"])
     assert np.allclose(pair.get_data(picks=["T7"]) + pair.get_data(picks=["T8"]), 0,
                        atol=1e-12)                                    # mean of T7/T8 = 0
     _ = mne
@@ -632,22 +600,21 @@ def test_erp_reference_choices(demo):
 
 def test_band_power_baseline_is_per_subject():
     """Epochs are normalised against their own subject's baseline, never pooled."""
-    from brainstudio import bandpower as BP
     # baseline events: subject a at 0 s and 100 s, subject b at 200 s
-    base = BP.BandBaseline(np.array([0.0, 100.0, 200.0]), 0, 10, "mean", "rest",
+    base = C.BandBaseline(np.array([0.0, 100.0, 200.0]), 0, 10, "mean", "rest",
                            np.array(["a", "a", "b"]))
     owner = np.array([0, 0, 1, 1, 2, 2])                       # 2 segments per event
     base_bp = np.array([1.0, 1.0, 3.0, 3.0, 10.0, 10.0])[:, None, None]  # a: 1 and 3, b: 10
     onsets = np.array([50.0, 150.0, 250.0, 260.0])
     subj = np.array(["a", "a", "b", "c"])                      # c has no baseline
-    mean, sd = BP.reference_for(onsets, base, base_bp, owner, subj)
+    mean, sd = C.reference_for(onsets, base, base_bp, owner, subj)
     assert mean[:3, 0, 0].tolist() == [2.0, 2.0, 10.0]          # own subject's mean only
     assert np.isnan(mean[3, 0, 0])                              # no borrowing across subjects
     base.mode = "nearest"
-    mean, _ = BP.reference_for(onsets, base, base_bp, owner, subj)
+    mean, _ = C.reference_for(onsets, base, base_bp, owner, subj)
     assert mean[:3, 0, 0].tolist() == [1.0, 3.0, 10.0]          # nearest event of the subject
-    assert BP.subjects_without_baseline(base, subj) == ["c"]
-    pooled, _ = BP.reference_for(onsets, BP.BandBaseline(base.onsets, 0, 10), base_bp, owner)
+    assert C.subjects_without_baseline(base, subj) == ["c"]
+    pooled, _ = C.reference_for(onsets, C.BandBaseline(base.onsets, 0, 10), base_bp, owner)
     assert np.allclose(pooled[:, 0, 0], np.mean([1, 1, 3, 3, 10, 10]))  # no labels: pooled
 
 
@@ -669,8 +636,8 @@ def test_group_erp_averages_subjects_first():
         ep = mne.EpochsArray(np.concatenate(data), info, tmin=-0.2, verbose="error")
         ep.metadata = pd.DataFrame({"subject": subj})
         groups[g] = ep
-    comp = E.Component("X", 0.2, 0.39, ("Cz", "Pz"), +1)
-    res = E.group_component_analysis(groups, comp)
+    comp = C.Component("X", 0.2, 0.39, ("Cz", "Pz"), +1)
+    res = C.group_component_analysis(groups, comp)
     subs = list(res["evokeds"]["A"].values())
     assert np.allclose(res["grand"]["A"].data, np.mean([e.data for e in subs], 0))
     # pooled epochs would weigh subject 02 (40 epochs) eight times more than subject 01
@@ -686,7 +653,7 @@ def test_group_erp_averages_subjects_first():
 
 
 def test_subject_spans_merge_runs():
-    from brainstudio.io.multi import segment_label, subject_spans
+    from brainstudio.core import segment_label, subject_spans
     segs = [{"start": 0, "end": 10, "subject": "01", "run": "1"},
             {"start": 10, "end": 20, "subject": "01", "run": "2"},
             {"start": 20, "end": 35, "subject": "02", "run": "1"}]
@@ -699,13 +666,12 @@ def test_subject_spans_merge_runs():
 
 def test_script_literals_are_exact_python():
     from brainstudio import script as SC
-    from brainstudio import workflow as W
-    spec = W.GroupSpec("A", ["stimulus", "x" * 40], query="cond == 'AI'",
+    spec = C.GroupSpec("A", ["stimulus", "x" * 40], query="cond == 'AI'",
                        conditions=[["subject", "=", "01"]],
                        recordings={"file": [f"sub-{i:02d}_task-x_eeg.vhdr" for i in range(9)]})
     code = SC.assign("spec = ", spec)
     assert max(len(line) for line in code.splitlines()) <= SC.WIDTH
-    ns = {"GroupSpec": W.GroupSpec}  # scripts hold the class itself, no module prefix
+    ns = {"GroupSpec": C.GroupSpec}  # scripts hold the class itself, no module prefix
     exec(code, ns)
     assert ns["spec"] == spec
     assert SC.lit(np.float64(0.1)) == "0.1" and SC.lit(np.int64(3)) == "3"
@@ -716,12 +682,8 @@ def test_exported_script_repeats_the_erp(tmp_path):
     same epochs and per-subject ERP values as the app."""
     import runpy
     import sys
-
-    from brainstudio import epoching as EP
     from brainstudio import io as bio
-    from brainstudio import preprocessing as P
     from brainstudio import script as SC
-    from brainstudio import workflow as W
     from brainstudio.demo import write_bids
     root = tmp_path / "bids"
     write_bids(root, subjects=("01", "02"))
@@ -729,23 +691,23 @@ def test_exported_script_repeats_the_erp(tmp_path):
     rec = bio.load_bids_runs(root, runs, None)
     step = {"kind": "load_bids", "root": str(root), "runs": [list(r.key) for r in runs],
             "screen_size": None}
-    step["recording"] = W.recording_info(rec, step)
-    layout, _ = E.read_channel_layout(E.layout_montages()["gtec_64"])
+    step["recording"] = S.recording_info(rec, step)
+    layout, _ = C.read_channel_layout(C.layout_montages()["gtec_64"])
     names = layout[:len(rec.raw.ch_names)]
-    W.set_montage(rec, "gtec_64", names)  # a montage step
-    det = G.DetectionParams()
-    gev = G.detect_events(rec.gaze, det)
-    table = EV.build_event_table(rec, gev, None)
-    ip = P.ICAParams(n_components=8, clean="threshold", iclabel=False)
-    ica, fit_raw = P.fit_ica(rec.raw, [], None, 50.0, ip)
-    pp = P.PreprocParams(ica_exclude=[0])
-    clean = P.run_preprocessing(rec.raw, pp, ica)
-    specs = [W.GroupSpec("stim", ["stimulus"]), W.GroupSpec("resp", ["response"])]
-    st = EP.EpochSettings(autoreject=False)
-    epochs, _ = EP.build_group_epochs(
-        clean, {g.label: W.select_events(table, g) for g in specs}, st, gev.blinks)
-    spec = W.ErpSpec(["stim", "resp"], E.COMPONENT_PRESETS["P300"], (-0.1, 0.0), "average")
-    res = W.run_erp(epochs, spec)
+    C.apply_montage(rec.raw, C.montage_from_source("gtec_64"), names)  # a montage step
+    det = C.DetectionParams()
+    gev = S.detect_gaze_events(rec.gaze, det)
+    table = S.event_table(rec, gev, None)
+    ip = C.ICAParams(n_components=8, clean="threshold", iclabel=False)
+    ica, fit_raw = C.fit_ica(rec.raw, [], None, 50.0, ip)
+    pp = C.PreprocParams(ica_exclude=[0])
+    clean = C.run_preprocessing(rec.raw, pp, ica)
+    specs = [C.GroupSpec("stim", ["stimulus"]), C.GroupSpec("resp", ["response"])]
+    st = C.EpochSettings(autoreject=False)
+    epochs, _ = C.build_group_epochs(
+        clean, {g.label: C.select_events(table, g) for g in specs}, st, gev.blinks)
+    spec = C.ErpSpec(["stim", "resp"], C.COMPONENT_PRESETS["P300"], (-0.1, 0.0), "average")
+    res = C.run_erp(epochs, spec)
     load = {"steps": [step, {"kind": "montage", "source": "gtec_64", "names": names}],
             "gaze": {"params": det, "aois": {}}}
     recipe = {"load": load, "groups": specs, "settings": st,
@@ -776,7 +738,7 @@ def test_text_files_are_read_and_written_as_utf8():
     exported scripts copy from: every text read/write must name its encoding."""
     import re
     from pathlib import Path
-    root = Path(E.__file__).parent
+    root = Path(C.__file__).parent
     bad = []
     for f in root.rglob("*.py"):
         for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
@@ -791,7 +753,7 @@ def test_gaze_preset_follows_the_data():
     t = np.arange(100) / 150.0
     fpog = GazeData(t, np.zeros(100), np.zeros(100), extra={"fpogx": t, "fpogy": t})
     best = GazeData(t, np.zeros(100), np.zeros(100), extra={"fpogx": t, "bpogx": t})
-    assert G.suggest_preset(fpog) == "gazepoint_fpog"
-    assert G.suggest_preset(best) == "standard"
-    assert G.preset_name(G.PRESETS["gazepoint_fpog"][1]) == "gazepoint_fpog"
-    assert G.preset_name(G.DetectionParams(fix_dispersion=55.0)) is None
+    assert S.suggest_preset(fpog) == "gazepoint_fpog"
+    assert S.suggest_preset(best) == "standard"
+    assert C.preset_name(C.PRESETS["gazepoint_fpog"][1]) == "gazepoint_fpog"
+    assert C.preset_name(C.DetectionParams(fix_dispersion=55.0)) is None

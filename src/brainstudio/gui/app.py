@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from .. import core as C
 import argparse
 import sys
 import tempfile
@@ -81,16 +82,12 @@ def _say(msg: str) -> None:
 
 def _analysis_checks(win) -> dict[str, bool]:
     """Run each analysis once on the loaded demo (catches modules missing in builds)."""
-    from .. import bandpower as BP
-    from .. import eeg as E
-    from .. import epoching as EP
-    from .. import preprocessing as P
     out = {}
     raw, table = win.pipeline.clean, win.event_df
     try:
-        ica, fit_raw = P.fit_ica(win.rec.raw, (), 40.0, None, P.ICAParams(n_components=5))
+        ica, fit_raw = C.fit_ica(win.rec.raw, (), 40.0, None, C.ICAParams(n_components=5))
         out["ICA (picard)"] = ica.n_components_ == 5 and len(
-            P.score_blink_components(ica, fit_raw, win.gaze_events.blinks)) == 5
+            C.score_blink_components(ica, fit_raw, win.gaze_events.blinks)) == 5
         out["ICLabel"] = fit_raw.ic_labels is not None and len(fit_raw.ic_labels) == 5
         if not out["ICLabel"]:
             _say(f"ICLabel: {fit_raw.fit_note}")
@@ -101,31 +98,30 @@ def _analysis_checks(win) -> dict[str, bool]:
     try:
         groups = {"stim": table[table.name == "stimulus"],
                   "fix": table[table.name == "fixation"].iloc[:60]}
-        eps, summ = EP.build_group_epochs(raw, groups, EP.EpochSettings(-0.2, 0.8, None))
+        eps, summ = C.build_group_epochs(raw, groups, C.EpochSettings(-0.2, 0.8, None))
         out["epochs"] = set(eps) == {"stim", "fix"}
         out["AutoReject"] = summ.attrs.get("autoreject") == "applied"
         # an exported script: plain standard code, no brAInStudio import
         import ast
 
         from .. import script as SC
-        from .. import workflow as W
-        spec = W.ErpSpec(["stim", "fix"], E.COMPONENT_PRESETS["P300"], (-0.2, 0.0))
+        spec = C.ErpSpec(["stim", "fix"], C.COMPONENT_PRESETS["P300"], (-0.2, 0.0))
         step = {"kind": "load", "path": "x.xdf", "screen_size": (1920, 1080),
                 "roles": None, "options": None,
                 "recording": {"channels_in": list(raw.ch_names),
                               "types_in": list(raw.get_channel_types()), "streams": []}}
         recipe = {"load": {"steps": [step], "gaze": {"params": None, "aois": {}}},
-                  "pre": None, "groups": [W.GroupSpec("stim", ["stimulus"])],
-                  "settings": EP.EpochSettings()}
+                  "pre": None, "groups": [C.GroupSpec("stim", ["stimulus"])],
+                  "settings": C.EpochSettings()}
         code = SC.build_script("erp", recipe, spec, {"ch_names": list(raw.ch_names),
                                                      "n_subjects": 1})
         ast.parse(code)
         out["script export"] = "def read_xdf(" in code and "brainstudio" not in code.split(
             '"""', 2)[2]
         erp = {g: e.copy().apply_baseline((-0.2, 0)) for g, e in eps.items()}
-        summary, _ = E.component_analysis(erp, E.COMPONENT_PRESETS["P300"])
+        summary, _ = C.component_analysis(erp, C.COMPONENT_PRESETS["P300"])
         out["ERP component statistics"] = "p" in summary
-        bp = BP.band_power(eps["stim"], BP.BandSettings(tmin=0.0, tmax=0.8))
+        bp = C.band_power(eps["stim"], C.BandSettings(tmin=0.0, tmax=0.8))
         out["band power"] = bp.shape[0] == len(eps["stim"])
     except Exception as e:
         _say(f"analysis: {e!r}")
@@ -159,8 +155,7 @@ def _self_test(app, win, timeout: float = 300.0) -> int:
             "gaze events": win.gaze_events is not None and len(win.gaze_events.fixations) > 0,
             "events": len(win.event_df) > 0,
             "preprocessed": win.pipeline.clean is not None,
-            "montage resources": bool(__import__("brainstudio.eeg", fromlist=["x"])
-                                      .layout_montages()),
+            "montage resources": bool(C.layout_montages()),
         }
         checks.update(_analysis_checks(win))
         for k, ok in checks.items():

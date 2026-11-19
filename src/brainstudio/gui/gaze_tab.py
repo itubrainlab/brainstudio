@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+from .. import core as C
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtWidgets
 
-from .. import gaze as G
 from .theme import THEME
 from .widgets import fill_table, hint
 
@@ -60,7 +60,7 @@ class GazeTab(QtWidgets.QWidget):
             self.summary_table.clear()
             self.aoi_table.clear()
         else:
-            fill_table(self.summary_table, G.summary_table(ev, rec.gaze.duration))
+            fill_table(self.summary_table, C.gaze_summary(ev, rec.gaze.duration))
         self.update_aoi_stats()
         self._plot()
 
@@ -95,7 +95,7 @@ class GazeTab(QtWidgets.QWidget):
             self.aoi_table.setRowCount(0)
             self._aoi_df = None
             return
-        self._aoi_df = G.aoi_statistics(ev.fixations, aois)
+        self._aoi_df = C.aoi_statistics(ev.fixations, aois)
         fill_table(self.aoi_table, self._aoi_df)
 
     def export_aoi(self):

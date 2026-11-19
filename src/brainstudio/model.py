@@ -94,11 +94,11 @@ class Recording:
     # srate, format, samples, labels, auto_role and role (EEG/gaze/markers/ignore)
     streams: list = field(default_factory=list)
     # Files the recording is made of: dicts with start/end (s) and BIDS entities
-    # (subject, session, task, acq, run) and file; see brainstudio.io.multi
+    # (subject, session, task, acq, run) and file; see brainstudio.core.join
     segments: list = field(default_factory=list)
     sources: list = field(default_factory=list)
     # Dataset information (BIDS: dataset, participant, eeg.json fields, bad channels
-    # with reasons, where the electrode positions come from); see io.bids.bids_metadata
+    # with reasons, where the electrode positions come from); see core.bids_metadata
     metadata: dict = field(default_factory=dict)
 
     @property

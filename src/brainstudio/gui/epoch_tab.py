@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+from .. import core as C
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
-from .. import workflow as W
 from ..core import epochs_memory
-from ..epoching import EpochSettings
+from ..core import EpochSettings
 from .eventselect import EventSelector
 from .theme import THEME
 from .widgets import StageHeader, _spin, _themed_plot, fill_table, hint
@@ -319,7 +319,7 @@ class EpochTab(QtWidgets.QWidget):
         return {lst.item(i).data(QtCore.Qt.UserRole) for i in range(lst.count())
                 if lst.item(i).checkState() == QtCore.Qt.Checked}
 
-    def group_spec(self, sel: EventSelector) -> W.GroupSpec:
+    def group_spec(self, sel: EventSelector) -> C.GroupSpec:
         """A group as plain settings: ticked names, filters and the ticked
         subjects/sessions/runs/files."""
         recs = {}
@@ -327,14 +327,14 @@ class EpochTab(QtWidgets.QWidget):
             keep = self.rec_selection(col)
             if keep is not None and lst.count():
                 recs[col] = sorted(keep)
-        return W.GroupSpec(label=sel.label(), names=sorted(sel.checked_names()),
+        return C.GroupSpec(label=sel.label(), names=sorted(sel.checked_names()),
                            text=sel.text.text(), query=sel.query.text(),
                            conditions=[list(c) for c in sel.conditions()], recordings=recs)
 
     def rows_for(self, sel: EventSelector):
         """A group's events, limited to the ticked subjects/sessions/runs/files
         (raises ValueError for invalid filters)."""
-        return W.select_events(sel.table, self.group_spec(sel))
+        return C.select_events(sel.table, self.group_spec(sel))
 
     def _recordings_changed(self, *_):
         for s in self._selectors:

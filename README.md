@@ -538,7 +538,7 @@ How groups are compared:
 ## Events, groups and filters
 
 All markers and detected gaze events go into one table
-(`brainstudio.events.build_event_table`):
+(`brainstudio.core.event_table`):
 
 - `onset`, `duration`, `name`, `kind` (marker, fixation, saccade or blink) and
   `description`.
@@ -592,90 +592,85 @@ Topomaps, joint plots and ICA scalp maps need electrode positions.
 
 ## Using the library
 
-Everything the app does is available from Python.
+Everything the app does is a plain function in `brainstudio.core` (MNE Raw/Epochs and
+pandas tables in, the same out); `brainstudio.session` adds the few helpers that work on
+the app's `Recording` (gaze as arrays, markers and annotations together).
 
 ```python
 import pandas as pd
 
-from brainstudio.io import load_xdf, load_many
-from brainstudio import gaze as G, events as EV, preprocessing as P, epoching as EP
-from brainstudio import bandpower as BP, stats as ST, eeg as E
+from brainstudio import core as C, session as S
+from brainstudio.io import load, load_many
 
-rec = load_xdf("recording.xdf")      # roles={"4": "ignore"}, options={...} override streams
+rec = load("recording.xdf")      # roles={"4": "ignore"}, options={...} override streams
 # rec = load_many(["sub-01_ses-1_eeg.xdf", "sub-01_ses-2_eeg.xdf"])   # several files
 print([(s["name"], s["role"]) for s in rec.streams])
-gtec = E.montage_from_source("gtec_64")                         # names + positions
-E.apply_montage(rec.raw, gtec, gtec.ch_names)
-ev = G.detect_events(rec.gaze)                                  # fixations / saccades / blinks
-table = EV.build_event_table(rec, ev)                           # markers + gaze events
+gtec = C.montage_from_source("gtec_64")                         # names + positions
+C.apply_montage(rec.raw, gtec, gtec.ch_names)
+ev = S.detect_gaze_events(rec.gaze)                              # fixations / saccades / blinks
+table = S.event_table(rec, ev)                                  # markers + gaze events
 
 # 1 preprocessing
-bad = P.detect_bad_channels(rec.raw, P.BadChannelParams(ptp_max_uv=250, notch=50))
+bad = C.detect_bad_channels(rec.raw, C.BadChannelParams(ptp_max_uv=250, notch=50))
 bads = bad.loc[bad.bad, "channel"].tolist()
-ica, fit_raw = P.fit_ica(rec.raw, bads, notch=50)               # 1–30 Hz, AutoReject, 99 %
-scores = P.score_blink_components(ica, fit_raw, ev.blinks)      # ICLabel + EOG/Fp + tracker
-pp = P.PreprocParams(bads=bads, l_freq=0.1, h_freq=30, notch=50,
+ica, fit_raw = C.fit_ica(rec.raw, bads, notch=50)               # 1–30 Hz, AutoReject, 99 %
+scores = C.score_blink_components(ica, fit_raw, ev.blinks)      # ICLabel + EOG/Fp + tracker
+pp = C.PreprocParams(bads=bads, l_freq=0.1, h_freq=30, notch=50,
                      ica_exclude=scores.loc[scores.suggested, "component"].tolist())
-clean = P.run_preprocessing(rec.raw, pp, ica)
+clean = C.run_preprocessing(rec.raw, pp, ica)
 
 # 2 epoching: named groups of events
-fx = EV.filter_events(table, query='phase == "READING"', names={"fixation"})
+fx = C.filter_events(table, query='phase == "READING"', names={"fixation"})
 groups = {"AI": fx[fx.cond == "AI"], "NoAI": fx[fx.cond == "NoAI"]}
-epochs, summary = EP.build_group_epochs(clean, groups, EP.EpochSettings(-0.1, 1.0))  # + AutoReject
+epochs, summary = C.build_group_epochs(clean, groups, C.EpochSettings(-0.1, 1.0))  # + AutoReject
 
 # 3a ERP component (pre-event baseline), as in Rhino ERP
-ref, why = E.resolve_erp_reference(E.COMPONENT_REFERENCE["P300"],  # "mastoids"
+ref, why = C.resolve_erp_reference(C.COMPONENT_REFERENCE["P300"],  # "mastoids"
                                    epochs["AI"].ch_names)
-erp = {g: E.reference_epochs(e, ref).apply_baseline((-0.2, 0)) for g, e in epochs.items()}
-comp_summary, per_epoch = E.component_analysis(erp, E.COMPONENT_PRESETS["P300"])  # one subject
-grp = E.group_component_analysis(erp, E.COMPONENT_PRESETS["P300"])   # subjects: evoked each,
+erp = {g: C.reference_epochs(e, ref).apply_baseline((-0.1, 0)) for g, e in epochs.items()}
+comp_summary, per_epoch = C.component_analysis(erp, C.COMPONENT_PRESETS["P300"])  # one subject
+grp = C.group_component_analysis(erp, C.COMPONENT_PRESETS["P300"])   # subjects: evoked each,
 grp["summary"], grp["subjects"], grp["grand"]                         # then grand average
-# cluster = E.group_cluster_test(list(grp["diffs"].values()), tfce=True)
+# cluster = C.group_cluster_test(list(grp["diffs"].values()), tfce=True)
 
 # 3b band power and indices (baseline: 5–115 s after BASELINE_START)
-s = BP.BandSettings(tmin=0, tmax=1.5)
-base = BP.BandBaseline(table.loc[table.name == "BASELINE_START", "onset"].values, 5, 115)
+s = C.BandSettings(tmin=0, tmax=1.5)
+base = C.BandBaseline(table.loc[table.name == "BASELINE_START", "onset"].values, 5, 115)
 per = []
 for g, ep in epochs.items():
-    bp = BP.band_power(ep, s)                                     # (epochs, channels, bands) µV²
-    bb, owner = BP.baseline_band_power(clean, base, s, ep.ch_names, 1.5)
-    ref, sd = BP.reference_for(ep.metadata.onset.values, base, bb, owner)
-    idx, notes = BP.eeg_indices(bp, ep.ch_names, s.bands, ref=ref)  # engagement, workload…
+    bp = C.band_power(ep, s)                                     # (epochs, channels, bands) µV²
+    bb, owner = C.baseline_band_power(clean, base, s, ep.ch_names, 1.5)
+    ref, sd = C.reference_for(ep.metadata.onset.values, base, bb, owner)
+    idx, notes = C.eeg_indices(bp, ep.ch_names, s.bands, ref=ref)  # engagement, workload…
     per.append(idx.assign(group=g))
-print(ST.comparison_table(pd.concat(per), ["engagement β/(α+θ)", "α ERD % (parietal)"],
-                          ["AI", "NoAI"]))
+print(C.comparison_table(pd.concat(per), ["engagement β/(α+θ)", "α ERD % (parietal)"],
+                         ["AI", "NoAI"]))
 
 # trigger channel → events (EDF/BDF): onset and code of every trigger
-# codes = E.trigger_codes(raw, "TRIG", mask=255)
+# codes = C.trigger_codes(raw, "TRIG", mask=255)
 ```
 
 ## Project layout
 
 ```
 src/brainstudio/
-  model.py           Recording, GazeData, GazeEvents (one time base, segments per file)
-  io/                loaders
-    xdf.py           XDF: stream roles/options, clock alignment, de-jitter, stream info
-    markers.py       multi-column marker streams → events (start/stop pairing)
-    multi.py         several files as one; BIDS entities from file names
-    bids.py          BIDS EEG + eye tracking (MNE-BIDS)
-    xdf_writer.py    minimal XDF writer (demo data, tests)
-  gaze.py            fixation / saccade / blink detection and AOIs (pymovements), heatmaps
-  events.py          unified event table, phases, filters
-  eeg.py             filtering, references, montages and layouts, epochs, trigger codes,
-                     ERP components, cluster tests
-  preprocessing.py   bad channels (peak-to-peak), filters, ICA blink scoring
-  epoching.py        event groups → mne.Epochs, EEG delay, rejection report
-  bandpower.py       band power, baselines, cognitive indices, gaze metrics
-  stats.py           group comparisons (Welch, Mann-Whitney, ANOVA, Hedges g, FDR)
-  workflow.py        the app's steps as functions: groups, montage, triggers, ERP,
-                     band power, time course, indices (the app and scripts call them)
+  core.py            the model: every step as plain functions on MNE + pandas — loading
+                     (XDF clocks and stream roles, markers, BIDS, MNE files, joining),
+                     gaze events and AOIs (pymovements), the event table, bad channels,
+                     filters, ICA and its blink scores, epochs + AutoReject, ERP and
+                     cluster tests, band power, indices, statistics, montages, triggers
+  session.py         the application state (no Qt): recording, gaze, event table, each
+                     stage's results and the settings behind them; notifies subscribers
+  model.py           Recording and GazeData (arrays the views plot)
+  io/                loading for the app (core readers → Recording); minimal XDF writer
   script.py          short exported analysis scripts (Loading / Preprocessing /
                      Epoching / Analysis) in standard-library code
   montages/          channel layouts (gtec_64, gtec_unicorn)
   demo.py            synthetic EEG + gaze dataset (BIDS and XDF)
-  gui/               PySide6 app: main window, Data/EEG/Gaze tabs, pipeline state,
-                     background worker, dialogs, brAIn lab style and drawn icons
+  gui/               PySide6 app (views + controllers):
+    controllers.py   one method per user action: runs core, stores results in the session
+    pipeline.py      Qt bridge: session notifications → signals the views listen to
+    *_tab.py, …      views: they read their controls, call the controller and draw
 tests/               pytest suite on synthetic data
 packaging/           PyInstaller build script and entry point
 .github/workflows/   CI: tests on every push, packages on release

@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as _dt
-import re
 from pathlib import Path
 
 import numpy as np
+
+from . import core as C
 
 TITLES = {"erp": "ERP", "bandpower": "Band power", "indices": "Cognitive indices"}
 _PREFIX: dict = {}
@@ -132,7 +133,6 @@ def _xdf_reader(streams: list[dict], screen) -> tuple[list[str], dict]:
          '    the first EEG sample."""',
          "    streams = {s['info']['name'][0]: s for s in "
          "pyxdf.load_xdf(path, dejitter_timestamps=False)[0]}"]
-    used = {"pyxdf", "ndimage"}
     if eeg is not None:
         L += ["",
               f"    eeg = streams[{eeg['name']!r}]",
@@ -188,8 +188,7 @@ def _xdf_reader(streams: list[dict], screen) -> tuple[list[str], dict]:
         if isinstance(labels, str):
             labels = eval(labels)  # noqa: S307  (stored as a list repr)
         if not cols:
-            from .io.xdf import gaze_columns
-            m = gaze_columns([lab.lower() for lab in labels], len(labels))
+            m = C.gaze_columns([lab.lower() for lab in labels], len(labels))
             cols = ["extra"] * len(labels)
             for role in ("x", "y", "pupil", "valid"):
                 for k in m.get(role, []):
@@ -225,7 +224,6 @@ def _xdf_reader(streams: list[dict], screen) -> tuple[list[str], dict]:
 
 def _loading(recipe: dict) -> tuple[list[str], set]:
     """The Loading cell and the imports it needs."""
-    from . import eeg as E
     steps = recipe["load"]["steps"]
     first = steps[0]
     k = first["kind"]
@@ -347,12 +345,11 @@ def _join_parts(paths, entities, reader) -> list[str]:
 
 
 def _montage_code(source) -> list[str]:
-    from . import eeg as E
     if not source:
         return ["montage = None"]
-    layouts = E.layout_montages()
+    layouts = C.layout_montages()
     if source in layouts:
-        names, template = E.read_channel_layout(layouts[source])
+        names, template = C.read_channel_layout(layouts[source])
         import mne
         if template == "standard_1005" and "colin27_1005" in mne.channels.get_builtin_montages():
             template = "colin27_1005"
@@ -375,10 +372,9 @@ def _gaze_events(recipe: dict) -> tuple[list[str], set]:
     p = gz.get("params")
     if p is None:
         return [], set()
-    from . import gaze as G
-    key = G.preset_name(p)
+    key = C.preset_name(p)
     L = ["", "# fixations (I-DT), saccades (Engbert & Kliegl) and blinks with pymovements",
-         *(_c(f"Preset: {G.PRESETS[key][0]}.") if key else []),
+         *(_c(f"Preset: {C.PRESETS[key][0]}.") if key else []),
          "sf = 1 / np.polyfit(np.arange(len(gaze)), gaze['t'], 1)[0]  # sampling rate",
          "n = lambda seconds, least=1: max(int(round(seconds * sf)), least)  # → samples",
          "xy = gaze[['x', 'y']].to_numpy().T",
@@ -562,8 +558,7 @@ def _epoching(recipe: dict) -> tuple[list[str], set]:
 
 # =========================================================================== analyses
 def _erp(spec, extra) -> tuple[list[str], set]:
-    from . import eeg as E
-    ref, label = E.resolve_erp_reference(spec.reference, extra["ch_names"])
+    ref, label = C.resolve_erp_reference(spec.reference, extra["ch_names"])
     c = spec.component
     groups = list(spec.groups)
     multi = extra.get("n_subjects", 0) >= 2
@@ -621,7 +616,6 @@ def _erp(spec, extra) -> tuple[list[str], set]:
 
 
 def _bandpower_core(spec) -> list[str]:
-    from . import bandpower as BP  # noqa: F401
     b = spec.baseline
     groups = list(spec.groups)
     L = [assign("BANDS = ", {k: list(v) for k, v in spec.bands.items()}),
@@ -706,8 +700,7 @@ def _bandpower(spec, tc_band) -> tuple[list[str], set]:
 
 
 def _indices(bp_spec, spec) -> tuple[list[str], set]:
-    from . import bandpower as BP
-    rois = {k: list(v) for k, v in {**BP.DEFAULT_ROIS, **spec.rois}.items()}
+    rois = {k: list(v) for k, v in {**C.DEFAULT_ROIS, **spec.rois}.items()}
     what = (f"Cognitive indices per epoch in {bp_spec.tmin:g} … {bp_spec.tmax:g} s, from "
             "absolute band power (Welch PSD) averaged over channel regions: engagement "
             "β/(α+θ), workload frontal-midline θ / parietal α, θ/α, frontal θ/β and frontal "

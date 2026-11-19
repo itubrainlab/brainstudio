@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
+from .. import core as C
 import mne
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
-from .. import eeg as E
-from .. import events as EV
-from .. import preprocessing as P
 from .icaview import ICAComponentView
 from .theme import THEME
 from .widgets import (StageHeader, _spin, _themed_plot, has_positions, hint,
@@ -50,7 +48,7 @@ class PreprocessTab(QtWidgets.QWidget):
         box = QtWidgets.QGroupBox("Channels — automated peak-to-peak rejection")
         v = QtWidgets.QVBoxLayout(box)
         g = QtWidgets.QGridLayout()
-        bp = P.BadChannelParams()
+        bp = C.BadChannelParams()
         self.ptp_max = _spin(1, 1e5, bp.ptp_max_uv, 10, 0, " µV")
         self.ptp_min = _spin(0, 1000, bp.ptp_min_uv, 0.5, 1, " µV")
         self.ptp_win = _spin(0.1, 30, bp.window, 0.5, 1, " s")
@@ -118,7 +116,7 @@ class PreprocessTab(QtWidgets.QWidget):
         box = QtWidgets.QGroupBox("ICA — blink removal")
         v = QtWidgets.QVBoxLayout(box)
         g = QtWidgets.QHBoxLayout()
-        ip = P.ICAParams()
+        ip = C.ICAParams()
         self.ica_on = QtWidgets.QCheckBox("Remove components")
         self.ica_on.setChecked(True)
         self.ica_var = QtWidgets.QCheckBox("99 % of variance")
@@ -236,10 +234,10 @@ class PreprocessTab(QtWidgets.QWidget):
         """Start of the data used for bad channels and ICA (None = whole recording)."""
         if not self.from_event.isChecked():
             return None
-        return EV.first_event_time(self.pl.event_table)
+        return C.first_event_time(self.pl.event_table)
 
     def _update_first_event_label(self):
-        t = EV.first_event_time(self.pl.event_table)
+        t = C.first_event_time(self.pl.event_table)
         self.from_event.setText("Ignore the data before the first event"
                                 + (f" ({t:.1f} s)" if t is not None else " (no events)"))
         self.from_event.setEnabled(t is not None and t > 0)
@@ -275,10 +273,10 @@ class PreprocessTab(QtWidgets.QWidget):
                                      if self.pl.clean is not None else ""))
         self.header.set_state(self.pl.state["preprocessing"])
 
-    def params(self) -> P.PreprocParams:
+    def params(self) -> C.PreprocParams:
         notch = {"off": None, "50 Hz": 50.0, "60 Hz": 60.0}[self.notch.currentText()]
         exclude = self.ica_excluded() if self.ica_on.isChecked() else []
-        return P.PreprocParams(bads=self.bads(), l_freq=self.hp.value() or None,
+        return C.PreprocParams(bads=self.bads(), l_freq=self.hp.value() or None,
                                h_freq=self.lp.value() or None, notch=notch,
                                reference=None, ica_exclude=exclude,
                                interpolate_bads=self.interp.isChecked())
@@ -311,7 +309,7 @@ class PreprocessTab(QtWidgets.QWidget):
             self.ch_table.blockSignals(False)
             return
         names = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude=[])] \
-            or [raw.ch_names[i] for i in E.eeg_picks(raw)]
+            or [raw.ch_names[i] for i in C.eeg_picks(raw)]
         cols = ["use", "channel", "median ptp µV", "noisy %", "flat %", "z", "reason"]
         self.ch_table.setColumnCount(len(cols))
         self.ch_table.setHorizontalHeaderLabels(cols)
@@ -387,7 +385,7 @@ class PreprocessTab(QtWidgets.QWidget):
         if self.pl.raw is None:
             return
         notch = {"off": None, "50 Hz": 50.0, "60 Hz": 60.0}[self.notch.currentText()]
-        p = P.BadChannelParams(ptp_max_uv=self.ptp_max.value(), ptp_min_uv=self.ptp_min.value(),
+        p = C.BadChannelParams(ptp_max_uv=self.ptp_max.value(), ptp_min_uv=self.ptp_min.value(),
                                window=self.ptp_win.value(),
                                max_bad_fraction=self.ptp_frac.value() / 100,
                                z_thresh=self.ptp_z.value() or np.inf,
@@ -414,7 +412,7 @@ class PreprocessTab(QtWidgets.QWidget):
         if self.pl.raw is None:
             return
         notch = {"off": None, "50 Hz": 50.0, "60 Hz": 60.0}[self.notch.currentText()]
-        ip = P.ICAParams(n_components=0.99 if self.ica_var.isChecked() else self.ica_n.value(),
+        ip = C.ICAParams(n_components=0.99 if self.ica_var.isChecked() else self.ica_n.value(),
                          method=self.ica_method.currentText(),
                          clean=self.ica_clean.currentData(),
                          autoreject_fraction=self.ica_ar_share.value() / 100,

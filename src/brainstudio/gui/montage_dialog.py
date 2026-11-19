@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+from .. import core as C
 from pathlib import Path
 
 import mne
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
-from .. import eeg as E
 
 MONTAGE_FILES = ("Montage files (*.elc *.sfp *.loc *.locs *.eloc *.csd *.elp *.hpts "
                  "*.bvef *.txt *.xyz *.fif *_electrodes.tsv);;All files (*)")
@@ -30,8 +30,8 @@ class MontageDialog(QtWidgets.QDialog):
         self.rb_none = QtWidgets.QRadioButton("None (rename channels only)")
         self.rb_builtin.setChecked(True)
         self.builtin = QtWidgets.QComboBox()
-        names = E.builtin_montages()
-        self.layouts = E.layout_montages()
+        names = C.builtin_montages()
+        self.layouts = C.layout_montages()
         self.builtin.addItems(names)
         for i, n in enumerate(self.layouts):
             self.builtin.setItemData(i, "Channel layout: also defines the input order "
@@ -102,7 +102,7 @@ class MontageDialog(QtWidgets.QDialog):
             return []
         out = []
         for name, path in self.layouts.items():
-            if len(E.read_channel_layout(path)[0]) == len(raw.ch_names):
+            if len(C.read_channel_layout(path)[0]) == len(raw.ch_names):
                 out.append(name)
         return out
 
@@ -133,7 +133,7 @@ class MontageDialog(QtWidgets.QDialog):
         src = self.builtin.currentText() if self.rb_builtin.isChecked() else self.path.text()
         if not src:
             raise ValueError("Choose a montage file")
-        return E.montage_from_source(src)
+        return C.montage_from_source(src)
 
     def _fill_from_montage(self):
         try:
@@ -169,7 +169,7 @@ class MontageDialog(QtWidgets.QDialog):
         test = mne.io.RawArray(np.zeros((len(self.raw.ch_names), 1)), self.raw.info.copy(),
                                verbose="error")
         montage = self._get_montage()
-        report = E.apply_montage(test, montage, self.new_names())
+        report = C.apply_montage(test, montage, self.new_names())
         return test, montage, report
 
     def _check(self):

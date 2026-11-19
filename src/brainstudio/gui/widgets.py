@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+from .. import core as C
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
-from .. import eeg as E
 from .theme import THEME
 
 
@@ -53,7 +53,7 @@ def fill_table(table: QtWidgets.QTableWidget, df: pd.DataFrame, fmt="{:.3g}"):
         table.setUpdatesEnabled(True)
 
 
-has_positions = E.has_positions
+has_positions = C.has_positions
 
 
 NO_POS = ("The EEG channels have no electrode positions. Use File ▸ Channel names & "

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+from .. import core as C
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore
 
-from .. import gaze as G
 from .theme import _SERIES_DARK, THEME
 
 # The display area is always drawn dark (like a monitor), so on-screen items
@@ -171,5 +171,4 @@ class ScreenView(pg.PlotWidget):
 
     def aoi_table(self):
         """The AOIs as a pymovements AOI table (None without AOIs)."""
-        from .. import gaze as G
-        return G.make_aois(self.aoi_specs())
+        return C.make_aois(self.aoi_specs())

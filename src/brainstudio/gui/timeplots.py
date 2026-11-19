@@ -70,7 +70,7 @@ class SegmentLinesMixin:
     """A labelled line where each recording (subject / session / run) starts."""
 
     def _set_segment_lines(self, plot: pg.PlotItem, segments: list[dict], labels=True):
-        from ..io.multi import segment_label
+        from ..core import segment_label
         for item in getattr(self, "_segment_items", []):
             plot.removeItem(item)
         self._segment_items = []

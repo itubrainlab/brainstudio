@@ -6,8 +6,8 @@ from __future__ import annotations
 
 from PySide6 import QtCore, QtWidgets
 
-from ..io.markers import COLUMN_ROLES
-from ..io.xdf import EEG_CHANNEL_TYPES, GAZE_COLUMN_ROLES, ROLES
+from ..core import MARKER_COLUMN_ROLES as COLUMN_ROLES
+from ..core import EEG_CHANNEL_TYPES, GAZE_COLUMN_ROLES, ROLES
 from .widgets import hint
 
 CHECKED, UNCHECKED = QtCore.Qt.Checked, QtCore.Qt.Unchecked

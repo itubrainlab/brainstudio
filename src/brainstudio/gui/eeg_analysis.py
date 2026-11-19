@@ -3,6 +3,7 @@ cognitive-state indices, all compared across groups."""
 
 from __future__ import annotations
 
+from .. import core as C
 from pathlib import Path
 
 import mne
@@ -12,9 +13,6 @@ import pyqtgraph as pg
 from scipy import stats as sst
 from PySide6 import QtCore, QtWidgets
 
-from .. import bandpower as BP
-from .. import eeg as E
-from .. import workflow as W
 from .theme import THEME
 from .widgets import (NO_POS, StageHeader, _spin, _themed_plot, fill_table, has_positions,
                       hint, parse_channels)
@@ -24,7 +22,7 @@ def _safe(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(name)) or "group"
 
 
-_sem = W.sem  # one implementation, shared with the exported scripts
+_sem = C.sem  # one implementation, shared with the exported scripts
 
 
 def _bars(plot: pg.PlotItem, xs, means, sems, color, width):
@@ -159,7 +157,7 @@ class AnalysisTab(QtWidgets.QWidget):
         # ERP component (as in Rhino ERP): preset → window, polarity, channel cluster
         self.erp_comp = QtWidgets.QComboBox()
         self.erp_comp.addItem("Custom")
-        self.erp_comp.addItems(list(E.COMPONENT_PRESETS))
+        self.erp_comp.addItems(list(C.COMPONENT_PRESETS))
         self.erp_comp.setToolTip("ERP component presets (conventional windows and sites — "
                                  "starting points, adjust to your paradigm). Any edit makes it "
                                  "Custom.")
@@ -299,17 +297,17 @@ class AnalysisTab(QtWidgets.QWidget):
             self.erp_ref_note.setText("")
             return
         try:
-            _, label = E.resolve_erp_reference("mastoids", names)
+            _, label = C.resolve_erp_reference("mastoids", names)
             self.erp_ref_note.setText("→ " + label)
         except ValueError as e:
             self.erp_ref_note.setText(f"⚠ {e}")
 
     def _apply_component_preset(self, name: str):
-        comp = E.COMPONENT_PRESETS.get(name)
+        comp = C.COMPONENT_PRESETS.get(name)
         if comp is None:
             return
         # each component comes with its usual reference
-        self.erp_ref.setCurrentText(E.COMPONENT_REFERENCE.get(name, "average"))
+        self.erp_ref.setCurrentText(C.COMPONENT_REFERENCE.get(name, "average"))
         for wdg in (self.erp_m0, self.erp_m1, self.erp_pol, self.erp_roi):
             wdg.blockSignals(True)
         self.erp_m0.setValue(comp.tmin)
@@ -326,10 +324,10 @@ class AnalysisTab(QtWidgets.QWidget):
             self.erp_comp.blockSignals(False)
         self._update_ref_note()
 
-    def component(self, available: list[str]) -> E.Component:
+    def component(self, available: list[str]) -> C.Component:
         found, _ = parse_channels(self.erp_roi.text(), available)
         name = self.erp_comp.currentText()
-        return E.Component(name if name != "Custom" else "custom", self.erp_m0.value(),
+        return C.Component(name if name != "Custom" else "custom", self.erp_m0.value(),
                            self.erp_m1.value(), tuple(found or available),
                            int(self.erp_pol.currentData()))
 
@@ -360,7 +358,7 @@ class AnalysisTab(QtWidgets.QWidget):
                                           "its start.")
             return False
         try:
-            ref, ref_label = E.resolve_erp_reference(self._ref_spec(self.erp_ref),
+            ref, ref_label = C.resolve_erp_reference(self._ref_spec(self.erp_ref),
                                                      list(first.ch_names))
         except ValueError as e:
             QtWidgets.QMessageBox.warning(self, "Reference", str(e))
@@ -371,7 +369,7 @@ class AnalysisTab(QtWidgets.QWidget):
                                           "ends.")
             return False
 
-        spec = W.ErpSpec(groups=list(groups), component=comp, baseline=bl,
+        spec = C.ErpSpec(groups=list(groups), component=comp, baseline=bl,
                          reference=self._ref_spec(self.erp_ref))
 
         def done(res):
@@ -681,7 +679,7 @@ class AnalysisTab(QtWidgets.QWidget):
                 ch = list(next(iter(r["eps"].values())).ch_names)
                 code = SC.build_script("erp", r["recipe"], r["spec"],
                                        {"ch_names": ch, "n_subjects":
-                                        len(E.subjects_in(r["eps"]))})
+                                        len(C.subjects_in(r["eps"]))})
             elif kind == "bandpower":
                 band = self.tc["band"] if self.tc is not None else None
                 code = SC.build_script("bandpower", r["recipe"], r["spec"], band)
@@ -806,7 +804,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.bl_mode.addItem("nearest preceding baseline event", "nearest")
         f.addRow("Use", self.bl_mode)
         self.bl_norm = QtWidgets.QComboBox()
-        self.bl_norm.addItems(list(BP.NORMALISATIONS))
+        self.bl_norm.addItems(list(C.NORMALISATIONS))
         self.bl_norm.setCurrentText("dB")
         f.addRow("Express as", self.bl_norm)
         f.addRow(hint("The baseline window is cut into segments as long as the analysis "
@@ -867,7 +865,7 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _default_bands(self):
         self.band_table.setRowCount(0)
-        for n, (lo, hi) in BP.DEFAULT_BANDS.items():
+        for n, (lo, hi) in C.DEFAULT_BANDS.items():
             self._add_band(n, lo, hi)
 
     def bands(self) -> dict:
@@ -907,13 +905,13 @@ class AnalysisTab(QtWidgets.QWidget):
         self.bl_event.setCurrentIndex(i)
         self.bl_event.blockSignals(False)
 
-    def baseline(self) -> W.BaselineSpec | None:
+    def baseline(self) -> C.BaselineSpec | None:
         name = self.bl_event.currentData()
         if not name:
             return None
-        spec = W.BaselineSpec(name, self.bl_t0.value(), self.bl_t1.value(),
+        spec = C.BaselineSpec(name, self.bl_t0.value(), self.bl_t1.value(),
                               self.bl_mode.currentData(), self.bl_query.text())
-        W.band_baseline(self.pl.event_table, spec)  # raises ValueError when invalid
+        C.band_baseline(self.pl.event_table, spec)  # raises ValueError when invalid
         return spec
 
     def compute_bp(self, then=None):
@@ -929,11 +927,11 @@ class AnalysisTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Band power", str(e))
             return False
         try:
-            E.resolve_erp_reference(self._ref_spec(self.bp_ref), list(first.ch_names))
+            C.resolve_erp_reference(self._ref_spec(self.bp_ref), list(first.ch_names))
         except ValueError as e:
             QtWidgets.QMessageBox.warning(self, "Reference", str(e))
             return False
-        spec = W.BandPowerSpec(groups=list(groups), bands=bands, tmin=self.bp_t0.value(),
+        spec = C.BandPowerSpec(groups=list(groups), bands=bands, tmin=self.bp_t0.value(),
                                tmax=self.bp_t1.value(), method=self.bp_method.currentText(),
                                roi=roi, reference=self._ref_spec(self.bp_ref),
                                baseline=base, norm=self.bl_norm.currentText())
@@ -969,7 +967,7 @@ class AnalysisTab(QtWidgets.QWidget):
             _bars(p.getPlotItem(), xs, means, sems, self._color(g, 200), width * 0.9)
             p.plot([], [], pen=pg.mkPen(self._color(g), width=6), name=f"{g} (n={len(sub)})")
         p.getAxis("bottom").setTicks([[(i, n) for i, n in enumerate(names)]])
-        p.setLabel("left", f"band power ({BP.unit(r['mode'])})")
+        p.setLabel("left", f"band power ({C.unit(r['mode'])})")
         if r["mode"] != "absolute":
             p.addItem(pg.InfiniteLine(0 if r["mode"] in ("dB", "% change", "z") else 1,
                                       angle=0, pen=pg.mkPen(THEME.muted)))
@@ -1007,7 +1005,7 @@ class AnalysisTab(QtWidgets.QWidget):
             p.addItem(pg.FillBetweenItem(lo, hi, brush=self._color(g, 50)))
             p.plot(t, m, pen=pg.mkPen(self._color(g), width=2), name=g)
         p.addItem(pg.InfiniteLine(0, angle=90, pen=pg.mkPen(THEME.muted)))
-        p.setLabel("left", f"{r['band']} power ({BP.unit(r['mode'])})")
+        p.setLabel("left", f"{r['band']} power ({C.unit(r['mode'])})")
 
     def bp_topo(self):
         r = self.bp
@@ -1042,7 +1040,7 @@ class AnalysisTab(QtWidgets.QWidget):
                                      cmap="RdBu_r" if sym else "viridis",
                                      vlim=(-lim, lim) if sym else (None, None))
                 axes[i, j].set_title(f"{g}\n{n}", fontsize=8)
-        unit = "log10 µV²" if r["mode"] == "absolute" else BP.unit(r["mode"])
+        unit = "log10 µV²" if r["mode"] == "absolute" else C.unit(r["mode"])
         fig.suptitle(f"Band power ({unit})")
         plt.show()
 
@@ -1085,7 +1083,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.roi_table.setHorizontalHeaderLabels(["region", "channels"])
         self.roi_table.horizontalHeader().setStretchLastSection(True)
         self.roi_table.verticalHeader().setVisible(False)
-        for k, v in BP.DEFAULT_ROIS.items():
+        for k, v in C.DEFAULT_ROIS.items():
             r = self.roi_table.rowCount()
             self.roi_table.insertRow(r)
             it = QtWidgets.QTableWidgetItem(k)
@@ -1100,7 +1098,7 @@ class AnalysisTab(QtWidgets.QWidget):
         box = QtWidgets.QGroupBox("Indices")
         bv = QtWidgets.QVBoxLayout(box)
         self.idx_list = QtWidgets.QListWidget()
-        for k, desc in list(BP.INDEX_INFO.items()) + [
+        for k, desc in list(C.INDEX_INFO.items()) + [
                 ("pupil dilation", "task-evoked pupil response (mean in window − 200 ms "
                                    "pre-event); larger = more load (Beatty, Kahneman)"),
                 ("blink rate /min", "blinks per minute inside the window (eye tracker)"),
@@ -1154,7 +1152,7 @@ class AnalysisTab(QtWidgets.QWidget):
             return self.compute_bp(then=lambda: self.compute_idx(then))
         chosen = [self.idx_list.item(i).text() for i in range(self.idx_list.count())
                   if self.idx_list.item(i).checkState() == QtCore.Qt.Checked]
-        spec = W.IndicesSpec(rois=self.rois(), measures=chosen)
+        spec = C.IndicesSpec(rois=self.rois(), measures=chosen)
 
         def done(res):
             self._plot_idx()

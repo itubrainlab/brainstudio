@@ -28,6 +28,8 @@ from scipy import stats as scipy_stats
 # =========================================================================== loading: XDF
 GAZE_TYPE = re.compile(r"gaze|eye|^et$|pupil|tobii|eyelink", re.I)
 EEG_TYPE = re.compile(r"eeg|exg", re.I)
+#: channel types the XDF stream dialog offers
+EEG_CHANNEL_TYPES = ("eeg", "eog", "ecg", "emg", "misc", "stim")
 ROLES = ("EEG", "gaze", "markers", "ignore")
 UNIT_SCALE = {"microvolts": 1e-6, "uv": 1e-6, "µv": 1e-6, "μv": 1e-6, "millivolts": 1e-3,
               "mv": 1e-3, "volts": 1.0, "v": 1.0, "nanovolts": 1e-9}
@@ -3113,7 +3115,7 @@ def baseline_band_power(raw: mne.io.BaseRaw, base: BandBaseline, settings: BandS
                         ) -> tuple[np.ndarray, np.ndarray]:
     """Band power of baseline segments: (n_segments, n_ch, n_bands) and segment owners.
 
-    ``ref`` (see :func:`brainstudio.eeg.resolve_erp_reference`) re-references the
+    ``ref`` (see :func:`resolve_erp_reference`) re-references the
     segments the same way as the epochs they are compared with."""
     ep, owner = baseline_epochs(raw, base, seg_len, ch_names)
     ep = reference_epochs(ep, ref)
