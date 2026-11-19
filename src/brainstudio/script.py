@@ -468,12 +468,16 @@ def _preprocessing(recipe: dict) -> tuple[list[str], set]:
               "segments = mne.Epochs(ica_raw, events_1s, tmin=0, tmax=1.0, baseline=None, "
               "preload=True)"]
         if s["segments"] == "autoreject":
-            n = s["autoreject_max"]
+            f = s.get("autoreject_fraction", 1.0)
             L += [f"ar = AutoReject(n_interpolate=[1, 2, 4], random_state={s['seed']}, "
-                  "verbose=False)",
-                  f"fit_on = np.sort(np.random.default_rng({s['seed']}).choice(len(segments), "
-                  f"{n}, replace=False)) if len(segments) > {n} else slice(None)",
-                  "good = ~ar.fit(segments[fit_on]).get_reject_log(segments).bad_epochs"]
+                  "verbose=False)"]
+            if f < 1:
+                L += [f"fit_on = np.sort(np.random.default_rng({s['seed']}).choice("
+                      f"len(segments), max(2, round({lit(f)} * len(segments))), "
+                      f"replace=False))  # {f:.0%} of the segments",
+                      "good = ~ar.fit(segments[fit_on]).get_reject_log(segments).bad_epochs"]
+            else:
+                L += ["good = ~ar.fit(segments).get_reject_log(segments).bad_epochs"]
         elif s["segments"] == "threshold" and s["reject_uv"]:
             L += [f"segments.drop_bad(reject=dict(eeg={lit(s['reject_uv'])}e-6))",
                   "good = np.ones(len(segments), bool)"]
@@ -539,13 +543,18 @@ def _epoching(recipe: dict) -> tuple[list[str], set]:
     imports = set()
     if st.autoreject:
         imports.add("autoreject")
-        L += ["", "# AutoReject fitted on (at most 600 of) the epochs of every group",
+        f = st.autoreject_fraction
+        L += ["", "# AutoReject fitted on " + ("all" if f >= 1 else f"{f:.0%} of") +
+              " the epochs of every group",
               "every = mne.concatenate_epochs(list(epochs.values()))",
-              "fit_on = np.sort(np.random.default_rng(42).choice(len(every), 600, "
-              "replace=False)) if len(every) > 600 else slice(None)",
-              "ar = AutoReject(n_interpolate=[1, 2, 4], random_state=42, verbose=False)",
-              "ar.fit(every[fit_on])",
-              "epochs = {label: ar.transform(ep) for label, ep in epochs.items()}"]
+              "ar = AutoReject(n_interpolate=[1, 2, 4], random_state=42, verbose=False)"]
+        if f < 1:
+            L += [f"fit_on = np.sort(np.random.default_rng(42).choice(len(every), "
+                  f"max(2, round({lit(f)} * len(every))), replace=False))",
+                  "ar.fit(every[fit_on])"]
+        else:
+            L += ["ar.fit(every)"]
+        L += ["epochs = {label: ar.transform(ep) for label, ep in epochs.items()}"]
     L += ["for label, ep in epochs.items():",
           "    print(f'{label}: {len(ep)} epochs')"]
     return L, imports

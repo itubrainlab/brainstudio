@@ -147,8 +147,21 @@ class PreprocessTab(QtWidgets.QWidget):
         self.ica_rej.setToolTip("Threshold cleaning: skip 1 s segments above this "
                                 "peak-to-peak")
         self.ica_rej.setEnabled(False)
-        self.ica_clean.currentIndexChanged.connect(
-            lambda _: self.ica_rej.setEnabled(self.ica_clean.currentData() == "threshold"))
+        self.ica_ar_share = QtWidgets.QSpinBox()
+        self.ica_ar_share.setRange(1, 100)
+        self.ica_ar_share.setValue(100)
+        self.ica_ar_share.setSuffix(" %")
+        self.ica_ar_share.setPrefix("fit on ")
+        self.ica_ar_share.setToolTip('Share of the segments AutoReject learns its thresholds from (100 % = '
+                                     'all). A smaller share is quicker and needs less memory (the fit takes '
+                                     'about 12× the memory of the segments it uses), but on noisy recordings'
+                                     ' the result can change a lot with which segments are drawn.')
+
+        def clean_changed(_=None):
+            ar = self.ica_clean.currentData() == "autoreject"
+            self.ica_rej.setEnabled(not ar)
+            self.ica_ar_share.setEnabled(ar)
+        self.ica_clean.currentIndexChanged.connect(clean_changed)
         self.ica_iclabel = QtWidgets.QCheckBox("ICLabel")
         self.ica_iclabel.setChecked(True)
         self.ica_iclabel.setToolTip("Label every component (brain, eye blink, muscle, heart, "
@@ -156,7 +169,7 @@ class PreprocessTab(QtWidgets.QWidget):
                                     "Needs electrode positions.")
         for lab, w in (("components", self.ica_var), ("", self.ica_n),
                        ("method", self.ica_method), ("bad segments", self.ica_clean),
-                       ("", self.ica_rej), ("", self.ica_iclabel)):
+                       ("", self.ica_ar_share), ("", self.ica_rej), ("", self.ica_iclabel)):
             if lab:
                 g.addWidget(QtWidgets.QLabel(lab))
             g.addWidget(w)
@@ -447,6 +460,7 @@ class PreprocessTab(QtWidgets.QWidget):
         ip = P.ICAParams(n_components=0.99 if self.ica_var.isChecked() else self.ica_n.value(),
                          method=self.ica_method.currentText(),
                          clean=self.ica_clean.currentData(),
+                         autoreject_fraction=self.ica_ar_share.value() / 100,
                          reject_uv=self.ica_rej.value() or None,
                          iclabel=self.ica_iclabel.isChecked())
         h = None  # ICA is fitted on 1–30 Hz (ERP guide), whatever the ERP low-pass

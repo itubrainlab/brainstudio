@@ -113,7 +113,7 @@ class ICAParams:
     target_sfreq: float = 128.0   # resample the fitting data to about this rate
     decim: int = 3                # fit on every 3rd sample
     max_samples: int = 300_000    # … or fewer, so long recordings stay bounded
-    autoreject_max_epochs: int = 600  # AutoReject is fitted on at most this many segments
+    autoreject_fraction: float = 1.0  # share of the segments AutoReject is fitted on
     max_iter: int = 500           # stop a fit that does not converge
     seed: int = 42
     iclabel: bool = True          # label the components with ICLabel (needs positions)
@@ -243,7 +243,7 @@ def fit_ica(raw: mne.io.BaseRaw, bads=(), h_freq=None, notch=None,
     how = "all"
     if p.clean == "autoreject" and len(seg) >= 20 and E.has_positions(seg):
         try:
-            good = ~autoreject_bad_segments(seg, p.seed, p.autoreject_max_epochs)
+            good = ~autoreject_bad_segments(seg, p.seed, p.autoreject_fraction)
             how = "autoreject"
             notes.append(f"AutoReject left out {int((~good).sum())} of {len(seg)} 1 s "
                          "segments")
@@ -281,7 +281,7 @@ def fit_ica(raw: mne.io.BaseRaw, bads=(), h_freq=None, notch=None,
         tmin=start or None, resample=(fit_raw.info["sfreq"] if decim > 1 else None),
         n_components=nc, method=method, fit_params=fit_params, max_iter=p.max_iter,
         seed=p.seed, segments=how, reject_uv=p.reject_uv,
-        autoreject_max=p.autoreject_max_epochs, decim=every)
+        autoreject_fraction=p.autoreject_fraction, decim=every)
     return ica, fit_raw
 
 
@@ -302,10 +302,25 @@ def ptp_good_segments(seg: mne.BaseEpochs, reject_uv) -> np.ndarray:
     return good
 
 
+def fit_subset(n: int, fraction: float, seed: int = 42):
+    """Indices of the epochs AutoReject is fitted on: all of them (``fraction`` 1), or a
+    random, reproducible share. Fitting on a share is quicker and needs less memory, but
+    on noisy data the result can depend strongly on which epochs are drawn."""
+    if fraction >= 1 or n < 2:
+        return slice(None)
+    k = max(2, int(round(fraction * n)))
+    return np.sort(np.random.default_rng(seed).choice(n, k, replace=False))
+
+
+#: AutoReject's fit needs roughly this many times the memory of the epochs it is fitted
+#: on (measured: 1.16 GB of epochs → +14.2 GB)
+AUTOREJECT_MEMORY_FACTOR = 12.5
+
+
 def autoreject_bad_segments(epochs: mne.BaseEpochs, seed: int = 42,
-                            max_fit: int = 600) -> np.ndarray:
-    """AutoReject (``n_interpolate=[1, 2, 4]``, ``random_state=42``) marks bad segments;
-    fitted on at most ``max_fit`` of them so long recordings stay quick."""
+                            fraction: float = 1.0) -> np.ndarray:
+    """AutoReject (``n_interpolate=[1, 2, 4]``, ``random_state=42``) marks bad segments,
+    fitted on all segments or on a random share (:func:`fit_subset`)."""
     import warnings
 
     from autoreject import AutoReject
@@ -313,12 +328,7 @@ def autoreject_bad_segments(epochs: mne.BaseEpochs, seed: int = 42,
                     picks=mne.pick_types(epochs.info, eeg=True, eog=False))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        n = len(epochs)
-        if n > max_fit:
-            ar.fit(epochs[np.sort(np.random.default_rng(seed).choice(n, max_fit,
-                                                                     replace=False))])
-        else:
-            ar.fit(epochs)
+        ar.fit(epochs[fit_subset(len(epochs), fraction, seed)])
         return np.asarray(ar.get_reject_log(epochs).bad_epochs, bool)
 
 

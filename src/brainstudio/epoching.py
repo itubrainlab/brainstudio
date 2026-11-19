@@ -24,6 +24,7 @@ class EpochSettings:
     tmax: float = 1.0
     reject_uv: float | None = None    # peak-to-peak rejection (EEG)
     autoreject: bool = True           # AutoReject (local): interpolate, then drop
+    autoreject_fraction: float = 1.0  # share of the epochs AutoReject is fitted on
     flat_uv: float | None = None      # reject epochs flatter than this
     drop_blinks: bool = False         # drop epochs overlapping an eye-tracker blink
     delay_ms: float = 0.0             # EEG recording delay: + moves events later
@@ -35,7 +36,8 @@ class EpochSettings:
         if self.flat_uv:
             s += f", flat < {self.flat_uv:g} µV"
         if self.autoreject:
-            s += ", AutoReject"
+            s += ", AutoReject" + (f" (fitted on {self.autoreject_fraction:.0%})"
+                                   if self.autoreject_fraction < 1 else "")
         if self.drop_blinks:
             s += ", no blinks"
         if self.delay_ms:
@@ -110,15 +112,15 @@ def build_group_epochs(raw: mne.io.BaseRaw, groups: dict[str, pd.DataFrame],
         rows.append(row)
     summary = pd.DataFrame(rows)
     if settings.autoreject and out:
-        out, summary = apply_autoreject(out, summary)
+        out, summary = apply_autoreject(out, summary, settings.autoreject_fraction)
     return out, summary
 
 
 def apply_autoreject(epochs: dict[str, mne.Epochs], summary: pd.DataFrame,
-                     max_fit: int = 600, seed: int = 42
+                     fraction: float = 1.0, seed: int = 42
                      ) -> tuple[dict[str, mne.Epochs], pd.DataFrame]:
     """AutoReject (``n_interpolate=[1, 2, 4]``, ``random_state=42``), as in the ERP guide:
-    fitted once on the epochs of every group (at most ``max_fit`` of them), then each
+    fitted once on the epochs of every group (all, or a random share), then each
     group is cleaned — bad channels are interpolated within an epoch and the epochs that
     cannot be repaired are dropped. Needs electrode positions and ≥ 10 epochs."""
     import warnings
@@ -140,9 +142,9 @@ def apply_autoreject(epochs: dict[str, mne.Epochs], summary: pd.DataFrame,
         # fitting needs only the data: one array of every group's epochs (their event
         # codes may clash, which mne.concatenate_epochs refuses)
         sizes = [len(e) for e in every]
-        pick = np.arange(n)
-        if n > max_fit:
-            pick = np.sort(np.random.default_rng(seed).choice(n, max_fit, False))
+        from .preprocessing import fit_subset
+        pick = fit_subset(n, fraction, seed)
+        pick = np.arange(n) if isinstance(pick, slice) else pick
         starts = np.cumsum([0] + sizes)
         data = np.concatenate([every[k].get_data(item=pick[(pick >= starts[k]) &
                                                          (pick < starts[k + 1])] - starts[k])

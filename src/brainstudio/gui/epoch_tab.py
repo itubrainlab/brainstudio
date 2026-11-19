@@ -20,12 +20,17 @@ MEMORY_WARN_BYTES = 2e9
 
 
 def epochs_memory(raw, groups: dict, settings) -> float:
-    """Bytes the epochs will take: events × EEG channels × samples × 8."""
+    """Bytes building the epochs takes: events × EEG channels × samples × 8, plus about
+    12× the epochs AutoReject is fitted on while it learns its thresholds."""
+    from ..preprocessing import AUTOREJECT_MEMORY_FACTOR
     import mne
     n_ch = len(mne.pick_types(raw.info, eeg=True, exclude="bads")) or len(raw.ch_names)
     n_samp = int((settings.tmax - settings.tmin) * raw.info["sfreq"]) + 1
     n_ev = sum(len(t) for t in groups.values())
-    return float(n_ev) * n_ch * n_samp * 8
+    data = float(n_ev) * n_ch * n_samp * 8
+    if getattr(settings, "autoreject", False):
+        data *= 1 + AUTOREJECT_MEMORY_FACTOR * settings.autoreject_fraction
+    return data
 
 
 def _human(nbytes: float) -> str:
@@ -95,8 +100,18 @@ class EpochTab(QtWidgets.QWidget):
         self.autoreject = QtWidgets.QCheckBox("AutoReject: interpolate bad channels per "
                                               "epoch, drop epochs it cannot repair")
         self.autoreject.setChecked(st.autoreject)
+        self.ar_share = QtWidgets.QSpinBox()
+        self.ar_share.setRange(1, 100)
+        self.ar_share.setValue(int(round(st.autoreject_fraction * 100)))
+        self.ar_share.setSuffix(" %")
+        self.ar_share.setPrefix("fit on ")
+        self.ar_share.setToolTip('Share of the epochs AutoReject learns its thresholds from (100 % = '
+                                 'all). A smaller share is quicker and needs less memory (the fit takes '
+                                 'about 12× the memory of the epochs it uses), but on noisy recordings '
+                                 'the result can change a lot with which epochs are drawn.')
+        self.autoreject.toggled.connect(self.ar_share.setEnabled)
         self.autoreject.setToolTip("AutoReject (local), as in the ERP guide. Needs electrode "
-                                   "positions; fitted on at most 600 epochs of all groups.")
+                                   "positions; fitted once on the epochs of all groups.")
         self.delay = _spin(-500, 500, 0, 1, 0, " ms")
         self.delay.setToolTip("EEG recording delay: a positive value means the EEG lags the "
                               "events (e.g. wireless amplifiers), so epochs are cut later")
@@ -106,7 +121,8 @@ class EpochTab(QtWidgets.QWidget):
             g.addWidget(QtWidgets.QLabel(lab), i // 2, 2 * (i % 2))
             g.addWidget(w, i // 2, 2 * (i % 2) + 1)
         g.addWidget(self.blinks, 3, 0, 1, 4)
-        g.addWidget(self.autoreject, 4, 0, 1, 4)
+        g.addWidget(self.autoreject, 4, 0, 1, 3)
+        g.addWidget(self.ar_share, 4, 3)
         g.addWidget(hint("Epochs are not baseline-corrected here: the ERP baseline and the "
                          "band-power baseline are chosen in Analysis. Make epochs long "
                          "enough for both (e.g. −0.5…2 s for band power)."), 5, 0, 1, 4)
@@ -164,6 +180,7 @@ class EpochTab(QtWidgets.QWidget):
         self.delay.valueChanged.connect(lambda *_: self.pl.mark_stale("epoching"))
         self.blinks.toggled.connect(lambda *_: self.pl.mark_stale("epoching"))
         self.autoreject.toggled.connect(lambda *_: self.pl.mark_stale("epoching"))
+        self.ar_share.valueChanged.connect(lambda *_: self.pl.mark_stale("epoching"))
         self.pl.changed.connect(self._on_pipeline)
         self.pl.stateChanged.connect(self._on_state)
 
@@ -362,6 +379,7 @@ class EpochTab(QtWidgets.QWidget):
                              flat_uv=self.flat.value() or None,
                              drop_blinks=self.blinks.isChecked(),
                              autoreject=self.autoreject.isChecked(),
+                             autoreject_fraction=self.ar_share.value() / 100,
                              delay_ms=self.delay.value())
 
     def run(self, then=None) -> bool:
@@ -394,9 +412,10 @@ class EpochTab(QtWidgets.QWidget):
             ans = QtWidgets.QMessageBox.question(
                 self, "Large epochs",
                 f"These epochs need about {_human(need)} of memory "
-                f"({st.tmax - st.tmin:g} s × {sum(len(t) for t in groups.values())} events)."
-                "\n\nShorten the window or select fewer events to use less. Build them "
-                "anyway?",
+                f"({st.tmax - st.tmin:g} s × {sum(len(t) for t in groups.values())} events"
+                + (f", and AutoReject's fit on {st.autoreject_fraction:.0%} of them"
+                   if st.autoreject else "") + ").\n\nShorten the window, select fewer "
+                "events or fit AutoReject on a smaller share to use less. Build them anyway?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                 QtWidgets.QMessageBox.No)
             if ans != QtWidgets.QMessageBox.Yes:

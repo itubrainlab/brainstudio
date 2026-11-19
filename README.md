@@ -315,8 +315,9 @@ The **EEG** tab is a three-stage pipeline:
   - fitted on a separate **1–30 Hz**, average-referenced copy of the good, non-flat
     channels, whatever the ERP filter;
   - the copy is cut into **1 s segments**; **AutoReject** (`n_interpolate=[1, 2, 4]`,
-    `random_state=42`) marks the bad ones, which are left out of the fit. Without
-    electrode positions a peak-to-peak threshold is used instead;
+    `random_state=42`), fitted on all segments by default (*fit on* %), marks the bad
+    ones, which are left out of the fit. Without electrode positions a peak-to-peak
+    threshold is used instead;
   - **99 % of the variance** (or a set number of components), `random_state=42`, every
     3rd sample (more on long recordings: at most 300,000 samples), at most 500
     iterations; picard and infomax run as extended infomax.
@@ -346,11 +347,13 @@ The **EEG** tab is a three-stage pipeline:
   with every column.
 - **Epoch window**:
   - start and end around each event, of any length (up to an hour either side). Before
-    building, the memory the epochs need is estimated; above 2 GB you are asked first;
+    building, the memory the epochs need is estimated, including AutoReject's fit;
+    above 2 GB you are asked first;
   - defaults from the ERP guide: **−0.1 … 1.0 s**, no fixed amplitude threshold;
   - **AutoReject** (on by default): it interpolates bad channels within an epoch and
-    drops the epochs it cannot repair. It is fitted once on the epochs of every group
-    (at most 600) and needs electrode positions;
+    drops the epochs it cannot repair. It is fitted once on the epochs of every group and
+    needs electrode positions. *Fit on* sets the share of the epochs it learns its
+    thresholds from (100 % by default; see the note below);
   - optional peak-to-peak and flat rejection;
   - an option to drop epochs that contain an eye-tracker blink;
   - **EEG delay** (±500 ms) to correct a recording lag between events and EEG.
@@ -483,10 +486,13 @@ How groups are compared:
   and indices; a test checks the ERP values with brAInStudio blocked. The script leaves
   out app-only extras (phase inheritance in the event table, the epoch rejection
   report, peak tables).
-- **AutoReject is sensitive**: on the 47-min recording, moving a few fixation onsets by
-  0.14 ms (one EEG sample for some epochs) changed the epochs it keeps from 2,788 to
-  4,859, because it learns its thresholds from a random 600 of them. Treat its result
-  on such data with care.
+- **AutoReject: fit on all epochs** (the *Fit on* setting, for ICA segments and for
+  epochs). On a 47-min recording (8,595 fixation epochs) fitting on a random share made
+  the result depend on the draw: kept epochs ranged 32–89 % (600 epochs), 45–75 %
+  (20 %) and 30–90 % (50 %) over five draws. Fitted on all epochs it kept 78 % ± 0.4 %,
+  and 73–82 % with a random 1 % of the epochs left out. The cost is memory: the fit
+  needs about 12× the epochs it uses (+14 GB for those 8,595 epochs; +1.8 GB for 600).
+  Lower the share only when memory runs short.
 - It uses the settings the results on screen were computed with; if the results mix
   epochs with newer preprocessing or events, the export asks you to compute again.
 
