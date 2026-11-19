@@ -525,8 +525,12 @@ def _epoching(recipe: dict) -> tuple[list[str], set]:
     imports = set()
     if st.autoreject:
         imports.add("autoreject")
-        L += ["", "ar = AutoReject(n_interpolate=[1, 2, 4], random_state=42, verbose=False)",
-              "ar.fit(mne.concatenate_epochs(list(epochs.values())))",
+        L += ["", "# AutoReject fitted on (at most 600 of) the epochs of every group",
+              "every = mne.concatenate_epochs(list(epochs.values()))",
+              "fit_on = np.sort(np.random.default_rng(42).choice(len(every), 600, "
+              "replace=False)) if len(every) > 600 else slice(None)",
+              "ar = AutoReject(n_interpolate=[1, 2, 4], random_state=42, verbose=False)",
+              "ar.fit(every[fit_on])",
               "epochs = {label: ar.transform(ep) for label, ep in epochs.items()}"]
     L += ["for label, ep in epochs.items():",
           "    print(f'{label}: {len(ep)} epochs')"]
