@@ -21,6 +21,7 @@ import re
 import numpy as np
 import pandas as pd
 
+from . import gaze as G
 from .model import GazeEvents, Recording
 
 BASE_COLUMNS = ["onset", "duration", "name", "kind", "description"]
@@ -89,7 +90,7 @@ def _phase_spans(markers: pd.DataFrame) -> list[tuple[str, float, float, dict]]:
 
 
 def build_event_table(rec: Recording, gaze_events: GazeEvents | None = None,
-                      aois: dict | None = None) -> pd.DataFrame:
+                      aois=None) -> pd.DataFrame:
     markers = rec.all_events() if rec is not None else pd.DataFrame(
         columns=["onset", "duration", "description"])
     rows = []
@@ -108,18 +109,14 @@ def build_event_table(rec: Recording, gaze_events: GazeEvents | None = None,
             f["name"] = "fixation"
             f["kind"] = "fixation"
             f["description"] = "fixation"
-            if aois:
-                hit = np.full(len(f), "", dtype=object)
-                xy = f[["x", "y"]].to_numpy()
-                for aname, aoi in aois.items():
-                    inside = np.array([bool(aoi.contains((x, y))) for x, y in xy])
-                    hit[(hit == "") & inside] = aname
-                f["aoi"] = hit
+            if aois is not None:  # pymovements AOI table
+                f["aoi"] = G.fixation_aois(f, aois)
             tables.append(f.drop(columns=["offset"]))
         s = gaze_events.saccades.copy()
         if len(s):
             s["name"] = s["kind"] = s["description"] = "saccade"
-            tables.append(s.drop(columns=["offset", "x0", "y0", "x1", "y1"]))
+            tables.append(s.drop(columns=[c for c in ("offset", "x0", "y0", "x1", "y1")
+                                          if c in s]))
         b = gaze_events.blinks.copy()
         if len(b):
             b["name"] = b["kind"] = b["description"] = "blink"

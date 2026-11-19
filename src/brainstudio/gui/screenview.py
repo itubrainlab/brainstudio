@@ -131,7 +131,8 @@ class ScreenView(pg.PlotWidget):
             self.scan_line.setData([], [])
 
     # ----------------------------------------------------------------- AOIs
-    def add_aoi(self, kind="rectangle", name=None, pos=None, size=None):
+    def add_aoi(self, name=None, pos=None, size=None):
+        """A rectangular area of interest (pymovements maps fixations to rectangles)."""
         name = name or f"AOI{len(self.aois) + 1}"
         while name in self.aois:
             name += "'"
@@ -139,9 +140,7 @@ class ScreenView(pg.PlotWidget):
         size = size or (self.screen[0] / 5, self.screen[1] / 5)
         pos = pos or (self.screen[0] / 2 - size[0] / 2, self.screen[1] / 2 - size[1] / 2)
         pen = pg.mkPen(color, width=2)
-        cls = pg.RectROI if kind == "rectangle" else pg.EllipseROI
-        roi = cls(pos, size, pen=pen, removable=True)
-        roi.aoi_kind = kind
+        roi = pg.RectROI(pos, size, pen=pen, removable=True)
         roi.aoi_name = name
         label = pg.TextItem(name, color=color, anchor=(0, 1))
         label.setParentItem(roi)
@@ -163,18 +162,14 @@ class ScreenView(pg.PlotWidget):
             self.remove_aoi(name)
 
     def aoi_specs(self) -> dict:
-        """AOIs as ``{name: (kind, position, size)}`` in PyGaze's convention
-        (rectangles: top-left corner; ellipses: centre)."""
+        """AOIs as ``{name: (left, top, width, height)}`` in screen pixels."""
         out = {}
         for name, roi in self.aois.items():
             (x, y), (w, h) = roi.pos(), roi.size()
-            if roi.aoi_kind == "rectangle":
-                out[name] = ("rectangle", (float(x), float(y)), (int(w), int(h)))
-            else:  # PyGaze ellipses are centred
-                out[name] = ("ellipse", (float(x + w / 2), float(y + h / 2)), (int(w), int(h)))
+            out[name] = (float(x), float(y), float(w), float(h))
         return out
 
-    def pygaze_aois(self) -> dict:
-        """Convert ROIs into PyGaze AOI objects."""
-        from .. import workflow as W
-        return W.make_aois(self.aoi_specs())
+    def aoi_table(self):
+        """The AOIs as a pymovements AOI table (None without AOIs)."""
+        from .. import gaze as G
+        return G.make_aois(self.aoi_specs())

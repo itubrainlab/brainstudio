@@ -117,7 +117,7 @@ BAR = "# " + "─" * 88
 #: pip name of each library the copied code imports
 PIP = {"mne": "mne", "numpy": "numpy", "pandas": "pandas", "scipy": "scipy",
        "pyxdf": "pyxdf", "mne_bids": "mne-bids", "autoreject": "autoreject",
-       "pygaze": "python-pygaze", "picard": "python-picard"}
+       "pymovements": "pymovements", "polars": "polars", "picard": "python-picard"}
 
 
 def _comment(text: str, width: int = WIDTH) -> list[str]:
@@ -240,15 +240,17 @@ def _describe_loading(recipe: dict) -> str:
     gz = recipe["load"]["gaze"] or {}
     p = gz.get("params")
     if p is not None:
-        parts.append(f"• Gaze events detected from the eye-tracker samples: blinks = runs "
-                     f"of missing samples lasting {p.blink_min_dur * 1000:g} ms – "
-                     f"{p.blink_max_dur:g} s; fixations = samples staying within "
-                     f"{p.fix_max_dist:g} px for at least {p.fix_min_dur * 1000:g} ms; "
-                     f"saccades = gaze velocity above {p.sac_vel_thresh:g} px/s for at "
-                     f"least {p.sac_min_dur * 1000:g} ms.")
+        parts.append(f"• Gaze events detected with pymovements on the screen-pixel gaze: "
+                     f"fixations with I-DT (dispersion ≤ {p.fix_dispersion:g} px for at least "
+                     f"{p.fix_min_dur * 1000:g} ms); saccades with the Engbert & Kliegl "
+                     f"velocity threshold (λ = {p.sac_threshold_factor:g}, at least "
+                     f"{p.sac_min_dur * 1000:g} ms; velocity from Gaze.pos2vel, "
+                     f"'{p.velocity_method}'); blinks from the pupil signal (lost or abruptly "
+                     f"changing, {p.blink_min_dur * 1000:g}–{p.blink_max_dur * 1000:g} ms).")
     if gz.get("aois"):
-        parts.append(f"• Areas of interest ({', '.join(gz['aois'])}): each fixation gets "
-                     "the name of the AOI it falls in (column 'aoi').")
+        parts.append(f"• Areas of interest ({', '.join(gz['aois'])}, rectangles): each "
+                     "fixation gets the name of the AOI it falls in (column 'aoi', "
+                     "pymovements Events.map_to_aois).")
     parts.append("• The event table: one row per marker and gaze event, with its onset "
                  "(s), duration, name, every column the marker carries, and the subject/"
                  "session/run/file of the part it falls in.")
@@ -412,7 +414,7 @@ def _loading_roots(recipe: dict) -> list[str]:
     if gz.get("params") is not None:
         roots += ["gaze.DetectionParams", "gaze.detect_events"]
     if gz.get("aois"):
-        roots += ["workflow.make_aois"]
+        roots += ["gaze.make_aois"]
     return roots + ["events.build_event_table"]
 
 
@@ -510,7 +512,7 @@ def _loading(recipe: dict, code: _Code, version: str) -> list[str]:
               "if rec.has_gaze else None"]
     else:
         L += ["gaze_events = None"]
-    L += [assign(f"aois = {n('workflow.make_aois')}(", gz["aois"], ")") if gz.get("aois")
+    L += [assign(f"aois = {n('gaze.make_aois')}(", gz["aois"], ")") if gz.get("aois")
           else "aois = None",
           f"table = {n('events.build_event_table')}(rec, gaze_events, aois)",
           "print(f'{len(table)} events:', table['name'].value_counts().head(10).to_dict())",
@@ -729,8 +731,7 @@ def build_script(kind: str, recipe: dict, spec, extra=None, version: str = "") -
         body += _indices(*spec, code, version)
     text = "\n".join(body)
     externals = code.externals + (["import autoreject"] if "AutoReject" in text else []) \
-        + (["import picard"] if "method='picard'" in text else []) \
-        + (["import pygaze"] if "make_aois(" in text and "aois = None" not in text else [])
+        + (["import picard"] if "method='picard'" in text else [])
     head = [f'"""{TITLES[kind]} — exported from brAInStudio {version} on '
             f'{_dt.date.today().isoformat()}.',
             "",

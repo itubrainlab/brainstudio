@@ -437,15 +437,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gaze_box = box
         f = QtWidgets.QFormLayout(box)
         p = G.DetectionParams()
-        self.p_fix_dist = _spin(1, 500, p.fix_max_dist, 5, 0, " px")
+        self.p_fix_disp = _spin(1, 500, p.fix_dispersion, 5, 0, " px")
+        self.p_fix_disp.setToolTip("I-DT dispersion threshold (pymovements): (max − min x) + "
+                                   "(max − min y) of a fixation's samples")
         self.p_fix_dur = _spin(0.01, 2, p.fix_min_dur, 0.01, 3, " s")
-        self.p_sac_vel = _spin(10, 1e5, p.sac_vel_thresh, 100, 0, " px/s")
-        self.p_sac_dur = _spin(0.001, 0.5, p.sac_min_dur, 0.005, 3, " s")
+        self.p_sac_lambda = _spin(1, 20, p.sac_threshold_factor, 0.5, 1, " λ")
+        self.p_sac_lambda.setToolTip("Saccades (pymovements, Engbert & Kliegl): velocity above "
+                                     "λ times the median-based velocity spread")
+        self.p_sac_dur = _spin(0.001, 0.5, p.sac_min_dur, 0.002, 3, " s")
         self.p_blink_min = _spin(0.005, 2, p.blink_min_dur, 0.01, 3, " s")
         self.p_blink_max = _spin(0.05, 10, p.blink_max_dur, 0.1, 2, " s")
-        f.addRow("Fixation radius", self.p_fix_dist)
+        f.addRow("Fixation dispersion", self.p_fix_disp)
         f.addRow("Min fixation", self.p_fix_dur)
-        f.addRow("Saccade velocity", self.p_sac_vel)
+        f.addRow("Saccade threshold", self.p_sac_lambda)
         f.addRow("Min saccade", self.p_sac_dur)
         f.addRow("Blink min", self.p_blink_min)
         f.addRow("Blink max", self.p_blink_max)
@@ -538,6 +542,16 @@ class MainWindow(QtWidgets.QMainWindow):
             def on_loaded(rec):
                 self.load_steps = [step]
                 shown(rec)
+        # gaze events are detected in the background too (pymovements takes a while on
+        # long recordings)
+        params, read = self._gaze_params(), load
+
+        def load():
+            rec = read()
+            if rec is not None and rec.has_gaze:
+                rec.gaze_events = G.detect_events(rec.gaze, params)
+                rec.detected_with = params
+            return rec
         if self.worker.busy:
             QtWidgets.QMessageBox.information(self, "Busy", "Wait for the running "
                                               "computation to finish.")
@@ -1118,19 +1132,40 @@ class MainWindow(QtWidgets.QMainWindow):
     def _gaze_params(self):
         return G.DetectionParams(
             blink_min_dur=self.p_blink_min.value(), blink_max_dur=self.p_blink_max.value(),
-            fix_max_dist=self.p_fix_dist.value(), fix_min_dur=self.p_fix_dur.value(),
-            sac_vel_thresh=self.p_sac_vel.value(), sac_min_dur=self.p_sac_dur.value())
+            fix_dispersion=self.p_fix_disp.value(), fix_min_dur=self.p_fix_dur.value(),
+            sac_threshold_factor=self.p_sac_lambda.value(), sac_min_dur=self.p_sac_dur.value())
 
     def detect_gaze_events(self, rebuild: bool = True):
+        """Detect fixations, saccades and blinks (pymovements) in the background; on a
+        fresh recording the events detected while loading are used."""
         if self.rec is None or not self.rec.has_gaze:
             return
-        with self._busy("Detecting fixations, saccades and blinks…"):
-            self._gaze_used = self._gaze_params()
-            self.gaze_events = G.detect_events(self.rec.gaze, self._gaze_used)
-            self.rec.gaze_events = self.gaze_events
-            self.pipeline.set_gaze_events(self.gaze_events)
-            self.pupil_clean = (G.clean_pupil(self.rec.gaze, self.gaze_events.blinks)
-                                if self.cb_pupil_clean.isChecked() else None)
+        rec = self.rec
+        if not rebuild and getattr(rec, "detected_with", None) is not None:
+            self._apply_gaze_events(rec.gaze_events, rec.detected_with, rebuild)
+            return
+        params, gaze = self._gaze_params(), rec.gaze
+        if self.worker.busy:  # e.g. while preprocessing runs: wait for it here
+            with self._busy("Detecting fixations, saccades and blinks…"):
+                ev = G.detect_events(gaze, params)
+            self._apply_gaze_events(ev, params, rebuild)
+            return
+
+        def done(ev):
+            if self.rec is rec and rec.gaze is gaze:  # still the same data
+                self._apply_gaze_events(ev, params, rebuild)
+
+        self.worker.run("Detecting fixations, saccades and blinks (pymovements)…",
+                        lambda: G.detect_events(gaze, params), done)
+
+    def _apply_gaze_events(self, ev, params, rebuild: bool = True):
+        self._gaze_used = params
+        self.gaze_events = ev
+        self.rec.gaze_events = ev
+        self.rec.detected_with = None
+        self.pipeline.set_gaze_events(ev)
+        self.pupil_clean = (G.clean_pupil(self.rec.gaze, ev.blinks)
+                            if self.cb_pupil_clean.isChecked() else None)
         self.gaze_plot.set_gaze(self.rec.gaze, self.pupil_clean)
         self.eeg_plot.gaze_events = self.gaze_events
         self.gaze_plot.gaze_events = self.gaze_events
@@ -1146,7 +1181,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ================================================================== events / montage
     def _rebuild_event_table(self):
         self._aois_used = self.screen.aoi_specs()
-        aois = W.make_aois(self._aois_used) if self._aois_used else None
+        aois = G.make_aois(self._aois_used)
         self.event_df = EV.build_event_table(self.rec, self.gaze_events, aois)
         self.pipeline.set_event_table(self.event_df)
         self._fill_event_list()

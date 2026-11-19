@@ -66,7 +66,7 @@ def main() -> int:
         "--specpath", str(BUILD),
         # MNE loads its submodules lazily from .pyi stubs and ships data files
         "--collect-all", "mne", "--collect-all", "mne_bids",
-        "--collect-all", "pyqtgraph", "--collect-all", "pygaze",
+        "--collect-all", "pyqtgraph", "--collect-all", "pymovements",
         "--collect-all", "brainstudio", "--collect-all", "picard",
         # ICLabel's network (ONNX) and AutoReject
         "--collect-all", "mne_icalabel", "--collect-all", "onnxruntime",

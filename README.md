@@ -10,8 +10,8 @@ and cognitive-state indices, compared between groups of events.
 
 - [MNE-Python](https://mne.tools) and [MNE-BIDS](https://mne.tools/mne-bids) do the EEG
   work: reading, filtering, ICA, epochs, evokeds, spectra and statistics.
-- [PyGaze](https://www.pygaze.org) provides the areas of interest (AOIs). brAInStudio
-  reimplements the PyGazeAnalyser event detectors.
+- [pymovements](https://pymovements.readthedocs.io) does the eye-tracking work: fixation,
+  saccade and blink detection, event properties and areas of interest (AOIs).
 - The interface is PySide6 and pyqtgraph, in the dark style of the ITU brAIn lab's
   other apps.
 
@@ -499,10 +499,28 @@ repeats the analysis from the data files onwards. It needs only the standard lib
 
 - Fixation, saccade and blink summary.
 - Fixation-duration and saccade-amplitude histograms, and the main sequence.
-- Per-AOI fixation count, dwell time and time to first fixation, computed with
-  `pygaze.plugins.aoi.AOI` (CSV export).
-- AOIs are drawn in the Data tab's screen view, and fixations get an `aoi` column for
-  event filters.
+- Per-AOI fixation count, dwell time and time to first fixation (CSV export). Fixations
+  are mapped to the AOIs with pymovements (`Events.map_to_aois`).
+- AOIs are rectangles drawn in the Data tab's screen view, and fixations get an `aoi`
+  column for event filters.
+
+**Gaze event detection** (Controls panel), with
+[pymovements](https://pymovements.readthedocs.io) on the screen-pixel gaze:
+
+- **Fixations**: I-DT (`pm.events.idt`): samples whose dispersion, (max − min x) +
+  (max − min y), stays within the threshold (40 px, about 1° at a typical set-up) for at
+  least the minimum duration (100 ms). The fixation's location is the mean position.
+- **Saccades**: the Engbert & Kliegl algorithm (`pm.events.microsaccades`, which finds
+  saccades of any size): velocity (`Gaze.pos2vel`, Savitzky-Golay) above λ = 6 times
+  its median-based spread, for at least 6 ms. Amplitude (px) and peak velocity (px/s)
+  come from `Gaze.compute_event_properties`.
+- **Blinks**: `pm.events.blink` on the pupil signal: samples where the pupil is lost or
+  changes abruptly, 50–500 ms. Without a pupil channel, the samples where tracking is
+  lost are used.
+- pymovements gets the sample number as its time axis (durations are converted to
+  samples), so any sampling rate works, even an irregular one; onsets are the exact
+  sample times. Detection runs in the background; long recordings take a while (about
+  18 s for 47 min at 150 Hz).
 
 ## Events, groups and filters
 
@@ -629,7 +647,7 @@ src/brainstudio/
     multi.py         several files as one; BIDS entities from file names
     bids.py          BIDS EEG + eye tracking (MNE-BIDS)
     xdf_writer.py    minimal XDF writer (demo data, tests)
-  gaze.py            blink / fixation / saccade detection, AOIs (PyGaze), heatmaps
+  gaze.py            fixation / saccade / blink detection and AOIs (pymovements), heatmaps
   events.py          unified event table, phases, filters
   eeg.py             filtering, references, montages and layouts, epochs, trigger codes,
                      ERP components, cluster tests
@@ -708,14 +726,11 @@ system you are on.
   and the cognitive indices still treat epochs as observations (normalised per
   subject): for group statistics on those, export the per-epoch values and model
   subjects outside brAInStudio.
-- **Gaze algorithms**: the PyPI release of PyGaze has the AOI plugin, but not the
-  offline detectors from PyGaze Analyser. brAInStudio reimplements those:
-  - blinks: runs of missing samples;
-  - fixations: dispersion-based;
-  - saccades: a velocity threshold.
-
-  Thresholds are in pixels. Trackers that export a fixation-filtered point of gaze
-  (e.g. Gazepoint `FPOG*`) give step-like traces, so saccade counts come out low.
+- **Gaze thresholds are in pixels**: without the screen's physical size and viewing
+  distance, pymovements cannot convert to degrees. Trackers that export a
+  fixation-filtered point of gaze (e.g. Gazepoint `FPOG*`) give step-like traces, which
+  changes what the detectors find.
+- **AOIs are rectangles** (what pymovements maps fixations to).
 - **ICA and blinks** depend on blinks being visible in the EEG. When no component is
   blink-locked, none is suggested, and removing nothing is the right call.
 - Component presets are conventional windows; choose the window before looking at the
@@ -724,7 +739,9 @@ system you are on.
 ## Acknowledgements
 
 - [MNE-Python](https://mne.tools), [MNE-BIDS](https://mne.tools/mne-bids),
-  [pyxdf](https://github.com/xdf-modules/pyxdf), [PyGaze](https://www.pygaze.org) and
+  [pyxdf](https://github.com/xdf-modules/pyxdf),
+  [pymovements](https://pymovements.readthedocs.io), [AutoReject](https://autoreject.github.io),
+  [MNE-ICALabel](https://mne.tools/mne-icalabel) and
   [python-picard](https://pierreablin.github.io/picard/).
 - The ERP component analysis follows the lab's Rhino ERP.
 - The look follows brAInStream. The style sheet and icons are brAInStudio's own; the app

@@ -46,17 +46,17 @@ def test_fixation_detection_matches_truth():
     sim = simulate(duration=60, seed=3)
     from brainstudio.model import GazeData
     g = GazeData(sim.gaze_t, sim.gx, sim.gy, sim.pupil)
-    fix = G.detect_fixations(g)
+    fix = G.detect_events(g).fixations
     err = np.abs(fix.onset.to_numpy()[:, None] - sim.fix_onsets[None]).min(1)
     assert np.median(err) < 0.03
     assert 0.8 < len(fix) / len(sim.fix_onsets) < 1.4
 
 
-def test_aoi_stats_use_pygaze():
+def test_aoi_stats_use_pymovements():
     import pandas as pd
     fix = pd.DataFrame({"onset": [0, 1], "offset": [.2, 1.3], "duration": [.2, .3],
                         "x": [100, 900], "y": [100, 500]})
-    st = G.aoi_statistics(fix, {"a": G.make_aoi("rectangle", (50, 50), (100, 100))})
+    st = G.aoi_statistics(fix, G.make_aois({"a": (50, 50, 100, 100)}))
     assert st.n_fixations.iloc[0] == 1 and st.dwell_time.iloc[0] == pytest.approx(.2)
 
 

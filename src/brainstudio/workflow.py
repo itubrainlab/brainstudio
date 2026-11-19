@@ -62,11 +62,6 @@ def replace_trigger_events(rec, ev: pd.DataFrame | None) -> None:
     rec.events = pd.concat(parts, ignore_index=True).sort_values("onset", ignore_index=True)
 
 
-def make_aois(specs: dict | None) -> dict:
-    """PyGaze AOIs from ``{name: (kind, position, size)}`` (ellipses: centre)."""
-    return {n: G.make_aoi(k, tuple(pos), tuple(size)) for n, (k, pos, size) in
-            (specs or {}).items()}
-
 
 # =========================================================================== epoching
 @dataclass

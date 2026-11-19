@@ -1,141 +1,116 @@
-"""Gaze analysis: blink / fixation / saccade detection, AOIs and heatmaps.
+"""Gaze analysis with pymovements: event detection, AOIs, heatmaps and statistics.
 
-The detectors follow the algorithms of PyGaze's companion analysis toolbox
-(PyGazeAnalyser, E. S. Dalmaijer): blinks are runs of missing samples,
-fixations are dispersion-based (samples stay within ``maxdist`` of the
-fixation start for at least ``mindur``), saccades are velocity-based.
-They are reimplemented here vectorised and on NaN-coded data so they run
-on long, high-rate recordings. Areas of interest use ``pygaze.plugins.aoi.AOI``.
+Fixations, saccades and blinks are detected with `pymovements
+<https://pymovements.readthedocs.io>`_ on the screen-pixel gaze:
+
+* fixations: I-DT (dispersion threshold, ``pm.events.idt``);
+* saccades: the Engbert & Kliegl velocity-threshold algorithm
+  (``pm.events.microsaccades``, which detects saccades of any size);
+* blinks: ``pm.events.blink`` on the pupil signal (or, without a pupil channel, on the
+  samples where tracking is lost).
+
+Velocities come from ``Gaze.pos2vel`` and the fixation location and saccade amplitude /
+peak velocity from ``Gaze.compute_event_properties``. Areas of interest are rectangles
+mapped with ``Events.map_to_aois`` (a ``pm.stimulus.TextStimulus`` table).
+pymovements gets the sample number as its time axis, so durations are given in samples:
+that handles any sampling rate, even an irregular one (its I-DT needs a constant interval
+between timesteps). Velocities use the sampling rate (px/s), and event onsets and
+offsets are mapped back to the exact sample times.
 """
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+import polars as pl
+import pymovements as pm
 from scipy.ndimage import gaussian_filter
 
 from .model import GazeData, GazeEvents
 
-try:  # PyGaze imports distutils at package import; keep it optional.
-    from pygaze.plugins.aoi import AOI
-except Exception:  # pragma: no cover - fallback when pygaze is unavailable
-    AOI = None
-
 
 @dataclass
 class DetectionParams:
-    blink_min_dur: float = 0.05  # s, shorter gaps are treated as dropouts
-    blink_max_dur: float = 1.0  # s, longer gaps are tracking loss, not blinks
-    fix_max_dist: float = 35.0  # px, dispersion radius from fixation start
-    fix_min_dur: float = 0.06  # s
-    sac_vel_thresh: float = 1500.0  # px/s
-    sac_min_dur: float = 0.01  # s
-    smooth_window: float = 0.02  # s, velocity smoothing window
+    """pymovements event detection on screen pixels (defaults: pymovements' own, with
+    about 40 px for its 1° dispersion threshold)."""
+    fix_dispersion: float = 40.0        # px, I-DT: (max − min x) + (max − min y)
+    fix_min_dur: float = 0.1            # s
+    sac_threshold_factor: float = 6.0   # λ: multiples of the median-based velocity SD
+    sac_min_dur: float = 0.006          # s
+    blink_min_dur: float = 0.05         # s
+    blink_max_dur: float = 0.5          # s
+    velocity_method: str = "smooth"     # Gaze.pos2vel: smooth (Savitzky-Golay),
+    #                                     neighbors or preceding
 
 
-def _runs(mask: np.ndarray) -> np.ndarray:
-    """Return (start, stop) index pairs (stop exclusive) of True runs."""
-    if not len(mask):
-        return np.empty((0, 2), int)
-    m = np.concatenate([[False], mask.astype(bool), [False]])
-    d = np.diff(m.astype(np.int8))
-    return np.column_stack([np.flatnonzero(d == 1), np.flatnonzero(d == -1)])
+def sampling_rate(g: GazeData) -> float:
+    return float(g.sfreq or 1.0 / float(np.median(np.diff(g.times))))
 
 
-def _sample_dt(g: GazeData) -> float:
-    return 1.0 / g.sfreq if g.sfreq else float(np.median(np.diff(g.times)))
+def to_pymovements(g: GazeData, p: DetectionParams = DetectionParams()) -> pm.Gaze:
+    """The gaze as a pymovements ``Gaze``: the sample number as time axis, pixel =
+    position (so distances are in px and velocities in px/s), the pupil (or a validity
+    stand-in) and the velocity."""
+    xy = np.vstack([g.x, g.y])
+    gz = pm.gaze.from_numpy(time=np.arange(len(g.times), dtype=np.int64), time_unit="ms",
+                            pixel=xy, position=xy,
+                            experiment=pm.Experiment(sampling_rate=sampling_rate(g)))
+    pupil = g.pupil if g.pupil is not None else \
+        np.where(np.isfinite(g.x) & np.isfinite(g.y), 1.0, np.nan)  # NaN = tracking lost
+    gz.samples = gz.samples.with_columns(pl.Series("pupil", np.asarray(pupil, float)))
+    gz.pos2vel(method=p.velocity_method)
+    return gz
 
 
-def detect_blinks(g: GazeData, p: DetectionParams = DetectionParams()) -> pd.DataFrame:
-    dt = _sample_dt(g)
-    missing = ~(np.isfinite(g.x) & np.isfinite(g.y))
-    rows = []
-    for a, b in _runs(missing):
-        onset, offset = g.times[a], g.times[b - 1] + dt
-        dur = offset - onset
-        if p.blink_min_dur <= dur <= p.blink_max_dur:
-            rows.append((onset, offset, dur))
-    return pd.DataFrame(rows, columns=["onset", "offset", "duration"])
-
-
-def detect_fixations(g: GazeData, p: DetectionParams = DetectionParams()) -> pd.DataFrame:
-    """Dispersion-based fixation detection (PyGazeAnalyser algorithm)."""
-    x, y, t = g.x, g.y, g.times
-    n = len(t)
-    dt = _sample_dt(g)
-    chunk = max(int(5.0 / dt), 16)  # look ahead at most 5 s per fixation
-    rows = []
-    i = 0
-    valid = np.isfinite(x) & np.isfinite(y)
-    while i < n:
-        if not valid[i]:
-            i += 1
-            continue
-        # Grow the look-ahead window geometrically: most candidates (saccade
-        # samples) end within a few samples, so this keeps the loop cheap.
-        look = 16
-        while True:
-            stop = min(n, i + 1 + look)
-            d2 = (x[i + 1:stop] - x[i]) ** 2 + (y[i + 1:stop] - y[i]) ** 2
-            out = ~(d2 <= p.fix_max_dist ** 2)  # NaN (missing) also ends it
-            if out.any() or stop == n or look >= chunk:
-                break
-            look *= 2
-        j = i + 1 + (int(np.argmax(out)) if out.any() else len(d2))
-        onset, offset = t[i], t[j - 1] + dt
-        if offset - onset >= p.fix_min_dur:
-            rows.append((onset, offset, offset - onset,
-                         float(np.nanmean(x[i:j])), float(np.nanmean(y[i:j]))))
-            i = j
-        else:
-            i += 1
-    return pd.DataFrame(rows, columns=["onset", "offset", "duration", "x", "y"])
-
-
-def gaze_velocity(g: GazeData, p: DetectionParams = DetectionParams()) -> np.ndarray:
-    """Smoothed 2D gaze speed in px/s (NaN where data is missing)."""
-    dt = _sample_dt(g)
-    w = max(int(round(p.smooth_window / dt)), 1)
-    vx = np.gradient(g.x, g.times) if len(g.times) > 1 else np.zeros_like(g.x)
-    vy = np.gradient(g.y, g.times) if len(g.times) > 1 else np.zeros_like(g.y)
-    v = np.hypot(vx, vy)
-    if w > 1:
-        kernel = np.ones(w) / w
-        finite = np.isfinite(v)
-        num = np.convolve(np.where(finite, v, 0.0), kernel, "same")
-        den = np.convolve(finite.astype(float), kernel, "same")
-        with np.errstate(invalid="ignore", divide="ignore"):
-            v = np.where(finite, num / den, np.nan)
-    return v
-
-
-def detect_saccades(g: GazeData, p: DetectionParams = DetectionParams(),
-                    velocity: np.ndarray | None = None) -> pd.DataFrame:
-    v = gaze_velocity(g, p) if velocity is None else velocity
-    dt = _sample_dt(g)
-    rows = []
-    for a, b in _runs(np.nan_to_num(v, nan=0.0) > p.sac_vel_thresh):
-        onset, offset = g.times[a], g.times[b - 1] + dt
-        if offset - onset < p.sac_min_dur:
-            continue
-        a0, b1 = max(a - 1, 0), min(b, len(v) - 1)
-        x0, y0, x1, y1 = g.x[a0], g.y[a0], g.x[b1], g.y[b1]
-        if not np.isfinite([x0, y0, x1, y1]).all():
-            continue  # saccade-like transient around missing data (blink edge)
-        rows.append((onset, offset, offset - onset, x0, y0, x1, y1,
-                     float(np.hypot(x1 - x0, y1 - y0)), float(np.nanmax(v[a:b]))))
-    return pd.DataFrame(rows, columns=["onset", "offset", "duration", "x0", "y0",
-                                       "x1", "y1", "amplitude", "peak_velocity"])
+def _times(g: GazeData, at) -> np.ndarray:
+    """Sample times (s) of pymovements timestamps (sample numbers)."""
+    return g.times[np.clip(np.asarray(at, np.int64), 0, len(g.times) - 1)]
 
 
 def detect_events(g: GazeData, p: DetectionParams = DetectionParams()) -> GazeEvents:
-    return GazeEvents(
-        fixations=detect_fixations(g, p),
-        saccades=detect_saccades(g, p),
-        blinks=detect_blinks(g, p),
-    )
+    """Fixations (onset, offset, duration, x, y), saccades (… amplitude px, peak_velocity
+    px/s) and blinks (onset, offset, duration), in seconds, detected with pymovements."""
+    sf = sampling_rate(g)
+    n = lambda s, least=1: max(int(round(s * sf)), least)  # noqa: E731  seconds → samples
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # "no events were detected" and the like
+        gz = to_pymovements(g, p)
+        gz.detect("idt", dispersion_threshold=p.fix_dispersion,
+                  minimum_duration=n(p.fix_min_dur, 2))
+        gz.detect("microsaccades", threshold_factor=p.sac_threshold_factor,
+                  minimum_duration=n(p.sac_min_dur), name="saccade")
+        gz.detect("blink", minimum_duration=n(p.blink_min_dur),
+                  maximum_duration=n(p.blink_max_dur), minimum_gap=n(0.005))
+        names = set(gz.events.frame["name"].to_list())
+        if "fixation" in names:
+            gz.compute_event_properties("location", name="fixation")
+        if "saccade" in names:
+            gz.compute_event_properties(["amplitude", "peak_velocity"], name="saccade")
+    ev = gz.events.frame
+
+    def table(name, extra=()):
+        e = ev.filter(pl.col("name") == name)
+        on = _times(g, e["onset"].to_numpy()) if len(e) else np.empty(0)
+        off = _times(g, e["offset"].to_numpy()) if len(e) else np.empty(0)
+        df = pd.DataFrame({"onset": on, "offset": off, "duration": off - on})
+        for col in extra:
+            df[col] = e[col].to_numpy().astype(float) if len(e) else np.empty(0)
+        return df
+
+    fix = table("fixation")
+    loc = ev.filter(pl.col("name") == "fixation")
+    xy = np.array(loc["location"].to_list(), float).reshape(-1, 2) if len(loc) and \
+        "location" in loc.columns else np.empty((0, 2))
+    fix["x"], fix["y"] = xy[:, 0], xy[:, 1]
+    sac = table("saccade", [c for c in ("amplitude", "peak_velocity")
+                            if c in ev.columns])
+    for c in ("amplitude", "peak_velocity"):
+        if c not in sac:
+            sac[c] = np.nan
+    return GazeEvents(fixations=fix, saccades=sac, blinks=table("blink"))
 
 
 def clean_pupil(g: GazeData, blinks: pd.DataFrame, pad: float = 0.05) -> np.ndarray | None:
@@ -166,27 +141,48 @@ def heatmap(fixations: pd.DataFrame, screen_size: tuple[int, int], sigma: float 
     return hm
 
 
-def make_aoi(kind: str, pos: tuple[float, float], size) -> object:
-    """Create a PyGaze AOI ('rectangle', 'circle' or 'ellipse').
+def make_aois(specs: dict | None) -> pm.stimulus.TextStimulus | None:
+    """Rectangular areas of interest ``{name: (left, top, width, height)}`` (px) as a
+    pymovements AOI table."""
+    if not specs:
+        return None
+    names = list(specs)
+    box = np.array([specs[n] for n in names], float).reshape(-1, 4)
+    return pm.stimulus.TextStimulus(
+        pl.DataFrame({"aoi": names, "x": box[:, 0], "y": box[:, 1], "width": box[:, 2],
+                      "height": box[:, 3]}),
+        aoi_column="aoi", start_x_column="x", start_y_column="y", width_column="width",
+        height_column="height")
 
-    For rectangles ``pos`` is the top-left corner; for circles/ellipses the
-    centre (PyGaze convention).
-    """
-    if AOI is None:
-        raise RuntimeError("PyGaze is not available")
-    return AOI(kind, tuple(pos), size if isinstance(size, (int, float)) else list(size))
+
+def fixation_aois(fixations: pd.DataFrame, aois: pm.stimulus.TextStimulus | None
+                  ) -> np.ndarray:
+    """The AOI each fixation falls in ("" for none), with ``Events.map_to_aois``."""
+    out = np.full(len(fixations), "", dtype=object)
+    if aois is None or not len(fixations):
+        return out
+    ev = pm.Events(pl.DataFrame({
+        "name": ["fixation"] * len(fixations),
+        "onset": np.arange(len(fixations)), "offset": np.arange(len(fixations)) + 1,
+        "location": fixations[["x", "y"]].to_numpy(float).tolist()}))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # fixations without a location
+        ev.map_to_aois(aois, verbose=False)
+    hit = ev.frame["aoi"].to_list()
+    out[:] = ["" if h is None else str(h) for h in hit]
+    return out
 
 
-def aoi_statistics(fixations: pd.DataFrame, aois: dict[str, object]) -> pd.DataFrame:
+def aoi_statistics(fixations: pd.DataFrame, aois: pm.stimulus.TextStimulus | None
+                   ) -> pd.DataFrame:
     """Per-AOI fixation count, dwell time and time to first fixation."""
+    names = fixation_aois(fixations, aois)
     rows = []
-    for name, aoi in aois.items():
-        hits = np.array([bool(aoi.contains((fx, fy)))
-                         for fx, fy in fixations[["x", "y"]].to_numpy()], dtype=bool)
-        sel = fixations[hits] if len(fixations) else fixations
+    for name in (aois.aois["aoi"].to_list() if aois is not None else []):
+        sel = fixations[names == name]
         rows.append({
             "aoi": name,
-            "n_fixations": int(hits.sum()),
+            "n_fixations": int(len(sel)),
             "dwell_time": float(sel["duration"].sum()) if len(sel) else 0.0,
             "first_fixation": float(sel["onset"].min()) if len(sel) else np.nan,
             "mean_fix_dur": float(sel["duration"].mean()) if len(sel) else np.nan,

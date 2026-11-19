@@ -1,4 +1,4 @@
-"""Gaze tab: oculomotor statistics, histograms and PyGaze AOIs."""
+"""Gaze tab: oculomotor statistics, histograms and AOIs (pymovements)."""
 
 from __future__ import annotations
 
@@ -26,13 +26,12 @@ class GazeTab(QtWidgets.QWidget):
         self.summary_table = QtWidgets.QTableWidget()
         bl.addWidget(self.summary_table)
         top.addWidget(box, 1)
-        box2 = QtWidgets.QGroupBox("Areas of interest (PyGaze AOI)")
+        box2 = QtWidgets.QGroupBox("Areas of interest (pymovements)")
         b2 = QtWidgets.QVBoxLayout(box2)
         row = QtWidgets.QHBoxLayout()
-        for label, kind in (("+ Rectangle", "rectangle"), ("+ Ellipse", "ellipse")):
-            b = QtWidgets.QPushButton(label)
-            b.clicked.connect(lambda _=False, k=kind: self.state.screen.add_aoi(k))
-            row.addWidget(b)
+        b = QtWidgets.QPushButton("+ Rectangle")
+        b.clicked.connect(lambda: self.state.screen.add_aoi())
+        row.addWidget(b)
         clr = QtWidgets.QPushButton("Clear")
         clr.clicked.connect(lambda: self.state.screen.clear_aois())
         row.addWidget(clr)
@@ -90,8 +89,8 @@ class GazeTab(QtWidgets.QWidget):
 
     def update_aoi_stats(self):
         ev = self.state.gaze_events
-        aois = self.state.screen.pygaze_aois() if self.state.screen.aois else {}
-        if ev is None or not aois:
+        aois = self.state.screen.aoi_table()
+        if ev is None or aois is None:
             self.aoi_table.clear()
             self.aoi_table.setRowCount(0)
             self._aoi_df = None
