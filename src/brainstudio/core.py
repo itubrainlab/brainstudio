@@ -262,6 +262,15 @@ def gaze_columns(labels: list[str], n_cols: int | None = None) -> dict[str, list
     return {"x": ix, "y": iy, "pupil": ip, "valid": iv[:1]}
 
 
+def numeric_samples(series, idx) -> np.ndarray:
+    """Rows idx of a stream's samples as floats; text that is not a number (a string-format
+    stream's empty USER field, say) becomes NaN."""
+    a = np.asarray(series)[idx]
+    if a.dtype.kind in "biuf":
+        return a.astype(float)
+    return pd.DataFrame(a).apply(pd.to_numeric, errors="coerce").to_numpy(float)
+
+
 def gaze_table(times, data, labels, screen=(1920, 1080), label="gaze", sfreq=None,
                mapping=None) -> pd.DataFrame:
     """Gaze samples as a table in screen pixels: x/y averaged over eyes, lost samples
@@ -452,7 +461,7 @@ def read_xdf(path, screen=(1920, 1080), roles=None, options=None):
         mapping = {r: [k for k, c in enumerate(cols) if c == r]
                    for r in ("x", "y", "pupil", "valid")} if cols else None
         gaze = gaze_table(ts + shift.get(id(gz), 0.0) - t0,
-                          np.asarray(gz["time_series"], float)[idx], labels, screen,
+                          numeric_samples(gz["time_series"], idx), labels, screen,
                           stream_field(gz, "name") or "gaze", inf.get("srate"), mapping)
     frames, marker_meta = [], {}
     for s in by_role["markers"]:

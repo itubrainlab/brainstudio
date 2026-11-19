@@ -198,8 +198,9 @@ def _xdf_reader(streams: list[dict], screen) -> tuple[list[str], dict]:
         gaze_cols = pick
         L += [f"    g = streams[{gz['name']!r}]",
               "    ts, own = lsl_time(g)",
-              "    s = pd.DataFrame(np.asarray(g['time_series'], float)[own], "
-              f"columns={labels!r})",
+              "    # string-format streams carry text (e.g. an empty USER field): non-numbers → NaN",
+              "    s = pd.DataFrame(np.asarray(g['time_series'])[own], "
+              f"columns={labels!r}).apply(pd.to_numeric, errors='coerce')",
               "    lost = (s[" + repr(pick["x"][0]) + "] == 0) & (s[" + repr(pick["y"][0]) + "] == 0)"]
         if pick["valid"]:
             L += [f"    lost |= s[{pick['valid'][0]!r}] != 1"]
