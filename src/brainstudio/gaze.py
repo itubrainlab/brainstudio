@@ -46,6 +46,38 @@ class DetectionParams:
     #                                     neighbors or preceding
 
 
+#: detection settings for common kinds of gaze data: (label, parameters, explanation)
+PRESETS = {
+    "standard": (
+        "pymovements defaults (raw gaze)",
+        DetectionParams(),
+        "pymovements' own settings, with about 40 px for its 1° dispersion: for raw, "
+        "unfiltered gaze (e.g. Gazepoint BPOG, EyeLink, Tobii)."),
+    "gazepoint_fpog": (
+        "Gazepoint, fixation-filtered gaze (FPOG)",
+        DetectionParams(fix_dispersion=100.0, fix_min_dur=0.06, sac_threshold_factor=6.0,
+                        sac_min_dur=0.006, blink_min_dur=0.05, blink_max_dur=0.5,
+                        velocity_method="neighbors"),
+        "For Gazepoint GP3 / GP3 HD data recorded with only the fixation point of gaze "
+        "(FPOG), which wanders within a fixation: a 100 px dispersion and 60 ms minimum "
+        "match the tracker's own fixations (FPOGID); saccades use central-difference "
+        "velocity, as smoothing blurs them at 150 Hz. Saccade timing is usable, but "
+        "amplitude and peak velocity are not (FPOG is a running average)."),
+}
+
+
+def suggest_preset(g: GazeData | None) -> str:
+    """The preset that fits the data: Gazepoint gaze with FPOG but no BPOG channels is
+    fixation-filtered; anything else is treated as raw gaze."""
+    keys = {k.lower() for k in (g.extra if g is not None else {})}
+    return "gazepoint_fpog" if "fpogx" in keys and "bpogx" not in keys else "standard"
+
+
+def preset_name(p: DetectionParams) -> str | None:
+    """The key of the preset ``p`` equals (None for custom settings)."""
+    return next((k for k, (_, q, _) in PRESETS.items() if q == p), None)
+
+
 def sampling_rate(g: GazeData) -> float:
     return float(g.sfreq or 1.0 / float(np.median(np.diff(g.times))))
 

@@ -816,3 +816,15 @@ def test_text_files_are_read_and_written_as_utf8():
             if re.search(r"\.(read_text|write_text)\(", line) and "encoding=" not in line:
                 bad.append(f"{f.relative_to(root)}:{i}")
     assert not bad, bad
+
+
+def test_gaze_preset_follows_the_data():
+    """Gazepoint gaze with only the fixation-filtered POG gets the Gazepoint preset."""
+    from brainstudio.model import GazeData
+    t = np.arange(100) / 150.0
+    fpog = GazeData(t, np.zeros(100), np.zeros(100), extra={"fpogx": t, "fpogy": t})
+    best = GazeData(t, np.zeros(100), np.zeros(100), extra={"fpogx": t, "bpogx": t})
+    assert G.suggest_preset(fpog) == "gazepoint_fpog"
+    assert G.suggest_preset(best) == "standard"
+    assert G.preset_name(G.PRESETS["gazepoint_fpog"][1]) == "gazepoint_fpog"
+    assert G.preset_name(G.DetectionParams(fix_dispersion=55.0)) is None

@@ -437,6 +437,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gaze_box = box
         f = QtWidgets.QFormLayout(box)
         p = G.DetectionParams()
+        # presets: "Automatic" picks one from the data at load (Gazepoint FPOG vs raw)
+        self.p_preset = QtWidgets.QComboBox()
+        self.p_preset.addItem("Automatic (from the data)", "auto")
+        for key, (label, _, why) in G.PRESETS.items():
+            self.p_preset.addItem(label, key)
+            self.p_preset.setItemData(self.p_preset.count() - 1, why, QtCore.Qt.ToolTipRole)
+        self.p_preset.addItem("Custom", "custom")
+        self.p_preset.setToolTip("Detection settings for the kind of gaze data. Automatic: "
+                                 "Gazepoint data with only the fixation-filtered gaze "
+                                 "(FPOG) gets the Gazepoint preset, other data the "
+                                 "pymovements defaults. Editing a value makes it Custom.")
+        self.p_preset_note = QtWidgets.QLabel("")
+        self.p_preset_note.setWordWrap(True)
+        self.p_preset_note.setEnabled(False)
         self.p_fix_disp = _spin(1, 500, p.fix_dispersion, 5, 0, " px")
         self.p_fix_disp.setToolTip("I-DT dispersion threshold (pymovements): (max − min x) + "
                                    "(max − min y) of a fixation's samples")
@@ -447,12 +461,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.p_sac_dur = _spin(0.001, 0.5, p.sac_min_dur, 0.002, 3, " s")
         self.p_blink_min = _spin(0.005, 2, p.blink_min_dur, 0.01, 3, " s")
         self.p_blink_max = _spin(0.05, 10, p.blink_max_dur, 0.1, 2, " s")
+        self.p_velocity = QtWidgets.QComboBox()
+        for key, label in (("smooth", "Savitzky-Golay (smooth)"),
+                           ("neighbors", "central difference"),
+                           ("preceding", "preceding sample")):
+            self.p_velocity.addItem(label, key)
+        self.p_velocity.setToolTip("How pymovements computes gaze velocity (Gaze.pos2vel) for "
+                                   "saccade detection")
+        f.addRow("Preset", self.p_preset)
+        f.addRow(self.p_preset_note)
         f.addRow("Fixation dispersion", self.p_fix_disp)
         f.addRow("Min fixation", self.p_fix_dur)
         f.addRow("Saccade threshold", self.p_sac_lambda)
         f.addRow("Min saccade", self.p_sac_dur)
+        f.addRow("Saccade velocity", self.p_velocity)
         f.addRow("Blink min", self.p_blink_min)
         f.addRow("Blink max", self.p_blink_max)
+        self.p_preset.activated.connect(lambda _: self._preset_chosen())
+        for spin in (self.p_fix_disp, self.p_fix_dur, self.p_sac_lambda, self.p_sac_dur,
+                     self.p_blink_min, self.p_blink_max):
+            spin.valueChanged.connect(lambda *_: self._params_edited())
+        self.p_velocity.currentIndexChanged.connect(lambda *_: self._params_edited())
         self.cb_pupil_clean = QtWidgets.QCheckBox("Interpolate pupil over blinks")
         self.cb_pupil_clean.setChecked(True)
         f.addRow(self.cb_pupil_clean)
@@ -544,11 +573,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 shown(rec)
         # gaze events are detected in the background too (pymovements takes a while on
         # long recordings)
-        params, read = self._gaze_params(), load
+        auto, fixed, read = self.p_preset.currentData() == "auto", self._gaze_params(), load
 
         def load():
             rec = read()
             if rec is not None and rec.has_gaze:
+                params = G.PRESETS[G.suggest_preset(rec.gaze)][1] if auto else fixed
                 rec.gaze_events = G.detect_events(rec.gaze, params)
                 rec.detected_with = params
             return rec
@@ -1129,11 +1159,53 @@ class MainWindow(QtWidgets.QMainWindow):
                  scalings=dict(eeg=self.eeg_scale.value() * 1e-6,
                                eog=self.eeg_scale.value() * 4e-6))
 
-    def _gaze_params(self):
+    def _gaze_params(self, gaze=None):
+        """The detection settings: the preset's, chosen from ``gaze`` when Automatic,
+        else the values in the Controls panel."""
+        key = self.p_preset.currentData()
+        if key == "auto":
+            return G.PRESETS[G.suggest_preset(gaze if gaze is not None else
+                                              (self.rec.gaze if self.rec else None))][1]
+        if key in G.PRESETS:
+            return G.PRESETS[key][1]
         return G.DetectionParams(
             blink_min_dur=self.p_blink_min.value(), blink_max_dur=self.p_blink_max.value(),
             fix_dispersion=self.p_fix_disp.value(), fix_min_dur=self.p_fix_dur.value(),
-            sac_threshold_factor=self.p_sac_lambda.value(), sac_min_dur=self.p_sac_dur.value())
+            sac_threshold_factor=self.p_sac_lambda.value(), sac_min_dur=self.p_sac_dur.value(),
+            velocity_method=self.p_velocity.currentData())
+
+    def _show_params(self, p):
+        """Show ``p`` in the controls without making the preset Custom."""
+        self._showing_params = True
+        try:
+            self.p_fix_disp.setValue(p.fix_dispersion)
+            self.p_fix_dur.setValue(p.fix_min_dur)
+            self.p_sac_lambda.setValue(p.sac_threshold_factor)
+            self.p_sac_dur.setValue(p.sac_min_dur)
+            self.p_blink_min.setValue(p.blink_min_dur)
+            self.p_blink_max.setValue(p.blink_max_dur)
+            self.p_velocity.setCurrentIndex(max(self.p_velocity.findData(p.velocity_method), 0))
+        finally:
+            self._showing_params = False
+        key = G.preset_name(p)
+        auto = self.p_preset.currentData() == "auto"
+        self.p_preset_note.setText(f"→ {G.PRESETS[key][0]}" if auto and key else "")
+        self.p_preset_note.setToolTip(G.PRESETS[key][2] if key else "")
+        self.p_preset.setToolTip(G.PRESETS[key][2] if key else
+                                 "Detection settings for the kind of gaze data.")
+
+    def _preset_chosen(self):
+        key = self.p_preset.currentData()
+        if key == "custom":
+            self.p_preset_note.setText("")
+            return
+        self._show_params(self._gaze_params())
+
+    def _params_edited(self):
+        if getattr(self, "_showing_params", False):
+            return
+        self.p_preset.setCurrentIndex(self.p_preset.findData("custom"))
+        self.p_preset_note.setText("")
 
     def detect_gaze_events(self, rebuild: bool = True):
         """Detect fixations, saccades and blinks (pymovements) in the background; on a
@@ -1160,6 +1232,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_gaze_events(self, ev, params, rebuild: bool = True):
         self._gaze_used = params
+        self._show_params(params)
         self.gaze_events = ev
         self.rec.gaze_events = ev
         self.rec.detected_with = None

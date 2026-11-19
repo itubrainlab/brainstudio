@@ -517,6 +517,18 @@ repeats the analysis from the data files onwards. It needs only the standard lib
 - **Blinks**: `pm.events.blink` on the pupil signal: samples where the pupil is lost or
   changes abruptly, 50–500 ms. Without a pupil channel, the samples where tracking is
   lost are used.
+- **Presets** (Controls panel), chosen automatically from the data when loading:
+  - *pymovements defaults (raw gaze)*: the values above, for unfiltered gaze (e.g.
+    Gazepoint BPOG, EyeLink, Tobii).
+  - *Gazepoint, fixation-filtered gaze (FPOG)*: for GP3 / GP3 HD data recorded with only
+    the fixation point of gaze, which wanders within a fixation. Dispersion 100 px,
+    minimum fixation 60 ms, saccades with central-difference velocity (λ 6, ≥ 6 ms),
+    blinks 50–500 ms. On a 47-min GP3 HD recording this matched the tracker's own
+    fixations (FPOGID): same count, 94 % of onsets within ±50 ms, median 221 vs 228 ms.
+    Saccade timing is usable, but amplitude and peak velocity are not (FPOG is a
+    running average). For realistic saccades and blinks, also record the best point of
+    gaze (BPOG) and the pupil in the Gazepoint configuration.
+  - Editing any value makes the preset *Custom*.
 - pymovements gets the sample number as its time axis (durations are converted to
   samples), so any sampling rate works, even an irregular one; onsets are the exact
   sample times. Detection runs in the background; long recordings take a while (about

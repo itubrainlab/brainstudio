@@ -187,6 +187,7 @@ def _requirements(externals: list[str]) -> str:
 
 # =========================================================================== explanations
 def _describe_loading(recipe: dict) -> str:
+    from . import gaze as G
     parts = ["Reads the recording and builds the event table that the epochs are later "
              "selected from.", ""]
     for st in recipe["load"]["steps"]:
@@ -246,7 +247,9 @@ def _describe_loading(recipe: dict) -> str:
                      f"velocity threshold (λ = {p.sac_threshold_factor:g}, at least "
                      f"{p.sac_min_dur * 1000:g} ms; velocity from Gaze.pos2vel, "
                      f"'{p.velocity_method}'); blinks from the pupil signal (lost or abruptly "
-                     f"changing, {p.blink_min_dur * 1000:g}–{p.blink_max_dur * 1000:g} ms).")
+                     f"changing, {p.blink_min_dur * 1000:g}–{p.blink_max_dur * 1000:g} ms)."
+                     + (f" These are the '{G.PRESETS[G.preset_name(p)][0]}' settings: "
+                        f"{G.PRESETS[G.preset_name(p)][2]}" if G.preset_name(p) else ""))
     if gz.get("aois"):
         parts.append(f"• Areas of interest ({', '.join(gz['aois'])}, rectangles): each "
                      "fixation gets the name of the AOI it falls in (column 'aoi', "
