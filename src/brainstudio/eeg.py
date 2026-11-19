@@ -191,7 +191,7 @@ def builtin_montages() -> list[str]:
 def read_channel_layout(path) -> tuple[list[str], str]:
     """Electrode names in input order and the MNE template that gives their positions."""
     names, template = [], "standard_1005"
-    for line in Path(path).read_text().splitlines():
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
         s = line.strip()
         if s.startswith("#"):
             key, _, val = s.lstrip("# ").partition(":")

@@ -41,7 +41,7 @@ class _Module:
         if not path.exists():
             path = ROOT / name.replace(".", "/") / "__init__.py"
         self.is_pkg = path.name == "__init__.py"
-        self.source = path.read_text()
+        self.source = path.read_text(encoding="utf-8")
         self.lines = self.source.splitlines()
         self.tree = ast.parse(self.source)
         self.aliases: dict = {}     # name → ("mod", module) | ("obj", module, name)

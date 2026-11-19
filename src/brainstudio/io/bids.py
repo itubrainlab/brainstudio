@@ -63,7 +63,7 @@ def _sidecar(path: Path) -> dict:
         if name.endswith(ext):
             js = path.with_name(name[: -len(ext)] + ".json")
             if js.exists():
-                return json.loads(js.read_text())
+                return json.loads(js.read_text(encoding="utf-8"))
     return {}
 
 
@@ -105,7 +105,7 @@ def scan_bids(root: str | Path) -> list[BidsRun]:
 
 def dataset_description(root: str | Path) -> dict:
     f = Path(root) / "dataset_description.json"
-    return json.loads(f.read_text()) if f.exists() else {}
+    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
 
 
 # --------------------------------------------------------------------------- metadata

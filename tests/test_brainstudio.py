@@ -802,3 +802,17 @@ def test_exported_script_reproduces_the_erp(tmp_path):
     assert np.array_equal(g["epochs"]["stim"].get_data(), epochs["stim"].get_data())
     pd.testing.assert_frame_equal(g["summary_table"], res["summary"])
     pd.testing.assert_frame_equal(g["per_subject"], res["group"]["subjects"])
+
+
+def test_text_files_are_read_and_written_as_utf8():
+    """Windows' default encoding (cp1252) cannot decode the package's own sources, which
+    exported scripts copy from: every text read/write must name its encoding."""
+    import re
+    from pathlib import Path
+    root = Path(E.__file__).parent
+    bad = []
+    for f in root.rglob("*.py"):
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            if re.search(r"\.(read_text|write_text)\(", line) and "encoding=" not in line:
+                bad.append(f"{f.relative_to(root)}:{i}")
+    assert not bad, bad

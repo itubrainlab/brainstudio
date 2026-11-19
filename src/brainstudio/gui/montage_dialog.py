@@ -122,7 +122,7 @@ class MontageDialog(QtWidgets.QDialog):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Channel names", "",
                                                       "Text (*.txt *.csv *.tsv);;All (*)")
         if fn:
-            txt = Path(fn).read_text()
+            txt = Path(fn).read_text(encoding="utf-8", errors="replace")
             names = [n.strip() for n in txt.replace(",", "\n").replace("\t", "\n").splitlines()
                      if n.strip()]
             self.names.setPlainText("\n".join(names))

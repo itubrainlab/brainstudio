@@ -173,7 +173,7 @@ def write_bids(root: str | Path, subjects=("01", "02")) -> Path:
         with gzip.open(fname, "wt") as f:
             for r in rows:
                 f.write("\t".join("n/a" if not np.isfinite(v) else f"{v:.2f}" for v in r) + "\n")
-        (d / f"{base}_recording-eye1_physio.json").write_text(json.dumps({
+        (d / f"{base}_recording-eye1_physio.json").write_text(encoding="utf-8", data=json.dumps({
             "PhysioType": "eyetrack", "SamplingFrequency": sim.gaze_sfreq,
             "StartTime": float(sim.gaze_t[0]), "RecordedEye": "right",
             "Columns": ["timestamp", "x_coordinate", "y_coordinate", "pupil_size"],
@@ -187,7 +187,7 @@ def write_bids(root: str | Path, subjects=("01", "02")) -> Path:
         with gzip.open(ev, "wt") as f:
             for t, desc in sim.markers:
                 f.write(f"{clock0 + (t - sim.gaze_t[0]) * 1000:.1f}\tn/a\t{desc}\n")
-        (d / f"{base}_recording-eye1_physioevents.json").write_text(json.dumps({
+        (d / f"{base}_recording-eye1_physioevents.json").write_text(encoding="utf-8", data=json.dumps({
             "Columns": ["onset", "duration", "message"],
             "onset": {"Units": "ms"}}, indent=2))
     make_dataset_description(path=root, name="brAInStudio synthetic free-viewing",

@@ -706,7 +706,7 @@ class AnalysisTab(QtWidgets.QWidget):
         fn, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, f"Export {title.lower()} script", f"{kind}_analysis.py", "Python (*.py)")
         if fn:
-            Path(fn).write_text(code)
+            Path(fn).write_text(code, encoding="utf-8")
             self.window().statusBar().showMessage(f"Script saved to {fn}", 6000)
 
     def erp_export(self):
@@ -742,7 +742,7 @@ class AnalysisTab(QtWidgets.QWidget):
                  f"epochs: {self.pl.epoch_settings.describe()}"]
         lines += [f"group {g}: {d}" for g, d in self.pl.group_desc.items()]
         lines += [f"{k}: {v}" for k, v in extra.items()]
-        path.write_text("\n".join(lines) + "\n")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         self.window().statusBar().showMessage(f"Exported to {path.parent}", 6000)
 
     # ================================================================== band power
