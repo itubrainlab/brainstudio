@@ -19,11 +19,9 @@ UNCHECKED, CHECKED = QtCore.Qt.Unchecked, QtCore.Qt.Checked
 
 
 class PreprocessTab(QtWidgets.QWidget):
-    def __init__(self, pipeline, worker, parent=None):
+    def __init__(self, pipeline, worker, controller, parent=None):
         super().__init__(parent)
-        self.pl, self.worker = pipeline, worker
-        self._stats = None
-        self._blink_before = self._blink_after = None
+        self.pl, self.worker, self.ctl = pipeline, worker, controller
         outer = QtWidgets.QVBoxLayout(self)
         self.header = StageHeader("① Preprocessing", "Apply preprocessing ▶")
         self.header.run.clicked.connect(lambda: self.run())
@@ -250,17 +248,13 @@ class PreprocessTab(QtWidgets.QWidget):
         if what in ("events", "recording"):
             self._update_first_event_label()
         if what == "recording" and self.pl.raw is not None:
-            raw = self.pl.raw
-            self.pl.params.bads = list(raw.info["bads"])  # e.g. from BIDS channels.tsv
-            lf = raw.info.get("line_freq")
+            lf = self.pl.raw.info.get("line_freq")
             if lf in (50.0, 60.0):  # the dataset's power-line frequency
                 self.notch.blockSignals(True)
                 self.notch.setCurrentText(f"{lf:g} Hz")
                 self.notch.blockSignals(False)
                 self.notch.setToolTip(f"Set from the dataset's power-line frequency ({lf:g} Hz)")
         if what == "recording":
-            self._stats = None
-            self._blink_before = self._blink_after = None
             self.refresh_channels()
             self.refresh_reference_choices()
             self._fill_ica_table()
@@ -302,34 +296,10 @@ class PreprocessTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.information(
                 self, "ICA", "Some channels used to fit the ICA are now marked bad: refit "
                              "ICA for the best result. Applying the current ICA anyway.")
-        blinks = self.pl.gaze_events.blinks if self.pl.gaze_events is not None else None
-        fp = self._frontal(raw, p.bads)
-
-        def job():
-            clean = P.run_preprocessing(raw, p, ica)
-            good = [c for c in clean.ch_names if c not in clean.info["bads"]]
-            eeg_good = [c for c in good if c in
-                        [clean.ch_names[i] for i in mne.pick_types(clean.info, eeg=True)]]
-            before = E.compute_psd(raw.copy().pick(eeg_good) if eeg_good else raw, 60.0)
-            after = E.compute_psd(clean, 60.0)
-            bb = P.blink_locked_average(P.filtered_copy(raw, p.l_freq, p.h_freq, p.notch, picks=fp)
-                                        if fp else raw, blinks, fp)
-            ba = P.blink_locked_average(clean, blinks, fp)
-            return clean, before, after, bb, ba
-
-        recipe = self.pl.snapshot_pre_recipe(p, ica)
-
-        def done(res):
-            clean, before, after, self._blink_before, self._blink_after = res
-            self.pl.set_clean(clean, p, before, after, recipe=recipe)
-            if then:
-                then()
-
         self.header.set_state("running")
-        return self.worker.run("Preprocessing…", job, done,
-                               failed=lambda m: (self._on_state(),
-                                                 QtWidgets.QMessageBox.warning(
-                                                     self, "Preprocessing", m)))
+        return self.ctl.preprocess(p, ica, then, failed=lambda m: (
+            self._on_state(), QtWidgets.QMessageBox.warning(self, "Preprocessing", m)))
+
 
     # ================================================================== channels
     def refresh_channels(self):
@@ -346,7 +316,7 @@ class PreprocessTab(QtWidgets.QWidget):
         self.ch_table.setColumnCount(len(cols))
         self.ch_table.setHorizontalHeaderLabels(cols)
         self.ch_table.setRowCount(len(names))
-        st = self._stats.set_index("channel") if self._stats is not None else None
+        st = self.pl.bad_stats.set_index("channel") if self.pl.bad_stats is not None else None
         bads = set(self.pl.params.bads)
         dataset_bad = self.dataset_bads()
         for i, n in enumerate(names):
@@ -414,10 +384,8 @@ class PreprocessTab(QtWidgets.QWidget):
             self._ch_item_changed(self.ch_table.item(0, 0))
 
     def detect_bads(self):
-        raw = self.pl.raw
-        if raw is None:
+        if self.pl.raw is None:
             return
-        tmin = self.first_event()
         notch = {"off": None, "50 Hz": 50.0, "60 Hz": 60.0}[self.notch.currentText()]
         p = P.BadChannelParams(ptp_max_uv=self.ptp_max.value(), ptp_min_uv=self.ptp_min.value(),
                                window=self.ptp_win.value(),
@@ -426,36 +394,25 @@ class PreprocessTab(QtWidgets.QWidget):
                                l_freq=self.hp.value() or None, h_freq=self.lp.value() or None,
                                notch=notch)
 
-        def done(df):
-            self._stats = df
-            bads = df.loc[df["bad"], "channel"].tolist()
-            # detection adds to the channels the dataset already marks bad
-            keep = [b for b in self.bads() if b in self.dataset_bads()]
-            self.pl.params.bads = keep + [b for b in bads if b not in keep]
+        def done():
             self.refresh_channels()
             self._plot_ptp()
             self.right.setCurrentIndex(1)
-            self.pl.mark_stale("preprocessing")
 
-        self.worker.run("Measuring peak-to-peak per channel…",
-                        lambda: P.detect_bad_channels(raw, p, tmin), done)
+        # detection adds to the channels the dataset already marks bad
+        keep = [b for b in self.bads() if b in self.dataset_bads()]
+        self.ctl.detect_bad_channels(p, self.first_event(), keep, done)
+
 
     # ================================================================== reference
     def refresh_reference_choices(self):
         """Kept for callers: the reference is chosen in the analyses now."""
 
     # ================================================================== ICA
-    def _frontal(self, raw, bads):
-        lower = {c.lower(): c for c in raw.ch_names}
-        return [lower[c.lower()] for c in P.FRONTAL
-                if c.lower() in lower and lower[c.lower()] not in bads][:2]
 
     def fit_ica(self):
-        raw = self.pl.raw
-        if raw is None:
+        if self.pl.raw is None:
             return
-        tmin = self.first_event()
-        bads = self.bads()
         notch = {"off": None, "50 Hz": 50.0, "60 Hz": 60.0}[self.notch.currentText()]
         ip = P.ICAParams(n_components=0.99 if self.ica_var.isChecked() else self.ica_n.value(),
                          method=self.ica_method.currentText(),
@@ -463,29 +420,14 @@ class PreprocessTab(QtWidgets.QWidget):
                          autoreject_fraction=self.ica_ar_share.value() / 100,
                          reject_uv=self.ica_rej.value() or None,
                          iclabel=self.ica_iclabel.isChecked())
-        h = None  # ICA is fitted on 1–30 Hz (ERP guide), whatever the ERP low-pass
-        blinks = self.pl.gaze_events.blinks if self.pl.gaze_events is not None else None
-        eog = [raw.ch_names[i] for i in mne.pick_types(raw.info, eog=True)]
 
-        def job():
-            ica, fit_raw = P.fit_ica(raw, bads, h, notch, ip, tmin=tmin)
-            scores = P.score_blink_components(ica, fit_raw, blinks, eog)
-            sources = ica.get_sources(fit_raw).get_data()
-            return ica, fit_raw, scores, sources
-
-        def done(res):
-            self.pl.ica, self.pl.ica_fit_raw, self.pl.ica_scores, self.pl.ica_sources = res
-            self.pl.ica_key = (tuple(bads), h, notch, tmin)
-            self.pl.ica_spec = dict(bads=list(bads), h_freq=h, notch=notch, params=ip,
-                                    tmin=tmin, steps=dict(self.pl.ica_fit_raw.fit_steps))
+        def done():
             self._fill_ica_table(use_suggested=True)
-            self.pl.mark_stale("preprocessing")
             if self.ica_table.rowCount():
                 self.ica_table.selectRow(0)
                 self.show_component(0)
+        self.ctl.fit_ica(self.bads(), notch, ip, self.first_event(), done)
 
-        what = "99 % variance" if ip.n_components < 1 else f"{ip.n_components} components"
-        self.worker.run(f"Fitting ICA ({ip.method}, {what})…", job, done)
 
     def gaze_events_changed(self):
         """New eye-tracker blinks (gaze offset or detection settings changed): rescore the
@@ -505,25 +447,9 @@ class PreprocessTab(QtWidgets.QWidget):
                         self.gaze_events_changed()
                 self.worker.busyChanged.connect(later)
             return
-        blinks = pl.gaze_events.blinks if pl.gaze_events is not None else None
-        raw, clean, p, ica, fit_raw = pl.raw, pl.clean, pl.params, pl.ica, pl.ica_fit_raw
-        eog = [raw.ch_names[i] for i in mne.pick_types(raw.info, eog=True)]
-        fp = self._frontal(raw, p.bads)
 
-        def job():
-            scores = (P.score_blink_components(ica, fit_raw, blinks, eog)
-                      if ica is not None and fit_raw is not None else None)
-            bb = ba = None
-            if clean is not None:
-                bb = P.blink_locked_average(P.filtered_copy(raw, p.l_freq, p.h_freq, p.notch,
-                                                        picks=fp) if fp else raw, blinks, fp)
-                ba = P.blink_locked_average(clean, blinks, fp)
-            return scores, bb, ba
-
-        def done(res):
-            scores, bb, ba = res
-            if pl.ica is ica and scores is not None:
-                pl.ica_scores = scores
+        def done(new_scores, new_check):
+            if new_scores:
                 row, ticked = self.ica_table.currentRow(), self.ica_excluded()
                 self._refilling = True
                 try:
@@ -533,11 +459,10 @@ class PreprocessTab(QtWidgets.QWidget):
                 if 0 <= row < self.ica_table.rowCount():
                     self.ica_table.selectRow(row)
                     self.show_component(row)
-            if pl.clean is clean and clean is not None:
-                self._blink_before, self._blink_after = bb, ba
+            if new_check:
                 self._plot_blink()
+        self.ctl.rescore_ica(done)
 
-        self.worker.run("Rescoring ICA against the shifted blinks…", job, done)
 
     def _fill_ica_table(self, use_suggested=False, keep=None):
         sc = self.pl.ica_scores
@@ -682,7 +607,7 @@ class PreprocessTab(QtWidgets.QWidget):
 
     def _plot_ptp(self):
         self.ptp_plot.clear()
-        st = self._stats
+        st = self.pl.bad_stats
         if st is None:
             return
         bads = set(self.bads())
@@ -704,11 +629,11 @@ class PreprocessTab(QtWidgets.QWidget):
 
     def _plot_blink(self):
         self.blink_plot.clear()
-        for res, lab, col in ((self._blink_before, "before", THEME.muted),
-                              (self._blink_after, "after", THEME.s(0))):
+        before, after = self.pl.blink_check
+        for res, lab, col in ((before, "before", THEME.muted), (after, "after", THEME.s(0))):
             if res is not None:
                 self.blink_plot.plot(res[0], res[1], pen=pg.mkPen(col, width=2), name=lab)
-        if self._blink_before is None and self._blink_after is None:
+        if before is None and after is None:
             self.blink_plot.addItem(pg.TextItem("Needs eye-tracker blinks and a frontal "
                                                 "channel (Fp1/Fp2…)", color=THEME.muted))
         self.blink_plot.addItem(pg.InfiniteLine(0, angle=90, pen=pg.mkPen(THEME.muted)))

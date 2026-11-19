@@ -123,6 +123,8 @@ class Session:
         self._subscribers = []
         self.rec = None
         self.aois: dict = {}  # areas of interest on the screen (kept across recordings)
+        # analysis results on screen: ERP, band power, its time course, indices
+        self.erp = self.bp = self.tc = self.idx = None
         self.clear_recording()
 
     # ------------------------------------------------------------------ observers
@@ -151,6 +153,8 @@ class Session:
         self.rec = rec
         self.clear_recording()
         self.raw_gaze = rec.gaze
+        if rec.raw is not None:  # e.g. from BIDS channels.tsv
+            self.params.bads = list(rec.raw.info["bads"])
         if step is not None:
             try:  # what an exported script needs to know about the files
                 step["recording"] = recording_info(rec, step)
@@ -223,6 +227,7 @@ class Session:
         if retyped:
             raw.set_channel_types({channel: "stim"}, verbose="error")
             self.params.bads = [b for b in self.params.bads if b != channel]
+            self.bad_stats = None
             self.invalidate_ica()
         self.rebuild_event_table()
         if retyped:
@@ -248,6 +253,7 @@ class Session:
         rename = dict(zip(old, self.rec.raw.ch_names))
         self.params.bads = [rename.get(b, b) for b in (self.params.bads if bads is None
                                                          else bads)]
+        self.bad_stats = None
         self.invalidate_ica()
         self.notify("channels")
         self.mark_stale("preprocessing")
@@ -261,7 +267,8 @@ class Session:
     def reset_stages(self):
         self.params = C.PreprocParams(reference=None)
         self.clean = None
-        self.bad_stats: pd.DataFrame | None = None
+        self.bad_stats: pd.DataFrame | None = None  # peak-to-peak per channel
+        self.blink_check = (None, None)  # blink-locked average before / after
         self.ica = self.ica_fit_raw = self.ica_scores = self.ica_key = None
         self.ica_sources = None
         self.psd_before = self.psd_after = None
@@ -297,9 +304,10 @@ class Session:
         self.state["analysis"] = "ok"
         self.notify("state")
 
-    def set_ica(self, ica, fit_raw, scores, key, spec):
+    def set_ica(self, ica, fit_raw, scores, sources, key, spec):
         self.ica, self.ica_fit_raw, self.ica_scores = ica, fit_raw, scores
-        self.ica_key, self.ica_spec, self.ica_sources = key, spec, None
+        self.ica_sources, self.ica_key, self.ica_spec = sources, key, spec
+        self.mark_stale("preprocessing")
 
     def invalidate_ica(self):
         self.ica = self.ica_fit_raw = self.ica_scores = self.ica_key = None

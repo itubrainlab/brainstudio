@@ -14,7 +14,6 @@ from PySide6 import QtCore, QtWidgets
 
 from .. import bandpower as BP
 from .. import eeg as E
-from .. import stats as ST
 from .. import workflow as W
 from .theme import THEME
 from .widgets import (NO_POS, StageHeader, _spin, _themed_plot, fill_table, has_positions,
@@ -39,13 +38,15 @@ def _bars(plot: pg.PlotItem, xs, means, sems, color, width):
 
 
 class AnalysisTab(QtWidgets.QWidget):
-    def __init__(self, pipeline, worker, parent=None):
+    # the results on screen, kept in the session
+    erp = property(lambda self: self.pl.erp)
+    bp = property(lambda self: self.pl.bp)
+    tc = property(lambda self: self.pl.tc)
+    idx = property(lambda self: self.pl.idx)
+
+    def __init__(self, pipeline, worker, controller, parent=None):
         super().__init__(parent)
-        self.pl, self.worker = pipeline, worker
-        self.erp = None
-        self.bp = None
-        self.tc = None
-        self.idx = None
+        self.pl, self.worker, self.ctl = pipeline, worker, controller
         outer = QtWidgets.QVBoxLayout(self)
         self.header = StageHeader("③ Analysis", "Run all analyses ▶")
         self.header.run.clicked.connect(lambda: self.run())
@@ -372,15 +373,8 @@ class AnalysisTab(QtWidgets.QWidget):
 
         spec = W.ErpSpec(groups=list(groups), component=comp, baseline=bl,
                          reference=self._ref_spec(self.erp_ref))
-        epochs, recipe = self.pl.epochs, self.pl.epoch_recipe
-
-        def job():
-            res = W.run_erp(epochs, spec)
-            res["recipe"] = recipe
-            return res
 
         def done(res):
-            self.erp = res
             cur = self.erp_chan.currentText()
             self.erp_chan.blockSignals(True)
             self.erp_chan.clear()
@@ -394,7 +388,7 @@ class AnalysisTab(QtWidgets.QWidget):
             if then:
                 then()
 
-        return self.worker.run("Computing ERPs…", job, done)
+        return self.ctl.compute_erp(spec, done)
 
     def _erp_clicked(self, ev):
         if self.erp is None or ev.button() != QtCore.Qt.LeftButton:
@@ -586,15 +580,8 @@ class AnalysisTab(QtWidgets.QWidget):
         f.addRow(bb)
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
-        tfce, n, a, b = kind.currentIndex() == 1, nperm.value(), t0.value(), t1.value()
-
-        def job():
-            return E.group_cluster_test(diffs, tfce=tfce, n_permutations=n, tmin=a, tmax=b)
-
-        def done(res):
-            self._show_cluster(res)
-
-        self.worker.run("Cluster test across subjects…", job, done)
+        self.ctl.cluster_test(diffs, kind.currentIndex() == 1, nperm.value(), t0.value(),
+                              t1.value(), self._show_cluster)
 
     def _show_cluster(self, res):
         import matplotlib.pyplot as plt
@@ -950,20 +937,8 @@ class AnalysisTab(QtWidgets.QWidget):
                                tmax=self.bp_t1.value(), method=self.bp_method.currentText(),
                                roi=roi, reference=self._ref_spec(self.bp_ref),
                                baseline=base, norm=self.bl_norm.currentText())
-        raw, table = self.pl.eeg_input(), self.pl.event_table
-        epochs, recipe = self.pl.epochs, self.pl.epoch_recipe
-
-        def job():
-            res = W.run_bandpower(epochs, raw, table, spec)
-            res["recipe"] = recipe
-            # the baseline came from the same data and events as the epochs
-            res["consistent"] = recipe is not None and raw is recipe["data"] \
-                and table is recipe["table"]
-            return res
 
         def done(res):
-            self.bp = res
-            self.tc = None
             self.tc_band.clear()
             self.tc_band.addItems(list(res["bands"]))
             if "alpha" in res["bands"]:
@@ -973,7 +948,7 @@ class AnalysisTab(QtWidgets.QWidget):
             if then:
                 then()
 
-        return self.worker.run("Computing band power (MNE PSD)…", job, done)
+        return self.ctl.compute_bandpower(spec, done)
 
     def _plot_bp(self):
         p = self.bp_plot
@@ -1012,19 +987,13 @@ class AnalysisTab(QtWidgets.QWidget):
         if r is None:
             QtWidgets.QMessageBox.information(self, "Time course", "Compute band power first.")
             return False
-        band = self.tc_band.currentText()
-        epochs, raw = self.pl.epochs, self.pl.eeg_input()
-
-        def job():
-            return W.run_timecourse(r, epochs, raw, band)
 
         def done(res):
-            self.tc = res
             self._plot_tc()
             if then:
                 then()
 
-        return self.worker.run(f"Computing {band} time course…", job, done)
+        return self.ctl.compute_timecourse(self.tc_band.currentText(), done)
 
     def _plot_tc(self):
         p = self.tc_plot
@@ -1183,27 +1152,16 @@ class AnalysisTab(QtWidgets.QWidget):
     def compute_idx(self, then=None):
         if self.bp is None or set(self.bp["bp"]) != set(self.groups()):
             return self.compute_bp(then=lambda: self.compute_idx(then))
-        r = self.bp
         chosen = [self.idx_list.item(i).text() for i in range(self.idx_list.count())
                   if self.idx_list.item(i).checkState() == QtCore.Qt.Checked]
         spec = W.IndicesSpec(rois=self.rois(), measures=chosen)
-        rec, gev, epochs = self.pl.rec, self.pl.gaze_events, self.pl.epochs
-
-        def job():
-            res = W.run_indices(r, epochs, rec.gaze if rec is not None else None, gev, spec)
-            res["recipe"] = r.get("recipe")
-            res["bp"] = r
-            res["consistent"] = r.get("consistent", False) and gev is \
-                (r.get("recipe") or {}).get("gaze_events", gev)
-            return res
 
         def done(res):
-            self.idx = res
             self._plot_idx()
             if then:
                 then()
 
-        return self.worker.run("Computing indices…", job, done)
+        return self.ctl.compute_indices(spec, done)
 
     def _plot_idx(self):
         self.idx_plots.clear()

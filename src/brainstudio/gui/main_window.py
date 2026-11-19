@@ -198,9 +198,9 @@ class MainWindow(QtWidgets.QMainWindow):
         h.setSizes([1000, 560])
 
         # --- EEG: preprocessing → epoching → analysis pipeline
-        self.pre_tab = PreprocessTab(self.pipeline, self.worker)
-        self.epoch_tab = EpochTab(self.pipeline, self.worker)
-        self.eeg_analysis = AnalysisTab(self.pipeline, self.worker)
+        self.pre_tab = PreprocessTab(self.pipeline, self.worker, self.ctl)
+        self.epoch_tab = EpochTab(self.pipeline, self.worker, self.ctl)
+        self.eeg_analysis = AnalysisTab(self.pipeline, self.worker, self.ctl)
         eeg = QtWidgets.QWidget()
         ev = QtWidgets.QVBoxLayout(eeg)
         ev.setContentsMargins(4, 4, 4, 4)
@@ -1071,7 +1071,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _channels_changed(self):
         """Channels renamed or retyped (montage, trigger channel): the preprocessing
         views follow and the viewer's default preprocessing runs again."""
-        self.pre_tab._stats = None
         self.pre_tab.refresh_channels()
         self.pre_tab.refresh_reference_choices()
         self.pre_tab._fill_ica_table()

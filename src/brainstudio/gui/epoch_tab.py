@@ -8,7 +8,8 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
 from .. import workflow as W
-from ..epoching import EpochSettings, build_group_epochs
+from ..core import epochs_memory
+from ..epoching import EpochSettings
 from .eventselect import EventSelector
 from .theme import THEME
 from .widgets import StageHeader, _spin, _themed_plot, fill_table, hint
@@ -19,18 +20,6 @@ MAX_EPOCH_S = 3600.0
 MEMORY_WARN_BYTES = 2e9
 
 
-def epochs_memory(raw, groups: dict, settings) -> float:
-    """Bytes building the epochs takes: events × EEG channels × samples × 8, plus about
-    12× the epochs AutoReject is fitted on while it learns its thresholds."""
-    from ..preprocessing import AUTOREJECT_MEMORY_FACTOR
-    import mne
-    n_ch = len(mne.pick_types(raw.info, eeg=True, exclude="bads")) or len(raw.ch_names)
-    n_samp = int((settings.tmax - settings.tmin) * raw.info["sfreq"]) + 1
-    n_ev = sum(len(t) for t in groups.values())
-    data = float(n_ev) * n_ch * n_samp * 8
-    if getattr(settings, "autoreject", False):
-        data *= 1 + AUTOREJECT_MEMORY_FACTOR * settings.autoreject_fraction
-    return data
 
 
 def _human(nbytes: float) -> str:
@@ -41,9 +30,9 @@ def _human(nbytes: float) -> str:
 
 
 class EpochTab(QtWidgets.QWidget):
-    def __init__(self, pipeline, worker, parent=None):
+    def __init__(self, pipeline, worker, controller, parent=None):
         super().__init__(parent)
-        self.pl, self.worker = pipeline, worker
+        self.pl, self.worker, self.ctl = pipeline, worker, controller
         outer = QtWidgets.QVBoxLayout(self)
         self.header = StageHeader("② Epoching", "Build epochs ▶")
         self.header.run.clicked.connect(lambda: self.run())
@@ -420,14 +409,9 @@ class EpochTab(QtWidgets.QWidget):
                 QtWidgets.QMessageBox.No)
             if ans != QtWidgets.QMessageBox.Yes:
                 return False
-        blinks = self.pl.gaze_events.blinks if self.pl.gaze_events is not None else None
         self._selected = groups
-        # what these epochs come from, for scripts that reproduce them
-        recipe = self.pl.snapshot_epoch_recipe(raw, specs, st)
 
-        def done(res):
-            epochs, summary = res
-            self.pl.set_epochs(epochs, summary, st, desc, recipe=recipe)
+        def done(epochs):
             if not epochs:
                 QtWidgets.QMessageBox.warning(self, "Epochs", "All epochs were dropped — check "
                                               "the rejection threshold and the selection.")
@@ -435,11 +419,8 @@ class EpochTab(QtWidgets.QWidget):
                 then()
 
         self.header.set_state("running")
-        return self.worker.run("Building epochs…",
-                               lambda: build_group_epochs(raw, groups, st, blinks), done,
-                               failed=lambda m: (self._on_state(),
-                                                 QtWidgets.QMessageBox.warning(
-                                                     self, "Epochs", m)))
+        return self.ctl.build_epochs(groups, specs, desc, st, done, failed=lambda m: (
+            self._on_state(), QtWidgets.QMessageBox.warning(self, "Epochs", m)))
 
     # ================================================================== display
     def restyle(self):

@@ -2145,6 +2145,31 @@ def blink_locked_average(raw: mne.io.BaseRaw, blinks: pd.DataFrame, channels,
 
 
 
+def frontal_channels(raw: mne.io.BaseRaw, bads=()) -> list[str]:
+    """Up to two good frontal channels (Fp1, Fp2, …), where blinks show most."""
+    lower = {c.lower(): c for c in raw.ch_names}
+    return [lower[c.lower()] for c in FRONTAL
+            if c.lower() in lower and lower[c.lower()] not in bads][:2]
+
+
+def blink_check(raw: mne.io.BaseRaw, clean: mne.io.BaseRaw | None, p: PreprocParams,
+                blinks) -> tuple:
+    """Blink-locked average of the frontal channels before (filtered only) and after
+    preprocessing, to see what ICA removed."""
+    if clean is None:
+        return None, None
+    fp = frontal_channels(raw, p.bads)
+    before = blink_locked_average(filtered_copy(raw, p.l_freq, p.h_freq, p.notch, picks=fp)
+                                  if fp else raw, blinks, fp)
+    return before, blink_locked_average(clean, blinks, fp)
+
+
+def psd_check(raw: mne.io.BaseRaw, clean: mne.io.BaseRaw) -> tuple:
+    """Power spectra of the good EEG channels before and after preprocessing."""
+    eeg = [clean.ch_names[i] for i in mne.pick_types(clean.info, eeg=True)]
+    good = [c for c in clean.ch_names if c not in clean.info["bads"] and c in eeg]
+    return (compute_psd(raw.copy().pick(good) if good else raw, 60.0),
+            compute_psd(clean, 60.0))
 
 
 # =========================================================================== epoching
@@ -2176,6 +2201,18 @@ class EpochSettings:
         if self.delay_ms:
             s += f", EEG delay {self.delay_ms:+g} ms"
         return s
+
+
+def epochs_memory(raw, groups: dict, settings) -> float:
+    """Bytes building the epochs takes: events × EEG channels × samples × 8, plus about
+    12× the epochs AutoReject is fitted on while it learns its thresholds."""
+    n_ch = len(mne.pick_types(raw.info, eeg=True, exclude="bads")) or len(raw.ch_names)
+    n_samp = int((settings.tmax - settings.tmin) * raw.info["sfreq"]) + 1
+    n_ev = sum(len(t) for t in groups.values())
+    data = float(n_ev) * n_ch * n_samp * 8
+    if getattr(settings, "autoreject", False):
+        data *= 1 + AUTOREJECT_MEMORY_FACTOR * settings.autoreject_fraction
+    return data
 
 
 def overlaps(onsets: np.ndarray, tmin: float, tmax: float,
