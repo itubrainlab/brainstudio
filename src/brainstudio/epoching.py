@@ -26,7 +26,6 @@ class EpochSettings:
     autoreject: bool = True           # AutoReject (local): interpolate, then drop
     flat_uv: float | None = None      # reject epochs flatter than this
     drop_blinks: bool = False         # drop epochs overlapping an eye-tracker blink
-    max_epochs: int | None = 2000     # per group, reproducible random subsample
     delay_ms: float = 0.0             # EEG recording delay: + moves events later
 
     def describe(self) -> str:
@@ -68,8 +67,8 @@ def build_group_epochs(raw: mne.io.BaseRaw, groups: dict[str, pd.DataFrame],
     """One ``mne.Epochs`` per group (metadata = event rows + ``group`` column).
 
     Returns the epochs and a summary table per group: selected; dropped before
-    epoching because of a blink, the window falling outside the recording, another
-    event on the same sample, or the max-epochs cap; rejected by amplitude
+    epoching because of a blink, the window falling outside the recording or another
+    event on the same sample; rejected by amplitude
     (peak-to-peak/flat) or by a BAD annotation; kept; and the channels behind
     amplitude rejections.
     """
@@ -85,15 +84,14 @@ def build_group_epochs(raw: mne.io.BaseRaw, groups: dict[str, pd.DataFrame],
             n_blink = int(hit.sum())
             tab = tab[~hit]
         row = {"group": name, "selected": n_sel, "blink": n_blink,
-               "outside recording": 0, "same sample": 0, "over cap": 0,
+               "outside recording": 0, "same sample": 0,
                "rejected (amplitude)": 0, "rejected (BAD annotation)": 0, "kept": 0,
                "rejected by": ""}
         if len(tab):
             tab = tab.assign(group=name)
             try:
                 ep = E.epochs_from_table(raw, tab, settings.tmin, settings.tmax, baseline=None,
-                                         reject_uv=settings.reject_uv,
-                                         max_epochs=settings.max_epochs)
+                                         reject_uv=settings.reject_uv)
             except ValueError as e:
                 ep = None
                 row.update(getattr(e, "counts", {"outside recording": len(tab)}))

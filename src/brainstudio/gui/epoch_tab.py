@@ -24,7 +24,7 @@ def epochs_memory(raw, groups: dict, settings) -> float:
     import mne
     n_ch = len(mne.pick_types(raw.info, eeg=True, exclude="bads")) or len(raw.ch_names)
     n_samp = int((settings.tmax - settings.tmin) * raw.info["sfreq"]) + 1
-    n_ev = sum(min(len(t), settings.max_epochs or len(t)) for t in groups.values())
+    n_ev = sum(len(t) for t in groups.values())
     return float(n_ev) * n_ch * n_samp * 8
 
 
@@ -97,24 +97,19 @@ class EpochTab(QtWidgets.QWidget):
         self.autoreject.setChecked(st.autoreject)
         self.autoreject.setToolTip("AutoReject (local), as in the ERP guide. Needs electrode "
                                    "positions; fitted on at most 600 epochs of all groups.")
-        self.max_ep = QtWidgets.QSpinBox()
-        self.max_ep.setRange(10, 1_000_000)
-        self.max_ep.setValue(st.max_epochs)
-        self.max_ep.setToolTip("Random, reproducible subsample above this many events per group")
         self.delay = _spin(-500, 500, 0, 1, 0, " ms")
         self.delay.setToolTip("EEG recording delay: a positive value means the EEG lags the "
                               "events (e.g. wireless amplifiers), so epochs are cut later")
         for i, (lab, w) in enumerate((("start", self.tmin), ("end", self.tmax),
                                       ("reject ptp >", self.reject), ("flat <", self.flat),
-                                      ("max epochs / group", self.max_ep),
                                       ("EEG delay", self.delay))):
             g.addWidget(QtWidgets.QLabel(lab), i // 2, 2 * (i % 2))
             g.addWidget(w, i // 2, 2 * (i % 2) + 1)
         g.addWidget(self.blinks, 3, 0, 1, 4)
-        g.addWidget(self.autoreject, 5, 0, 1, 4)
+        g.addWidget(self.autoreject, 4, 0, 1, 4)
         g.addWidget(hint("Epochs are not baseline-corrected here: the ERP baseline and the "
                          "band-power baseline are chosen in Analysis. Make epochs long "
-                         "enough for both (e.g. −0.5…2 s for band power)."), 4, 0, 1, 4)
+                         "enough for both (e.g. −0.5…2 s for band power)."), 5, 0, 1, 4)
         rv.addWidget(box)
 
         # recordings: subject / session / run / task / file of each event
@@ -166,7 +161,6 @@ class EpochTab(QtWidgets.QWidget):
         self.add_group(default=("fixation",))
         for w in (self.tmin, self.tmax, self.reject, self.flat):
             w.valueChanged.connect(lambda *_: self.pl.mark_stale("epoching"))
-        self.max_ep.valueChanged.connect(lambda *_: self.pl.mark_stale("epoching"))
         self.delay.valueChanged.connect(lambda *_: self.pl.mark_stale("epoching"))
         self.blinks.toggled.connect(lambda *_: self.pl.mark_stale("epoching"))
         self.autoreject.toggled.connect(lambda *_: self.pl.mark_stale("epoching"))
@@ -368,7 +362,6 @@ class EpochTab(QtWidgets.QWidget):
                              flat_uv=self.flat.value() or None,
                              drop_blinks=self.blinks.isChecked(),
                              autoreject=self.autoreject.isChecked(),
-                             max_epochs=self.max_ep.value(),
                              delay_ms=self.delay.value())
 
     def run(self, then=None) -> bool:
@@ -401,9 +394,9 @@ class EpochTab(QtWidgets.QWidget):
             ans = QtWidgets.QMessageBox.question(
                 self, "Large epochs",
                 f"These epochs need about {_human(need)} of memory "
-                f"({st.tmax - st.tmin:g} s × {sum(len(t) for t in groups.values())} events, "
-                f"capped at {st.max_epochs} per group).\n\nLower ‘max epochs / group’ or "
-                "shorten the window to use less. Build them anyway?",
+                f"({st.tmax - st.tmin:g} s × {sum(len(t) for t in groups.values())} events)."
+                "\n\nShorten the window or select fewer events to use less. Build them "
+                "anyway?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                 QtWidgets.QMessageBox.No)
             if ans != QtWidgets.QMessageBox.Yes:

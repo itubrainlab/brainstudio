@@ -511,12 +511,6 @@ def _epoching(recipe: dict) -> tuple[list[str], set]:
           "    samples = np.round(rows['onset'] * data.info['sfreq']).astype(int) "
           "+ data.first_samp",
           "    rows, samples = rows[~samples.duplicated()], samples[~samples.duplicated()]",
-          *([f"    if len(rows) > {st.max_epochs}:  # at most {st.max_epochs} per group "
-             "(random, reproducible)",
-             f"        keep = np.sort(np.random.default_rng(0).choice(len(rows), "
-             f"{st.max_epochs}, replace=False))",
-             "        rows, samples = rows.iloc[keep], samples.iloc[keep]"]
-            if st.max_epochs else []),
           "    epochs[label] = mne.Epochs(data, np.c_[samples, np.zeros_like(samples), "
           "np.ones_like(samples)],",
           f"                               tmin={lit(st.tmin)}, tmax={lit(st.tmax)}, "

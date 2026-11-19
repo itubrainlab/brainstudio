@@ -353,7 +353,6 @@ The **EEG** tab is a three-stage pipeline:
     (at most 600) and needs electrode positions;
   - optional peak-to-peak and flat rejection;
   - an option to drop epochs that contain an eye-tracker blink;
-  - a cap on epochs per group;
   - **EEG delay** (±500 ms) to correct a recording lag between events and EEG.
 - **Recordings**: tick the subjects, sessions, runs, tasks or files to use events from.
 - **Summary** per group. These add up to *selected*:
@@ -362,7 +361,6 @@ The **EEG** tab is a three-stage pipeline:
     recording;
   - **same sample**: another selected event of the group is on the same EEG sample (MNE
     needs one per sample);
-  - **over cap**: left out by the *max epochs / group* limit (random, reproducible);
   - **rejected (amplitude)**: peak-to-peak or flat rejection; **rejected by** names the
     channels;
   - **rejected (BAD annotation)**: the epoch overlaps a `BAD_…` span or a file boundary;

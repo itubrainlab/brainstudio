@@ -302,14 +302,13 @@ def apply_montage(raw: mne.io.BaseRaw, montage: mne.channels.DigMontage | None,
 # =========================================================================== event-table epochs
 def epochs_from_table(raw: mne.io.BaseRaw, table, tmin: float = -0.2, tmax: float = 0.8,
                       baseline=(None, 0), reject_uv: float | None = None,
-                      max_epochs: int | None = 2000, seed: int = 0,
                       picks="eeg") -> mne.Epochs:
     """MNE Epochs locked to the rows of an event table, with the table as metadata.
 
     Event IDs are the table's ``name`` column, so standard MNE selection works:
     ``epochs["fixation"]``, ``epochs['cond == "AI"']`` (metadata query), etc.
     Rows outside the recording, or falling on an already used sample, are
-    dropped; ``max_epochs`` randomly subsamples (reproducibly) to bound memory.
+    dropped.
     """
     import pandas as pd
 
@@ -325,11 +324,6 @@ def epochs_from_table(raw: mne.io.BaseRaw, table, tmin: float = -0.2, tmax: floa
     keep = np.sort(first)
     counts["same sample"] = len(tab) - len(keep)
     tab, samples = tab.iloc[keep], samples[keep]
-    counts["over cap"] = 0
-    if max_epochs and len(tab) > max_epochs:
-        counts["over cap"] = len(tab) - max_epochs
-        sel = np.sort(np.random.default_rng(seed).choice(len(tab), max_epochs, replace=False))
-        tab, samples = tab.iloc[sel], samples[sel]
     if not len(tab):
         err = ValueError("No selected events fall inside the EEG recording")
         err.counts = counts

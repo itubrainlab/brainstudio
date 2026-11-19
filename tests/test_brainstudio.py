@@ -625,13 +625,14 @@ def test_epoch_summary_counts_each_reason():
     table = pd.DataFrame({"onset": onsets, "duration": 0.0, "name": "e", "kind": "marker",
                           "description": "e"})
     _, summ = EP.build_group_epochs(raw, {"g": table},
-                                    EP.EpochSettings(-0.2, 0.8, reject_uv=100, max_epochs=10))
+                                    EP.EpochSettings(-0.2, 0.8, reject_uv=100,
+                                                     autoreject=False))
     r = summ.iloc[0]
     assert r["selected"] == 13 and r["outside recording"] == 1 and r["same sample"] == 1
-    assert r["over cap"] == 1                          # 11 epochable events, cap 10
-    assert r["rejected (BAD annotation)"] + r["rejected (amplitude)"] + r["kept"] == 10
-    assert r["kept"] + r["outside recording"] + r["same sample"] + r["over cap"] \
+    assert r["rejected (BAD annotation)"] + r["rejected (amplitude)"] + r["kept"] == 11
+    assert r["kept"] + r["outside recording"] + r["same sample"] \
         + r["rejected (amplitude)"] + r["rejected (BAD annotation)"] == r["selected"]
+    assert "over cap" not in summ
     assert "outside/dup" not in summ
 
 
