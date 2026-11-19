@@ -650,6 +650,10 @@ def test_group_erp_averages_subjects_first():
     assert sm.loc["A − B", "t"] == pytest.approx(t.statistic)
     assert sm.loc["A − B", "p"] == pytest.approx(t.pvalue)
     assert len(res["diffs"]) == 4 and len(res["subject_tests"]) == 4
+    # three groups: repeated-measures ANOVA on the subjects that have every group
+    three = C.group_component_analysis({**groups, "C": groups["A"].copy()}, comp)
+    last = three["summary"].iloc[-1]
+    assert last["test"] == "repeated-measures ANOVA" and 0 <= last["p"] <= 1
 
 
 def test_subject_spans_merge_runs():

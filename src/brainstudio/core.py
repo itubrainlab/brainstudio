@@ -2162,40 +2162,21 @@ def apply_autoreject(epochs: dict, summary, fraction=1.0, seed=42):
 
 
 # =========================================================================== EEG: montages, triggers, ERP
-def compute_psd(raw: mne.io.BaseRaw, fmax: float = 60.0, tmin=None, tmax=None):
+def compute_psd(raw, fmax: float = 60.0, tmin=None, tmax=None):
     picks = mne.pick_types(raw.info, eeg=True, exclude="bads")
-    if not len(picks):
-        picks = eeg_picks(raw)
-    fmax = min(fmax, raw.info["sfreq"] / 2)
-    return raw.compute_psd(fmax=fmax, picks=picks, tmin=tmin, tmax=tmax)
+    return raw.compute_psd(fmax=min(fmax, raw.info["sfreq"] / 2), tmin=tmin, tmax=tmax,
+                           picks=picks if len(picks) else eeg_picks(raw))
 
 
-def add_gaze_annotations(raw: mne.io.BaseRaw, ev, kinds=("blinks", "saccades")) -> None:
+def add_gaze_annotations(raw, ev, kinds=("blinks", "saccades")) -> None:
     """Annotate blinks/saccades/fixations on ``raw`` (e.g. to reject segments)."""
-    onsets, durs, descs = [], [], []
     label = {"blinks": "BAD_blink", "saccades": "saccade", "fixations": "fixation"}
-    for k in kinds:
-        df = getattr(ev, k)
-        onsets += list(df["onset"])
-        durs += list(df["duration"])
-        descs += [label[k]] * len(df)
-    if not onsets:
-        return
-    ann = mne.Annotations(np.asarray(onsets) + raw.first_time, durs, descs,
-                          orig_time=raw.annotations.orig_time)
-    if raw.annotations.orig_time is None:
-        ann = mne.Annotations(onsets, durs, descs)
-    raw.set_annotations(raw.annotations + ann)
-
-
-def set_standard_montage(raw: mne.io.BaseRaw) -> None:
-    """Apply a standard 10-05 montage to channels whose names match (in place)."""
-    available = mne.channels.get_builtin_montages()
-    name = "colin27_1005" if "colin27_1005" in available else "standard_1005"
-    try:
-        raw.set_montage(name, on_missing="ignore", match_case=False)
-    except Exception:
-        pass
+    df = pd.concat([getattr(ev, k).assign(description=label[k]) for k in kinds])
+    if len(df):
+        orig = raw.annotations.orig_time
+        raw.set_annotations(raw.annotations + mne.Annotations(
+            df["onset"].to_numpy() + (raw.first_time if orig is not None else 0.0),
+            df["duration"].to_numpy(), df["description"].to_numpy(), orig_time=orig))
 
 
 #: Folders with channel-layout montages: text files listing electrode names in amplifier
@@ -2207,11 +2188,7 @@ MONTAGE_DIRS = (Path(__file__).parent / "montages", Path.home() / ".brainstudio"
 
 def layout_montages() -> dict[str, Path]:
     """Channel-layout montages shipped with brAInStudio or in ~/.brainstudio/montages."""
-    out: dict[str, Path] = {}
-    for d in MONTAGE_DIRS:
-        if d.is_dir():
-            out.update({f.stem: f for f in sorted(d.glob("*.txt"))})
-    return out
+    return {f.stem: f for d in MONTAGE_DIRS if d.is_dir() for f in sorted(d.glob("*.txt"))}
 
 
 def builtin_montages() -> list[str]:
@@ -2223,20 +2200,16 @@ def builtin_montages() -> list[str]:
 def read_channel_layout(path) -> tuple[list[str], str]:
     """Electrode names in input order and the MNE template that gives their positions."""
     names, template = [], "standard_1005"
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        s = line.strip()
-        if s.startswith("#"):
-            key, _, val = s.lstrip("# ").partition(":")
-            if key.strip().lower() == "positions" and val.strip():
-                template = val.strip()
-            continue
-        if s:
-            names.append(s.split()[-1])
+    for line in map(str.strip, Path(path).read_text(encoding="utf-8").splitlines()):
+        key, _, val = line.lstrip("# ").partition(":")
+        if line.startswith("#") and key.strip().lower() == "positions" and val.strip():
+            template = val.strip()
+        elif line and not line.startswith("#"):
+            names.append(line.split()[-1])
     return names, template
 
 
-def montage_from_layout(names: list[str], template: str = "standard_1005"
-                        ) -> mne.channels.DigMontage:
+def montage_from_layout(names: list[str], template: str = "standard_1005"):
     """DigMontage whose channel order is ``names``, positioned from ``template``."""
     if template == "standard_1005" and "colin27_1005" in mne.channels.get_builtin_montages():
         template = "colin27_1005"  # MNE's new name for the 10-05 template
@@ -2250,12 +2223,11 @@ def montage_from_layout(names: list[str], template: str = "standard_1005"
         lpa=pos["lpa"], rpa=pos["rpa"], coord_frame=pos["coord_frame"])
 
 
-def montage_from_source(source: str) -> mne.channels.DigMontage:
+def montage_from_source(source: str):
     """Montage name (layout montage or ``mne.channels.get_builtin_montages``) or file."""
-    layouts = layout_montages()
+    layouts, p = layout_montages(), Path(source)
     if source in layouts:
         return montage_from_layout(*read_channel_layout(layouts[source]))
-    p = Path(source)
     if not p.exists():  # a montage name (incl. deprecated aliases MNE still accepts)
         try:
             return mne.channels.make_standard_montage(source)
@@ -2264,7 +2236,6 @@ def montage_from_source(source: str) -> mne.channels.DigMontage:
     if p.suffix.lower() == ".fif":
         return mne.channels.read_dig_fif(p)
     if p.name.endswith("_electrodes.tsv"):  # BIDS electrodes file
-        import pandas as pd
         df = pd.read_csv(p, sep="\t", na_values=["n/a"]).dropna(subset=["x", "y", "z"])
         pos = df[["x", "y", "z"]].to_numpy(float)
         if np.nanmax(np.abs(pos)) > 1.0:  # mm / cm → m
@@ -2274,66 +2245,50 @@ def montage_from_source(source: str) -> mne.channels.DigMontage:
     return mne.channels.read_custom_montage(p)
 
 
-def apply_montage(raw: mne.io.BaseRaw, montage: mne.channels.DigMontage | None,
-                  new_names: list[str] | None = None, set_types: bool = True) -> dict:
-    """Rename channels (in recording order), set types and apply ``montage`` in place.
-
-    Returns a report: n_renamed, n_positioned, missing (EEG channels without position).
-    """
-    report = {"n_renamed": 0}
-    if new_names:
-        mapping = {}
-        for old, new in zip(raw.ch_names, new_names):
-            new = new.strip()
-            if new and new != old:
-                mapping[old] = new
-        if len(set(mapping.values())) != len(mapping) or \
-                set(mapping.values()) & (set(raw.ch_names) - set(mapping)):
-            raise ValueError("Channel names must be unique")
-        raw.rename_channels(mapping)
-        report["n_renamed"] = len(mapping)
+def apply_montage(raw, montage, new_names: list[str] | None = None, set_types=True) -> dict:
+    """Rename the channels (in recording order), set their types from their names and
+    apply ``montage``, in place. Returns n_renamed, n_positioned and missing (EEG
+    channels without a position)."""
+    mapping = {old: new.strip() for old, new in zip(raw.ch_names, new_names or [])
+               if new.strip() and new.strip() != old}
+    if len(set(mapping.values())) != len(mapping) or \
+            set(mapping.values()) & (set(raw.ch_names) - set(mapping)):
+        raise ValueError("Channel names must be unique")
+    raw.rename_channels(mapping)
     if set_types:
-        types = {ch: guess_channel_type(ch) for ch in raw.ch_names}
-        changed = {ch: t for ch, t in types.items()
-                   if t != "eeg" and raw.get_channel_types([ch])[0] == "eeg"}
+        changed = {c: guess_channel_type(c) for c, t in zip(raw.ch_names,
+                                                           raw.get_channel_types())
+                   if t == "eeg" and guess_channel_type(c) != "eeg"}
         if changed:
             raw.set_channel_types(changed)
     if montage is not None:
         raw.set_montage(montage, match_case=False, on_missing="ignore")
     eeg = mne.pick_types(raw.info, eeg=True, exclude=[])
-    has = [i for i in eeg if np.isfinite(raw.info["chs"][i]["loc"][:3]).all()
-           and np.abs(raw.info["chs"][i]["loc"][:3]).sum() > 0]
-    report["n_positioned"] = len(has)
-    report["missing"] = [raw.ch_names[i] for i in eeg if i not in has]
-    return report
+    loc = np.array([raw.info["chs"][i]["loc"][:3] for i in eeg]).reshape(-1, 3)
+    placed = np.isfinite(loc).all(1) & (np.abs(loc).sum(1) > 0)
+    return {"n_renamed": len(mapping), "n_positioned": int(placed.sum()),
+            "missing": [raw.ch_names[i] for i in eeg[~placed]]}
 
 
 TRIGGER_WORDS = ("trig", "status", "marker", "event", "stim", "sti ")
-
-
 _UNIT_BACK = {"uV": 1e6, "µV": 1e6, "μV": 1e6, "mV": 1e3, "nV": 1e9, "V": 1.0}
 
 
-def guess_trigger_channel(raw: mne.io.BaseRaw) -> str | None:
+def guess_trigger_channel(raw) -> str | None:
     """A stim channel, else one named like a trigger (TRIG, Status, …), else None."""
     stims = [raw.ch_names[i] for i in mne.pick_types(raw.info, stim=True)]
-    if stims:
-        return stims[0]
-    return next((c for c in raw.ch_names if any(w in c.lower() + " " for w in TRIGGER_WORDS)),
-                None)
+    return stims[0] if stims else next(
+        (c for c in raw.ch_names if any(w in c.lower() + " " for w in TRIGGER_WORDS)), None)
 
 
-def trigger_codes(raw: mne.io.BaseRaw, channel: str, mask: int | None = None,
-                  mode: str = "codes") -> pd.DataFrame:
-    """Events on a trigger channel: onset (s) and code.
+def trigger_codes(raw, channel: str, mask: int | None = None, mode="codes") -> pd.DataFrame:
+    """Events on a trigger channel: onset (s) and code, with ``mne.find_events``.
 
-    ``mode="codes"``: the channel holds integer codes (EDF/BDF trigger or
-    Status channels). The reader's unit scaling is undone and values rounded,
-    then ``mne.find_events`` reports every change to a non-zero code (an
-    optional bit ``mask`` keeps only some bits). ``mode="threshold"``: an
-    analog pulse channel (e.g. photodiode) is binarised half-way between its
-    resting level (median) and its pulse extreme, and each pulse onset is code 1.
-    """
+    ``codes``: the channel holds integer codes (EDF/BDF trigger or Status channels): the
+    reader's unit scaling is undone, values rounded, and every change to a non-zero code
+    is an event (``mask`` keeps only some bits). ``threshold``: an analog pulse channel
+    (e.g. photodiode) is cut half-way between its resting level (median) and its pulse
+    extreme; each pulse onset is code 1."""
     if channel not in raw.ch_names:
         raise ValueError(f"No channel named {channel!r}")
     x = raw.get_data(picks=[channel])[0]
@@ -2342,19 +2297,15 @@ def trigger_codes(raw: mne.io.BaseRaw, channel: str, mask: int | None = None,
         up, down = float(x.max()) - base, base - float(x.min())
         if max(up, down) <= 0:
             raise ValueError(f"{channel} is flat")
-        thr = base + up / 2 if up >= down else base - down / 2  # positive or negative pulses
-        data = ((x > thr) if up >= down else (x < thr)).astype(float)
-    else:
-        # undo the reader's unit scaling (µV stored → V in memory) from the file's unit,
-        # whatever the channel's type is now (it may have been re-typed as stim)
-        unit = getattr(raw, "_orig_units", {}).get(channel, "")
-        data = np.round(x * _UNIT_BACK.get(unit, 1.0))
-    info = mne.create_info(["TRIG"], raw.info["sfreq"], "stim")
-    trig = mne.io.RawArray(data[None], info, first_samp=raw.first_samp)
+        data = (x > base + up / 2 if up >= down else x < base - down / 2).astype(float)
+    else:  # from the file's unit, whatever the channel's type is now
+        data = np.round(x * _UNIT_BACK.get(getattr(raw, "_orig_units", {}).get(channel, ""), 1.0))
+    trig = mne.io.RawArray(data[None], mne.create_info(["TRIG"], raw.info["sfreq"], "stim"),
+                           first_samp=raw.first_samp)
     ev = mne.find_events(trig, stim_channel="TRIG", shortest_event=1, consecutive=True,
                          initial_event=True, mask=mask or None, mask_type="and")
-    onsets = (ev[:, 0] - raw.first_samp) / raw.info["sfreq"]
-    return pd.DataFrame({"onset": onsets, "code": ev[:, 2].astype(int)})
+    return pd.DataFrame({"onset": (ev[:, 0] - raw.first_samp) / raw.info["sfreq"],
+                         "code": ev[:, 2].astype(int)})
 
 
 @dataclass
@@ -2382,197 +2333,147 @@ COMPONENT_PRESETS = {
 }
 
 
-def component_analysis(groups: dict[str, mne.BaseEpochs], comp: Component
-                       ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Measure ``comp`` in every group (epochs already baseline-corrected).
-
-    Per epoch: mean amplitude in the window on the channel-cluster mean (µV).
-    Per group: n, window mean ± SEM, and peak amplitude/latency of the average
-    ERP (``Evoked.get_peak`` on the cluster mean, in the component's polarity).
-    With two groups the window means are compared with a two-sided Welch t-test
-    (plus Mann-Whitney U and Hedges' g) and the peak latencies are subtracted.
-
-    Returns (summary table, per-epoch table).
-    """
-
-    if comp.tmin >= comp.tmax:
-        raise ValueError("The component window must start before it ends")
+def component_window(groups: dict, comp: Component) -> tuple[list[str], np.ndarray, str]:
+    """The component's channels among the epochs', its window as a mask on the epoch
+    times, and its label."""
     first = next(iter(groups.values()))
     chans = [c for c in comp.channels if c in first.ch_names]
-    if not chans:
-        raise ValueError(f"None of {', '.join(comp.channels)} are among the epoch channels "
-                         "(renamed, or marked bad?)")
-    rows, per = [], []
-    vals = {}
-    for g, ep in groups.items():
-        m = (ep.times >= comp.tmin) & (ep.times <= comp.tmax)
-        if not m.any():
-            raise ValueError("The component window lies outside the epochs")
-        x = ep.get_data(picks=chans).mean(1) * 1e6
-        amps = x[:, m].mean(1)
-        vals[g] = amps
-        roi = mne.channels.combine_channels(
-            ep.average(), {"roi": [ep.ch_names.index(c) for c in chans]}, method="mean")
-        _, lat, amp = roi.get_peak(tmin=comp.tmin, tmax=comp.tmax,
-                                   mode="neg" if comp.polarity < 0 else "pos",
-                                   return_amplitude=True, strict=False)
-        n = len(amps)
-        rows.append({"group": g, "n": n, "window mean µV": float(amps.mean()),
-                     "sem": float(amps.std(ddof=1) / np.sqrt(n)) if n > 1 else np.nan,
-                     "peak µV": float(amp) * 1e6, "peak latency ms": float(lat) * 1000})
-        per.append(pd.DataFrame({"group": g, "onset": ep.metadata["onset"].to_numpy(float)
-                                 if ep.metadata is not None and "onset" in ep.metadata
-                                 else np.nan, "window mean µV": amps}))
-    summary = pd.DataFrame(rows)
-    if len(groups) == 2:
-        (ga, a), (gb, b) = vals.items()
-        if min(len(a), len(b)) >= 2:
-            w = scipy_stats.ttest_ind(a, b, equal_var=False)
-            u = scipy_stats.mannwhitneyu(a, b, alternative="two-sided")
-            la, lb = summary["peak latency ms"]
-            pa, pb = summary["peak µV"]
-            summary = pd.concat([summary, pd.DataFrame([{
-                "group": f"{ga} − {gb}", "n": np.nan,
-                "window mean µV": float(a.mean() - b.mean()), "sem": np.nan,
-                "peak µV": pa - pb, "peak latency ms": la - lb,
-                "Welch t": float(w.statistic), "df": float(w.df), "p": float(w.pvalue),
-                "p (Mann-Whitney)": float(u.pvalue), "hedges g": hedges_g(a, b)}])],
-                ignore_index=True)
-    elif len(groups) > 2:
-        f = scipy_stats.f_oneway(*[v for v in vals.values() if len(v) >= 2])
-        summary = pd.concat([summary, pd.DataFrame([{
-            "group": "all groups", "ANOVA F": float(f.statistic), "p": float(f.pvalue)}])],
-            ignore_index=True)
-    summary.insert(0, "component", f"{comp.name} {comp.tmin * 1000:.0f}–{comp.tmax * 1000:.0f} ms "
-                   f"{'+' if comp.polarity > 0 else '−'} @ {'+'.join(chans)}")
-    return summary, pd.concat(per, ignore_index=True)
-
-
-def epoch_subjects(ep: mne.BaseEpochs) -> np.ndarray | None:
-    """Subject label of every epoch ("" when unknown), or None without a subject column."""
-    md = ep.metadata
-    if md is None or "subject" not in md:
-        return None
-    s = md["subject"]
-    return np.array(["" if (v is None or (isinstance(v, float) and np.isnan(v)))
-                     else str(v) for v in s], dtype=object)
-
-
-def subjects_in(groups: dict[str, mne.BaseEpochs]) -> list[str]:
-    """Subjects with at least one epoch in any group (sorted)."""
-    out = set()
-    for ep in groups.values():
-        k = epoch_subjects(ep)
-        if k is not None:
-            out |= set(k) - {""}
-    return sorted(out)
-
-
-def subject_evokeds(groups: dict[str, mne.BaseEpochs]) -> dict[str, dict[str, mne.Evoked]]:
-    """One Evoked per subject and group: each subject's epochs averaged on their own."""
-    out = {}
-    for g, ep in groups.items():
-        keys = epoch_subjects(ep)
-        out[g] = {}
-        if keys is None:
-            continue
-        for s in sorted(set(keys) - {""}):
-            ev = ep[np.flatnonzero(keys == s)].average()
-            ev.comment = f"{g} · sub-{s}"
-            out[g][s] = ev
-    return out
-
-
-def grand_average(evokeds: list[mne.Evoked]) -> mne.Evoked:
-    """Average of averages: every subject weighs the same, whatever its epoch count."""
-    if len(evokeds) == 1:
-        return evokeds[0].copy()
-    return mne.grand_average(list(evokeds), interpolate_bads=False, drop_bads=False)
-
-
-def _roi_wave(ev: mne.Evoked, chans: list[str]) -> np.ndarray:
-    return ev.get_data(picks=chans).mean(0) * 1e6
-
-
-def _peak(ev: mne.Evoked, chans: list[str], comp: "Component") -> tuple[float, float]:
-    roi = mne.channels.combine_channels(ev, {"roi": [ev.ch_names.index(c) for c in chans]},
-                                        method="mean")
-    _, lat, amp = roi.get_peak(tmin=comp.tmin, tmax=comp.tmax,
-                               mode="neg" if comp.polarity < 0 else "pos",
-                               return_amplitude=True, strict=False)
-    return float(amp) * 1e6, float(lat) * 1000
-
-
-def group_component_analysis(groups: dict[str, mne.BaseEpochs], comp: "Component") -> dict:
-    """ERP component across subjects, as in group ERP studies: average the epochs of each
-    subject first (one Evoked per subject and group), then average those Evokeds with equal
-    weight (grand average). Subjects, not epochs, are the observations.
-
-    Returns a dict with
-    * ``summary``: per group N subjects, mean ± SEM and 95 % CI of the subjects' window
-      means, peak of the grand average; then the across-subject test. Two groups: paired
-      t-test on the subjects that have both (= one-sample t-test of their difference
-      waves against 0), Wilcoxon signed-rank and Cohen's d_z; without shared subjects a
-      Welch t-test between subject means. More groups: repeated-measures ANOVA and
-      Friedman test on the subjects that have every group.
-    * ``subjects``: one row per subject and group (epochs, window mean, peak).
-    * ``subject_tests``: within each subject, the epoch-level test between the groups.
-    * ``evokeds`` / ``grand`` / ``diffs`` / ``grand_diff``.
-    """
-
     if comp.tmin >= comp.tmax:
         raise ValueError("The component window must start before it ends")
-    first = next(iter(groups.values()))
-    chans = [c for c in comp.channels if c in first.ch_names]
     if not chans:
         raise ValueError(f"None of {', '.join(comp.channels)} are among the epoch channels "
                          "(renamed, or marked bad?)")
     m = (first.times >= comp.tmin) & (first.times <= comp.tmax)
     if not m.any():
         raise ValueError("The component window lies outside the epochs")
-    evs = subject_evokeds(groups)
-    rows = []
-    vals: dict[str, dict[str, float]] = {}
-    for g, by_s in evs.items():
-        vals[g] = {}
-        for s, ev in by_s.items():
-            w = float(_roi_wave(ev, chans)[m].mean())
-            pa, pl = _peak(ev, chans, comp)
-            vals[g][s] = w
-            rows.append({"subject": s, "group": g, "epochs": ev.nave, "window mean µV": w,
+    return chans, m, (f"{comp.name} {comp.tmin * 1000:.0f}–{comp.tmax * 1000:.0f} ms "
+                      f"{'+' if comp.polarity > 0 else '−'} @ {'+'.join(chans)}")
+
+
+def peak(ev, chans, comp) -> tuple[float, float]:
+    """Peak amplitude (µV) and latency (ms) of the cluster mean, in the component's
+    polarity (``Evoked.get_peak``)."""
+    roi = mne.channels.combine_channels(ev, {"roi": [ev.ch_names.index(c) for c in chans]},
+                                        method="mean")
+    _, lat, amp = roi.get_peak(tmin=comp.tmin, tmax=comp.tmax, return_amplitude=True,
+                               mode="neg" if comp.polarity < 0 else "pos", strict=False)
+    return float(amp) * 1e6, float(lat) * 1000
+
+
+def component_analysis(groups: dict, comp: Component) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """``comp`` in every group, epochs as observations (baseline-corrected epochs): per
+    epoch the window mean of the cluster mean (µV); per group n, mean ± SEM and the peak
+    of the average. Two groups: Welch t, Mann-Whitney U, Hedges' g and the peak
+    differences; more: one-way ANOVA. Returns (summary, per-epoch table)."""
+    chans, _, label = component_window(groups, comp)
+    rows, per, vals = [], [], {}
+    for g, ep in groups.items():
+        w = (ep.times >= comp.tmin) & (ep.times <= comp.tmax)
+        if not w.any():
+            raise ValueError("The component window lies outside the epochs")
+        vals[g] = amps = (ep.get_data(picks=chans).mean(1) * 1e6)[:, w].mean(1)
+        pa, pl = peak(ep.average(), chans, comp)
+        rows.append({"group": g, "n": len(amps), "window mean µV": float(amps.mean()),
+                     "sem": float(amps.std(ddof=1) / np.sqrt(len(amps))) if len(amps) > 1
+                     else np.nan, "peak µV": pa, "peak latency ms": pl})
+        md = ep.metadata
+        per.append(pd.DataFrame({"group": g, "onset": md["onset"].to_numpy(float)
+                                 if md is not None and "onset" in md else np.nan,
+                                 "window mean µV": amps}))
+    summary = pd.DataFrame(rows)
+    if len(groups) == 2 and min(map(len, vals.values())) >= 2:
+        (ga, a), (gb, b) = vals.items()
+        w = scipy_stats.ttest_ind(a, b, equal_var=False)
+        (pa, pb), (la, lb) = summary["peak µV"], summary["peak latency ms"]
+        summary = pd.concat([summary, pd.DataFrame([{
+            "group": f"{ga} − {gb}", "n": np.nan, "window mean µV": float(a.mean() - b.mean()),
+            "sem": np.nan, "peak µV": pa - pb, "peak latency ms": la - lb,
+            "Welch t": float(w.statistic), "df": float(w.df), "p": float(w.pvalue),
+            "p (Mann-Whitney)": float(scipy_stats.mannwhitneyu(a, b, alternative="two-sided").pvalue),
+            "hedges g": hedges_g(a, b)}])], ignore_index=True)
+    elif len(groups) > 2:
+        f = scipy_stats.f_oneway(*[v for v in vals.values() if len(v) >= 2])
+        summary = pd.concat([summary, pd.DataFrame([{
+            "group": "all groups", "ANOVA F": float(f.statistic), "p": float(f.pvalue)}])],
+            ignore_index=True)
+    summary.insert(0, "component", label)
+    return summary, pd.concat(per, ignore_index=True)
+
+
+def epoch_subjects(ep) -> np.ndarray | None:
+    """Subject label of every epoch ("" when unknown), or None without a subject column."""
+    if ep.metadata is None or "subject" not in ep.metadata:
+        return None
+    return np.array(["" if v is None or (isinstance(v, float) and np.isnan(v)) else str(v)
+                     for v in ep.metadata["subject"]], dtype=object)
+
+
+def subjects_in(groups: dict) -> list[str]:
+    """Subjects with at least one epoch in any group (sorted)."""
+    keys = [epoch_subjects(ep) for ep in groups.values()]
+    return sorted({s for k in keys if k is not None for s in k} - {""})
+
+
+def grand_average(evokeds: list) -> mne.Evoked:
+    """Average of averages: every subject weighs the same, whatever its epoch count."""
+    return evokeds[0].copy() if len(evokeds) == 1 else \
+        mne.grand_average(list(evokeds), interpolate_bads=False, drop_bads=False)
+
+
+def group_component_analysis(groups: dict, comp: Component) -> dict:
+    """ERP component across subjects (ERP guide): one Evoked per subject and group (the
+    subject's epochs averaged), then their grand average with equal weights; subjects
+    are the observations.
+
+    * ``summary``: per group the subjects' window means (mean ± SEM, 95 % CI) and the
+      grand average's peak, then the test. Two groups: paired t-test on the subjects
+      that have both (= their difference waves against 0), Wilcoxon and Cohen's d_z;
+      without shared subjects Welch t on the subject means. More: repeated-measures
+      ANOVA and Friedman test on the subjects that have every group.
+    * ``subjects``: one row per subject and group; ``subject_tests``: within each subject,
+      the epoch-level test between the groups.
+    * ``evokeds`` / ``grand`` / ``diffs`` / ``grand_diff``."""
+    chans, m, label = component_window(groups, comp)
+    keys = {g: epoch_subjects(ep) for g, ep in groups.items()}
+    evs, rows = {}, []
+    for g, ep in groups.items():
+        evs[g] = {}
+        for s in (sorted(set(keys[g]) - {""}) if keys[g] is not None else []):
+            ev = evs[g][s] = ep[np.flatnonzero(keys[g] == s)].average()
+            ev.comment = f"{g} · sub-{s}"
+            pa, pl = peak(ev, chans, comp)
+            rows.append({"subject": s, "group": g, "epochs": ev.nave,
+                         "window mean µV": float((ev.get_data(picks=chans).mean(0) * 1e6)[m].mean()),
                          "peak µV": pa, "peak latency ms": pl})
     subjects = pd.DataFrame(rows)
+    vals = {g: {s: w for s, w in zip(subjects.loc[subjects.group == g, "subject"],
+                                     subjects.loc[subjects.group == g, "window mean µV"])}
+            for g in evs} if len(subjects) else {g: {} for g in evs}
     grand = {g: grand_average(list(by_s.values())) for g, by_s in evs.items() if by_s}
     for g, ev in grand.items():
         ev.comment = f"{g} (grand average)"
-
     summary = []
     for g, v in vals.items():
-        x = np.array(list(v.values()))
-        n = len(x)
+        x, n = np.array(list(v.values())), len(v)
         sem = float(x.std(ddof=1) / np.sqrt(n)) if n > 1 else np.nan
-        ci = float(scipy_stats.t.ppf(0.975, n - 1) * sem) if n > 1 else np.nan
-        pa, pl = _peak(grand[g], chans, comp) if g in grand else (np.nan, np.nan)
-        summary.append({"group": g, "subjects": n, "epochs": int(sum(
-            e.nave for e in evs[g].values())), "window mean µV": float(x.mean()) if n
-            else np.nan, "sem": sem, "95% CI ±": ci, "grand-average peak µV": pa,
-            "grand-average peak latency ms": pl})
-    labels = list(vals)
-    diffs, grand_diff = {}, None
+        pa, pl = peak(grand[g], chans, comp) if g in grand else (np.nan, np.nan)
+        summary.append({"group": g, "subjects": n, "epochs": int(sum(e.nave for e in evs[g].values())),
+                        "window mean µV": float(x.mean()) if n else np.nan, "sem": sem,
+                        "95% CI ±": float(scipy_stats.t.ppf(0.975, n - 1) * sem) if n > 1 else np.nan,
+                        "grand-average peak µV": pa, "grand-average peak latency ms": pl})
+    labels, diffs, grand_diff = list(vals), {}, None
     if len(labels) == 2:
         ga, gb = labels
         both = sorted(set(vals[ga]) & set(vals[gb]))
         row = {"group": f"{ga} − {gb}"}
         if len(both) >= 2:
-            a = np.array([vals[ga][s] for s in both])
-            b = np.array([vals[gb][s] for s in both])
-            d = a - b
-            t = scipy_stats.ttest_rel(a, b)
+            a, b = np.array([vals[ga][s] for s in both]), np.array([vals[gb][s] for s in both])
+            d, t = a - b, scipy_stats.ttest_rel(a, b)
+            sd = d.std(ddof=1)
             try:
                 wp = float(scipy_stats.wilcoxon(a, b).pvalue)
             except ValueError:
                 wp = np.nan
-            sd = d.std(ddof=1)
             row.update({"subjects": len(both), "window mean µV": float(d.mean()),
                         "sem": float(sd / np.sqrt(len(d))),
                         "95% CI ±": float(scipy_stats.t.ppf(0.975, len(d) - 1) * sd / np.sqrt(len(d))),
@@ -2583,104 +2484,82 @@ def group_component_analysis(groups: dict[str, mne.BaseEpochs], comp: "Component
             a, b = np.array(list(vals[ga].values())), np.array(list(vals[gb].values()))
             if min(len(a), len(b)) >= 2:
                 t = scipy_stats.ttest_ind(a, b, equal_var=False)
-                row.update({"subjects": len(a) + len(b), "window mean µV":
-                            float(a.mean() - b.mean()), "test": "Welch t (subject means, "
-                            "independent groups)", "t": float(t.statistic), "df": float(t.df),
-                            "p": float(t.pvalue), "p (Mann-Whitney)": float(
-                                scipy_stats.mannwhitneyu(a, b).pvalue), "hedges g": hedges_g(a, b)})
+                row.update({"subjects": len(a) + len(b), "window mean µV": float(a.mean() - b.mean()),
+                            "test": "Welch t (subject means, independent groups)",
+                            "t": float(t.statistic), "df": float(t.df), "p": float(t.pvalue),
+                            "p (Mann-Whitney)": float(scipy_stats.mannwhitneyu(a, b).pvalue),
+                            "hedges g": hedges_g(a, b)})
         summary.append(row)
         for s in both:
-            dv = mne.combine_evoked([evs[ga][s], evs[gb][s]], weights=[1, -1])
-            dv.comment = f"{ga} − {gb} · sub-{s}"
-            diffs[s] = dv
+            diffs[s] = mne.combine_evoked([evs[ga][s], evs[gb][s]], weights=[1, -1])
+            diffs[s].comment = f"{ga} − {gb} · sub-{s}"
         if diffs:
             grand_diff = grand_average(list(diffs.values()))
             grand_diff.comment = f"{ga} − {gb}"
     elif len(labels) > 2:
         common = sorted(set.intersection(*[set(v) for v in vals.values()]))
         if len(common) >= 2:
-            y = np.array([[vals[g][s] for g in labels] for s in common])
             from mne.stats import f_mway_rm
+            y = np.array([[vals[g][s] for g in labels] for s in common])
             fv, pv = f_mway_rm(y[:, :, None], [len(labels)], effects="A", correction=False)
-            f, p = float(fv[0]), float(pv[0])
-            d1, d2 = float(len(labels) - 1), float((len(labels) - 1) * (len(common) - 1))
-            fr = scipy_stats.friedmanchisquare(*y.T)
             summary.append({"group": "all groups", "subjects": len(common),
-                            "test": "repeated-measures ANOVA", "F": f, "df": d1, "df2": d2,
-                            "p": p, "p (Friedman)": float(fr.pvalue)})
-
+                            "test": "repeated-measures ANOVA", "F": float(np.ravel(fv)[0]),
+                            "df": float(len(labels) - 1),
+                            "df2": float((len(labels) - 1) * (len(common) - 1)), "p": float(np.ravel(pv)[0]),
+                            "p (Friedman)": float(scipy_stats.friedmanchisquare(*y.T).pvalue)})
     tests = []
-    keys = {g: epoch_subjects(ep) for g, ep in groups.items()}
     for s in subjects_in(groups):
         sub = {g: ep[np.flatnonzero(keys[g] == s)] for g, ep in groups.items()
                if keys[g] is not None and (keys[g] == s).sum() >= 2}
-        if len(sub) < 2:
-            continue
-        r = compare_groups({g: ep.get_data(picks=chans).mean(1)[:, m].mean(1) * 1e6
-                        for g, ep in sub.items()})
-        tests.append({"subject": s, **{f"n {g}": len(ep) for g, ep in sub.items()},
-                      "test (epochs)": r["test"], "statistic": r["stat"], "p": r["p"],
-                      "effect (hedges g)": r["effect"], "p (non-parametric)": r["p_np"]})
+        if len(sub) >= 2:
+            r = compare_groups({g: ep.get_data(picks=chans).mean(1)[:, m].mean(1) * 1e6
+                                for g, ep in sub.items()})
+            tests.append({"subject": s, **{f"n {g}": len(ep) for g, ep in sub.items()},
+                          "test (epochs)": r["test"], "statistic": r["stat"], "p": r["p"],
+                          "effect (hedges g)": r["effect"], "p (non-parametric)": r["p_np"]})
     subject_tests = pd.DataFrame(tests)
     if len(subject_tests):
         subject_tests["q (FDR)"] = fdr(subject_tests["p"].to_numpy())
     summary = pd.DataFrame(summary)
-    summary.insert(0, "component", f"{comp.name} {comp.tmin * 1000:.0f}–{comp.tmax * 1000:.0f} "
-                   f"ms {'+' if comp.polarity > 0 else '−'} @ {'+'.join(chans)}")
+    summary.insert(0, "component", label)
     return dict(summary=summary, subjects=subjects, subject_tests=subject_tests,
                 evokeds=evs, grand=grand, diffs=diffs, grand_diff=grand_diff, channels=chans)
 
 
-def group_cluster_test(diffs: list[mne.Evoked], tfce: bool = False,
-                       n_permutations: int = 5000, seed: int = 42, alpha: float = 0.05,
-                       tmin: float | None = None, tmax: float | None = None) -> dict:
-    """Across-subject mass-univariate test of difference waves against 0 (ERP guide):
-    ``spatio_temporal_cluster_1samp_test`` with the channels' adjacency, cluster-forming
-    threshold from the t distribution or TFCE (``threshold=dict(start=0, step=0.2)``).
-
-    Returns t values and the significance mask (times × channels), one row per
-    significant cluster (time span, channels, p) and the settings."""
+def group_cluster_test(diffs: list, tfce=False, n_permutations=5000, seed=42, alpha=0.05,
+                       tmin=None, tmax=None) -> dict:
+    """Across-subject test of the difference waves against 0 (ERP guide):
+    ``spatio_temporal_cluster_1samp_test`` with the channels' adjacency, clusters formed
+    from the t distribution or with TFCE (``threshold=dict(start=0, step=0.2)``).
+    Returns t values, the significance mask (times × channels), one row per significant
+    cluster (time span, channels, p) and the settings."""
     from mne.stats import spatio_temporal_cluster_1samp_test
     if len(diffs) < 3:
         raise ValueError("The cluster test needs at least 3 subjects with both groups")
     ev0 = diffs[0].copy().pick("eeg")
     if tmin is not None or tmax is not None:
         ev0.crop(tmin, tmax)
-    chans = ev0.ch_names
-    x = np.array([d.copy().pick(chans).crop(ev0.times[0], ev0.times[-1]).data.T
-                  for d in diffs])                       # subjects × times × channels
-    adjacency, _ = mne.channels.find_ch_adjacency(ev0.info, ch_type="eeg")
-    kw = dict(threshold=dict(start=0, step=0.2)) if tfce else {}
+    chans, times = ev0.ch_names, ev0.times
+    x = np.array([d.copy().pick(chans).crop(times[0], times[-1]).data.T for d in diffs])
     t_obs, clusters, pv, _ = spatio_temporal_cluster_1samp_test(
-        x, adjacency=adjacency, n_permutations=int(n_permutations), out_type="mask",
-        seed=seed, n_jobs=1, **kw)
-    mask = np.zeros(t_obs.shape, bool)
-    rows = []
+        x, adjacency=mne.channels.find_ch_adjacency(ev0.info, ch_type="eeg")[0],
+        n_permutations=int(n_permutations), out_type="mask", seed=seed, n_jobs=1,
+        **(dict(threshold=dict(start=0, step=0.2)) if tfce else {}))
+
+    def row(name, m, p, **extra):
+        ti, ci = np.nonzero(m)
+        return {"cluster": name, "from ms": times[ti.min()] * 1000, "to ms": times[ti.max()] * 1000,
+                **extra, "channels": ", ".join(sorted({chans[c] for c in ci})), "p": p}
     if tfce:
         mask = pv.reshape(t_obs.shape) < alpha
-        if mask.any():
-            ti, ci = np.nonzero(mask)
-            rows.append({"cluster": "TFCE", "from ms": ev0.times[ti.min()] * 1000,
-                         "to ms": ev0.times[ti.max()] * 1000,
-                         "channels": ", ".join(sorted({chans[c] for c in ci})),
-                         "p": float(pv.min())})
+        rows = [row("TFCE", mask, float(pv.min()))] if mask.any() else []
     else:
-        for k in np.flatnonzero(pv < alpha):
-            m = clusters[k]
-            mask |= m
-            ti, ci = np.nonzero(m)
-            rows.append({"cluster": int(k), "from ms": ev0.times[ti.min()] * 1000,
-                         "to ms": ev0.times[ti.max()] * 1000,
-                         "sign": "+" if t_obs[m].mean() > 0 else "−",
-                         "channels": ", ".join(sorted({chans[c] for c in ci})),
-                         "p": float(pv[k])})
-    return dict(t_obs=t_obs, mask=mask, table=pd.DataFrame(rows), times=ev0.times,
-                channels=chans, n_subjects=len(diffs), tfce=tfce,
-                n_permutations=int(n_permutations))
-
-
-#: Mastoid-like channel pairs, in order of preference (10-05 names)
-MASTOID_PAIRS = (("M1", "M2"), ("TP9", "TP10"), ("A1", "A2"), ("P9", "P10"))
+        sig = np.flatnonzero(pv < alpha)
+        mask = np.any([clusters[k] for k in sig], axis=0) if len(sig) else np.zeros(t_obs.shape, bool)
+        rows = [row(int(k), clusters[k], float(pv[k]),
+                    sign="+" if t_obs[clusters[k]].mean() > 0 else "−") for k in sig]
+    return dict(t_obs=t_obs, mask=mask, table=pd.DataFrame(rows), times=times, channels=chans,
+                n_subjects=len(diffs), tfce=tfce, n_permutations=int(n_permutations))
 
 
 #: Reference chosen with each ERP component: the average reference for posterior
@@ -2690,38 +2569,26 @@ COMPONENT_REFERENCE = {
     "N2": "mastoids", "MMN": "mastoids", "P300": "mastoids", "N400": "mastoids",
     "LPP": "mastoids",
 }
+#: Mastoid-like channel pairs, in order of preference (10-05 names)
+MASTOID_PAIRS = (("M1", "M2"), ("TP9", "TP10"), ("A1", "A2"), ("P9", "P10"))
 
 
-def mastoid_channels(ch_names: list[str]) -> list[str] | None:
-    """The first mastoid-like pair present (M1/M2, TP9/TP10, A1/A2, P9/P10)."""
-    lower = {c.lower(): c for c in ch_names}
-    for a, b in MASTOID_PAIRS:
-        if a.lower() in lower and b.lower() in lower:
-            return [lower[a.lower()], lower[b.lower()]]
-    return None
-
-
-def resolve_erp_reference(spec: str, ch_names: list[str]
-                          ) -> tuple[str | list[str] | None, str]:
-    """Turn a reference choice into what ``set_eeg_reference`` needs, plus a label.
-
-    ``spec``: "recorded", "average", "mastoids", or channel name(s) "Cz" / "M1, M2".
-    The data are the epochs' (good) channels, so a bad mastoid is simply not found.
-    Without a mastoid pair the data stay as recorded (said in the label).
-    """
-    low = (spec or "").strip().lower()
+def resolve_erp_reference(spec: str, ch_names: list[str]):
+    """A reference choice ("recorded", "average", "mastoids" or channel names "Cz" /
+    "M1, M2") as what ``set_eeg_reference`` needs, plus a label. The channels are the
+    epochs' good ones; without a mastoid pair the data stay as recorded."""
+    low, lower = (spec or "").strip().lower(), {c.lower(): c for c in ch_names}
     if low in ("recorded", "keep", "as recorded", ""):
         return None, "as recorded"
     if low in ("average", "avg", "car"):
         return "average", "average reference"
     if low == "mastoids":
-        pair = mastoid_channels(ch_names)
-        if pair is None:  # keep the recorded reference rather than switch scheme
-            return None, ("as recorded — no good mastoid pair (M1/M2, TP9/TP10, A1/A2, "
-                          "P9/P10) among the channels")
-        return pair, f"mean of {'+'.join(pair)}"
+        pair = next(([lower[a.lower()], lower[b.lower()]] for a, b in MASTOID_PAIRS
+                     if a.lower() in lower and b.lower() in lower), None)
+        return (pair, f"mean of {'+'.join(pair)}") if pair else (
+            None, "as recorded — no good mastoid pair (M1/M2, TP9/TP10, A1/A2, P9/P10) "
+                  "among the channels")
     names = [n for n in spec.replace(";", ",").replace(",", " ").split() if n]
-    lower = {c.lower(): c for c in ch_names}
     missing = [n for n in names if n.lower() not in lower]
     if missing:
         raise ValueError(f"Reference channel(s) not among the epochs' channels (bad, or "
@@ -2730,13 +2597,9 @@ def resolve_erp_reference(spec: str, ch_names: list[str]
     return chans, f"mean of {'+'.join(chans)}" if len(chans) > 1 else chans[0]
 
 
-def reference_epochs(epochs: mne.BaseEpochs, ref) -> mne.BaseEpochs:
+def reference_epochs(epochs, ref):
     """A re-referenced copy (``ref`` from :func:`resolve_erp_reference`)."""
-    if ref is None:
-        return epochs
-    out = epochs.copy()
-    out.set_eeg_reference(ref, projection=False)
-    return out
+    return epochs if ref is None else epochs.copy().set_eeg_reference(ref, projection=False)
 
 
 # =========================================================================== statistics

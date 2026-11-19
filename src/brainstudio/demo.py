@@ -16,7 +16,7 @@ from pathlib import Path
 import mne
 import numpy as np
 
-from .core import set_standard_montage
+from .core import standard_montage
 
 SCREEN = (1920, 1080)
 CH_NAMES = ["Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8", "FC5", "FC1", "FC2", "FC6",
@@ -145,7 +145,7 @@ def make_raw(sim: SimData) -> mne.io.RawArray:
     info["line_freq"] = 50
     raw = mne.io.RawArray(sim.eeg, info, verbose="error")
     raw.set_meas_date(1_700_000_000)
-    set_standard_montage(raw)
+    standard_montage(raw)
     on = [t for t, _ in sim.markers]
     raw.set_annotations(mne.Annotations(on, [0.0] * len(on), [d for _, d in sim.markers],
                                         orig_time=raw.info["meas_date"]))
