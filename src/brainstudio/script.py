@@ -132,12 +132,14 @@ def _xdf_reader(streams: list[dict], screen) -> tuple[list[str], dict]:
          '    the first EEG sample."""',
          "    streams = {s['info']['name'][0]: s for s in "
          "pyxdf.load_xdf(path, dejitter_timestamps=False)[0]}"]
-    used = {"pyxdf"}
+    used = {"pyxdf", "ndimage"}
     if eeg is not None:
         L += ["",
               f"    eeg = streams[{eeg['name']!r}]",
-              "    t0 = eeg['time_stamps'][0]",
-              "    sfreq = (len(eeg['time_stamps']) - 1) / (eeg['time_stamps'][-1] - t0)",
+              "    # start and rate from a straight line through the (jittered) timestamps",
+              "    step, t0 = np.polyfit(np.arange(len(eeg['time_stamps'])), "
+              "eeg['time_stamps'], 1)",
+              "    sfreq = 1 / step",
               "    info = mne.create_info(CHANNELS, sfreq, CHANNEL_TYPES)",
               "    raw = mne.io.RawArray(np.asarray(eeg['time_series'], float).T "
               "* 1e-6, info)  # µV → V"]
@@ -147,12 +149,25 @@ def _xdf_reader(streams: list[dict], screen) -> tuple[list[str], dict]:
           "    def lsl_time(s):",
           '        """Timestamps on the EEG clock. Some trackers (e.g. Gazepoint) stamp',
           "        samples with their own clock and only a few with the LSL clock: the",
-          '        difference between the two gives the offset."""',
-          "        ts = s['time_stamps']",
+          "        difference between the two gives the offset. Regularly sampled streams",
+          "        get their jitter removed while following any drift: a straight line plus",
+          '        its 5 s trend."""',
+          "        ts = s['time_stamps'].copy()",
           "        own = np.abs(ts - np.median(ts)) < 1e4",
-          "        if (~own).any() and own.any():",
-          "            i = np.flatnonzero(own)",
-          "            ts = ts + np.median(ts[~own] - np.interp(np.flatnonzero(~own), i, ts[i]))",
+          "        if (~own).any() and own.any():  # runs of samples on the other clock",
+          "            j = np.flatnonzero(~own)",
+          "            runs = np.split(j, np.flatnonzero(np.diff(j) > 1) + 1)",
+          "            ts = ts + np.median([(ts[r[0]] + ts[r[-1]] - ts[r[0] - 1] - "
+          "ts[r[-1] + 1]) / 2 for r in runs])",
+          "        if float(s['info']['nominal_srate'][0]) > 0 and own.sum() > 2:",
+          "            t = ts[own]",
+          "            k = np.arange(len(t))",
+          "            slope, start = np.polyfit(k, t, 1)",
+          "            line = start + slope * k",
+          "            trend = uniform_filter1d(t - line, max(3, round(5 / slope)), "
+          "mode='nearest')",
+          "            ts[own] = np.maximum.accumulate(line + trend) "
+          "if np.abs(trend).max() > max(0.01, 2 * slope) else line",
           "        return ts - t0, own",
           "",
           "    rows = []"]
@@ -195,8 +210,13 @@ def _xdf_reader(streams: list[dict], screen) -> tuple[list[str], dict]:
         if pick["pupil"]:
             L += [f"    gaze['pupil'] = s[{pick['pupil'][0]!r}].where(~lost & "
                   f"(s[{pick['pupil'][0]!r}] > 0))"]
+        w, h = screen
         L += ["    if gaze[['x', 'y']].abs().quantile(0.95).max() <= 1.5:  # 0–1 → px",
-              f"        gaze[['x', 'y']] *= {list(screen)!r}"]
+              f"        gaze[['x', 'y']] *= {list(screen)!r}",
+              "    # samples far outside the screen are tracker glitches",
+              f"    off = ~gaze['x'].between({-0.5 * w:g}, {1.5 * w:g}) | "
+              f"~gaze['y'].between({-0.5 * h:g}, {1.5 * h:g})",
+              "    gaze.loc[off, ['x', 'y']] = np.nan"]
     else:
         L += ["    gaze = None"]
     L += ["    return raw, events, gaze"]
@@ -215,7 +235,7 @@ def _loading(recipe: dict) -> tuple[list[str], set]:
     rec_info = first.get("recording", {})
     if k in ("load", "load_many") and str(first.get("path", first.get("paths", [""])[0])) \
             .lower().endswith((".xdf", ".xdfz")):
-        imports.add("pyxdf")
+        imports |= {"pyxdf", "ndimage"}
         what = ("Reads the XDF file with pyxdf: the EEG stream becomes an MNE Raw, marker "
                 "streams become events and the gaze stream a table in screen pixels, all in "
                 "seconds from the first EEG sample." if k == "load" else
@@ -359,7 +379,7 @@ def _gaze_events(recipe: dict) -> tuple[list[str], set]:
     key = G.preset_name(p)
     L = ["", "# fixations (I-DT), saccades (Engbert & Kliegl) and blinks with pymovements",
          *(_c(f"Preset: {G.PRESETS[key][0]}.") if key else []),
-         "sf = 1 / np.median(np.diff(gaze['t']))",
+         "sf = 1 / np.polyfit(np.arange(len(gaze)), gaze['t'], 1)[0]  # sampling rate",
          "n = lambda seconds, least=1: max(int(round(seconds * sf)), least)  # → samples",
          "xy = gaze[['x', 'y']].to_numpy().T",
          "pg = pm.gaze.from_numpy(time=np.arange(len(gaze)), time_unit='ms', pixel=xy, "
@@ -567,10 +587,11 @@ def _erp(spec, extra) -> tuple[list[str], set]:
               "evokeds.items()}",
               "",
               "# each subject's mean amplitude in the window (µV)",
-              "means = pd.DataFrame({label: {s: ev.copy().pick(ROI).crop(*WINDOW).data.mean() "
-              "* 1e6",
-              "                              for s, ev in v.items()} for label, v in "
-              "evokeds.items()})",
+              "def window_mean(ev):",
+              "    in_window = (ev.times >= WINDOW[0]) & (ev.times <= WINDOW[1])",
+              "    return ev.get_data(picks=ROI)[:, in_window].mean() * 1e6",
+              "means = pd.DataFrame({label: {s: window_mean(ev) for s, ev in v.items()}",
+              "                      for label, v in evokeds.items()})",
               "print(means)"]
         if b:
             L += [f"print(stats.ttest_rel(means[{a!r}], means[{b!r}], nan_policy='omit'))"]
@@ -579,8 +600,9 @@ def _erp(spec, extra) -> tuple[list[str], set]:
               "                             picks=ROI, combine='mean')"]
     else:
         L += ["grand = {label: ep.average() for label, ep in erp.items()}",
-              "trials = {label: ep.copy().pick(ROI).crop(*WINDOW).get_data().mean(axis=(1, 2)) "
-              "* 1e6",
+              "in_window = (erp[" + repr(groups[0]) + "].times >= WINDOW[0]) & "
+              "(erp[" + repr(groups[0]) + "].times <= WINDOW[1])",
+              "trials = {label: ep.get_data(picks=ROI)[:, :, in_window].mean(axis=(1, 2)) * 1e6",
               "          for label, ep in erp.items()}",
               "print({label: round(v.mean(), 2) for label, v in trials.items()})"]
         if b:
@@ -734,10 +756,11 @@ _IMPORT = {"mne": "import mne", "numpy": "import numpy as np", "pandas": "import
            "pyxdf": "import pyxdf", "json": "import json", "warnings": "import warnings",
            "mne_bids": "from mne_bids import get_bids_path_from_fname, read_raw_bids",
            "pymovements": "import pymovements as pm", "polars": "import polars as pl",
-           "autoreject": "from autoreject import AutoReject", "scipy": "from scipy import stats"}
+           "autoreject": "from autoreject import AutoReject", "scipy": "from scipy import stats",
+           "ndimage": "from scipy.ndimage import uniform_filter1d"}
 _PIP = {"mne": "mne", "numpy": "numpy", "pandas": "pandas", "pyxdf": "pyxdf",
         "mne_bids": "mne-bids", "pymovements": "pymovements", "polars": "polars",
-        "autoreject": "autoreject", "scipy": "scipy"}
+        "autoreject": "autoreject", "scipy": "scipy", "ndimage": "scipy"}
 
 
 def build_script(kind: str, recipe: dict, spec, extra=None, version: str = "") -> str:
@@ -768,7 +791,7 @@ def build_script(kind: str, recipe: dict, spec, extra=None, version: str = "") -
     else:
         pip_extra = []
     order = ["json", "warnings", "mne", "numpy", "pandas", "polars", "pymovements", "pyxdf", "autoreject",
-             "mne_bids", "scipy"]
+             "mne_bids", "scipy", "ndimage"]
     std = [_IMPORT[m] for m in order if m in imports and m in ("json", "warnings")]
     third = [_IMPORT[m] for m in order if m in imports and m not in ("json", "warnings")]
     pip = " ".join(sorted({_PIP[m] for m in imports if m in _PIP} | set(pip_extra)))

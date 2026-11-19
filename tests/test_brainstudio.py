@@ -748,7 +748,7 @@ def test_script_literals_are_exact_python():
 
 def test_exported_script_repeats_the_erp(tmp_path):
     """The short exported ERP script (standard libraries only, no brAInStudio) builds the
-    same epochs and per-subject ERP values as the app, within 0.3 µV."""
+    same epochs and per-subject ERP values as the app."""
     import runpy
     import sys
 
@@ -803,7 +803,7 @@ def test_exported_script_repeats_the_erp(tmp_path):
     assert {k: len(v) for k, v in g["epochs"].items()} == {k: len(v) for k, v in epochs.items()}
     app = res["group"]["subjects"].pivot(index="subject", columns="group",
                                          values="window mean µV")
-    assert np.allclose(g["means"].loc[app.index, app.columns], app, atol=0.3)
+    assert np.allclose(g["means"].loc[app.index, app.columns], app, rtol=0, atol=1e-9)
 
 
 def test_text_files_are_read_and_written_as_utf8():

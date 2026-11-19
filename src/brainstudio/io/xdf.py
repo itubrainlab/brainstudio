@@ -337,7 +337,9 @@ def _raw_from_stream(stream: dict, ts: np.ndarray, idx: np.ndarray, srate: float
                   _type=custom_types[k]) for k in sel]
     # Resample onto a regular grid starting at t0 so that jitter/dropouts do
     # not accumulate drift.
-    grid = t0 + np.arange(int(np.floor((ts[-1] - t0) * srate)) + 1) / srate
+    # round, not floor: (n − 1) × step × rate can come out as n − 1 − 1e-9, which would
+    # drop the last sample and resample the whole recording for nothing
+    grid = t0 + np.arange(int(np.round((ts[-1] - t0) * srate)) + 1) / srate
     if len(grid) != len(ts) or np.abs(ts - grid).max() > 0.5 / srate:
         data = np.vstack([np.interp(grid, ts, ch) for ch in data])
     names, types, scales = [], [], []

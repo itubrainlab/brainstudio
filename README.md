@@ -475,13 +475,18 @@ How groups are compared:
   channels, filters, the ICA fit and the components removed, event groups, epoch
   window, rejection, reference, baseline, bands and windows. Each cell opens with a
   one-paragraph explanation. Only the steps that apply are written.
-- **Close to the app, not identical**: the app's loader handles more edge cases (for
-  XDF, it smooths timestamp jitter and corrects drift; the script uses the raw
-  timestamps and recovers clock offsets in a few lines), and the script leaves out
-  some app-only extras (phase inheritance in the event table, the epoch rejection
-  report, peak tables). On the synthetic 3-subject dataset the script gives the app's
-  epochs, per-subject ERP values within 0.1 µV, and identical band power and indices;
-  a test checks this.
+- **Same results as the app**: the few lines of loading that matter for timing (EEG
+  start and rate from a line fit, the Gazepoint clock offset, smoothing the gaze
+  timestamps while following drift) do what the app does. On the synthetic 3-subject
+  dataset and on a 47-min, 64-channel XDF with Gazepoint gaze, the script gives the
+  app's preprocessed data and ICA bit for bit, the same epochs, ERP values, band power
+  and indices; a test checks the ERP values with brAInStudio blocked. The script leaves
+  out app-only extras (phase inheritance in the event table, the epoch rejection
+  report, peak tables).
+- **AutoReject is sensitive**: on the 47-min recording, moving a few fixation onsets by
+  0.14 ms (one EEG sample for some epochs) changed the epochs it keeps from 2,788 to
+  4,859, because it learns its thresholds from a random 600 of them. Treat its result
+  on such data with care.
 - It uses the settings the results on screen were computed with; if the results mix
   epochs with newer preprocessing or events, the export asks you to compute again.
 
