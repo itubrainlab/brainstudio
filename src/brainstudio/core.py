@@ -229,8 +229,7 @@ def eeg_from_stream(s: dict, ts, idx, srate: float, t0: float, opts=None) -> mne
         labels.append(name)
     scale = [UNIT_SCALE.get(str(chans[k].get("unit", "")).lower(), 1e-6) for k in sel]
     raw = mne.io.RawArray(data * np.asarray(scale)[:, None],
-                          mne.create_info(labels, srate, [types[k] for k in sel]),
-                          verbose="error")
+                          mne.create_info(labels, srate, [types[k] for k in sel]))
     standard_montage(raw)
     return raw
 
@@ -572,7 +571,7 @@ def standard_montage(raw) -> None:
     name = "colin27_1005" if "colin27_1005" in mne.channels.get_builtin_montages() \
         else "standard_1005"
     try:
-        raw.set_montage(name, on_missing="ignore", match_case=False, verbose="error")
+        raw.set_montage(name, on_missing="ignore", match_case=False)
     except Exception:  # noqa: BLE001  (e.g. duplicate positions)
         pass
 
@@ -593,7 +592,7 @@ def type_channels_by_name(raw) -> dict:
     changed = {c: guess_channel_type(c) for c, t in zip(raw.ch_names, raw.get_channel_types())
                if t == "eeg" and guess_channel_type(c) != "eeg"}
     if changed:
-        raw.set_channel_types(changed, verbose="error")
+        raw.set_channel_types(changed)
     return changed
 
 
@@ -621,9 +620,9 @@ def read_file(path, screen=(1920, 1080)):
     """EEG (and any eye-tracking channels) of a file MNE reads, or an EyeLink .asc."""
     path = Path(path)
     if path.name.lower().endswith(".asc"):
-        raw = mne.io.read_raw_eyelink(path, verbose="error")
+        raw = mne.io.read_raw_eyelink(path)
         return None, annotations_table(raw), gaze_from_raw(raw, screen, drop=False), {}
-    raw = mne.io.read_raw(path, preload=True, verbose="error")
+    raw = mne.io.read_raw(path, preload=True)
     return raw, pd.DataFrame(columns=["onset", "duration", "description"]), \
         gaze_from_raw(raw, screen), {}
 
@@ -767,9 +766,9 @@ def read_bids_run(root, run, screen=None):
                                          session=e.get("session"), task=e.get("task"),
                                          acquisition=e.get("acquisition"), run=e.get("run"),
                                          datatype=run.eeg.parent.name, suffix="eeg",
-                                         extension=run.eeg.suffix), verbose="error")
+                                         extension=run.eeg.suffix))
         except Exception:  # noqa: BLE001  broken sidecars: plain MNE + channels.tsv
-            raw = mne.io.read_raw(run.eeg, verbose="error")
+            raw = mne.io.read_raw(run.eeg)
             ch = channels_tsv(run.eeg)
             to_mne = {"EEG": "eeg", "EOG": "eog", "ECG": "ecg", "EMG": "emg", "MISC": "misc",
                       "TRIG": "stim", "STIM": "stim", "RESP": "resp", "GSR": "gsr",
@@ -777,14 +776,14 @@ def read_bids_run(root, run, screen=None):
             types = {r.name: to_mne[r.type.upper()] for r in ch.itertuples()
                      if r.name in raw.ch_names and r.type.upper() in to_mne}
             if types:
-                raw.set_channel_types(types, on_unit_change="ignore", verbose="error")
+                raw.set_channel_types(types, on_unit_change="ignore")
             raw.info["bads"] = [r.name for r in ch.itertuples()
                                 if r.status.lower() == "bad" and r.name in raw.ch_names]
             pl = sidecar(run.eeg).get("PowerLineFrequency")
             if isinstance(pl, (int, float)):
                 with raw.info._unlock():
                     raw.info["line_freq"] = float(pl)
-        raw.load_data(verbose="error")
+        raw.load_data()
         eeg_meta = sidecar(run.eeg)
         ev_file = bids_file(run.eeg, "events.tsv")
         if ev_file is not None and len(tsv := bids_events(ev_file)):
@@ -969,15 +968,15 @@ def join(parts: list[tuple]) -> tuple:
                     notes.append(f"rates aligned to {sf:.4f} Hz (< 0.1 % apart)")
             elif d:
                 notes.append(f"resampled {r.info['sfreq']:g} → {sf:g} Hz")
-                r.resample(sf, verbose="error")
+                r.resample(sf)
             r.set_channel_types({c: types[c] for c, k in zip(r.ch_names, r.get_channel_types())
-                                 if types[c] != k}, verbose="error")
+                                 if types[c] != k})
             starts.append(t)
             t += r.n_times / sf
             ready.append(r)
-        raw = mne.concatenate_raws(ready, verbose="error")
+        raw = mne.concatenate_raws(ready)
         if raws[0].get_montage() is not None:
-            raw.set_montage(raws[0].get_montage(), on_missing="ignore", verbose="error")
+            raw.set_montage(raws[0].get_montage(), on_missing="ignore")
     else:
         for p in parts:
             starts.append(t)
@@ -1592,75 +1591,6 @@ def parse_reference(ref, raw: mne.io.BaseRaw):
     return out
 
 
-def epochs_from_table(raw: mne.io.BaseRaw, table, tmin: float = -0.2, tmax: float = 0.8,
-                      baseline=(None, 0), reject_uv: float | None = None,
-                      picks="eeg") -> mne.Epochs:
-    """MNE Epochs locked to the rows of an event table, with the table as metadata.
-
-    Event IDs are the table's ``name`` column, so standard MNE selection works:
-    ``epochs["fixation"]``, ``epochs['cond == "AI"']`` (metadata query), etc.
-    Rows outside the recording, or falling on an already used sample, are
-    dropped.
-    """
-    tab = table.reset_index(drop=True).copy()
-    sf = raw.info["sfreq"]
-    samples = np.round(tab["onset"].to_numpy(float) * sf).astype(int) + raw.first_samp
-    lo = raw.first_samp + int(np.ceil(-tmin * sf))
-    hi = raw.last_samp - int(np.ceil(tmax * sf))
-    ok = (samples >= lo) & (samples <= hi)
-    counts = {"outside recording": int((~ok).sum())}
-    tab, samples = tab[ok], samples[ok]
-    _, first = np.unique(samples, return_index=True)  # MNE needs unique samples
-    keep = np.sort(first)
-    counts["same sample"] = len(tab) - len(keep)
-    tab, samples = tab.iloc[keep], samples[keep]
-    if not len(tab):
-        err = ValueError("No selected events fall inside the EEG recording")
-        err.counts = counts
-        raise err
-    names = sorted(tab["name"].astype(str).unique())
-    event_id = {n: i + 1 for i, n in enumerate(names)}
-    codes = tab["name"].astype(str).map(event_id).to_numpy()
-    events = np.column_stack([samples, np.zeros_like(samples), codes]).astype(int)
-    picks_idx = mne.pick_types(raw.info, eeg=True, exclude="bads") if picks == "eeg" else picks
-    if picks == "eeg" and not len(picks_idx):
-        picks_idx = eeg_picks(raw)
-    reject = dict(eeg=reject_uv * 1e-6) if reject_uv else None
-    meta = tab.reset_index(drop=True)
-    meta = meta.astype({c: object for c in meta.columns
-                        if isinstance(meta[c].dtype, pd.StringDtype)})
-    epochs = mne.Epochs(raw, events, event_id=event_id, tmin=tmin, tmax=tmax,
-                        baseline=baseline, picks=picks_idx, reject=reject, preload=True,
-                        metadata=meta, verbose="error")
-    epochs.selection_counts = counts  # events never epoched, by reason
-    return epochs
-
-
-def drop_reasons(epochs: mne.BaseEpochs) -> dict[str, int]:
-    """Dropped epochs by kind: amplitude (peak-to-peak or flat, named by channels) and
-    BAD annotation (overlaps a BAD_… span or a file boundary); anything else is other."""
-    out = {"amplitude": 0, "BAD annotation": 0, "other": 0}
-    chans = set(epochs.ch_names)
-    for reasons in epochs.drop_log:
-        if not reasons:
-            continue
-        if any(str(r).upper().startswith(("BAD", "EDGE")) for r in reasons):
-            out["BAD annotation"] += 1
-        elif any(r in chans for r in reasons):
-            out["amplitude"] += 1
-        elif reasons != ("IGNORED",):
-            out["other"] += 1
-    return out
-
-
-def rejection_causes(epochs: mne.BaseEpochs) -> dict[str, int]:
-    """How many epochs each channel caused to be rejected, worst first."""
-    counts: dict[str, int] = {}
-    for reasons in epochs.drop_log:
-        for r in reasons:
-            if r in epochs.ch_names:
-                counts[r] = counts.get(r, 0) + 1
-    return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
 
 
 # =========================================================================== preprocessing
@@ -2081,19 +2011,14 @@ class EpochSettings:
     delay_ms: float = 0.0             # EEG recording delay: + moves events later
 
     def describe(self) -> str:
-        s = f"{self.tmin:g} … {self.tmax:g} s"
-        if self.reject_uv:
-            s += f", reject ptp > {self.reject_uv:g} µV"
-        if self.flat_uv:
-            s += f", flat < {self.flat_uv:g} µV"
-        if self.autoreject:
-            s += ", AutoReject" + (f" (fitted on {self.autoreject_fraction:.0%})"
-                                   if self.autoreject_fraction < 1 else "")
-        if self.drop_blinks:
-            s += ", no blinks"
-        if self.delay_ms:
-            s += f", EEG delay {self.delay_ms:+g} ms"
-        return s
+        f = self.autoreject_fraction
+        return "".join([f"{self.tmin:g} … {self.tmax:g} s",
+                        f", reject ptp > {self.reject_uv:g} µV" if self.reject_uv else "",
+                        f", flat < {self.flat_uv:g} µV" if self.flat_uv else "",
+                        ", AutoReject" + (f" (fitted on {f:.0%})" if f < 1 else "")
+                        if self.autoreject else "",
+                        ", no blinks" if self.drop_blinks else "",
+                        f", EEG delay {self.delay_ms:+g} ms" if self.delay_ms else ""])
 
 
 def epochs_memory(raw, groups: dict, settings) -> float:
@@ -2101,75 +2026,94 @@ def epochs_memory(raw, groups: dict, settings) -> float:
     12× the epochs AutoReject is fitted on while it learns its thresholds."""
     n_ch = len(mne.pick_types(raw.info, eeg=True, exclude="bads")) or len(raw.ch_names)
     n_samp = int((settings.tmax - settings.tmin) * raw.info["sfreq"]) + 1
-    n_ev = sum(len(t) for t in groups.values())
-    data = float(n_ev) * n_ch * n_samp * 8
+    data = float(sum(len(t) for t in groups.values())) * n_ch * n_samp * 8
     if getattr(settings, "autoreject", False):
         data *= 1 + AUTOREJECT_MEMORY_FACTOR * settings.autoreject_fraction
     return data
 
 
-def overlaps(onsets: np.ndarray, tmin: float, tmax: float,
-             intervals: pd.DataFrame | None) -> np.ndarray:
+def overlaps(onsets, tmin, tmax, intervals) -> np.ndarray:
     """True for each onset whose window [onset+tmin, onset+tmax] overlaps an interval."""
     out = np.zeros(len(onsets), bool)
     if intervals is None or not len(intervals):
         return out
-    s = intervals["onset"].to_numpy(float)
-    e = s + intervals["duration"].to_numpy(float)
-    order = np.argsort(s)
-    s, e = s[order], e[order]
-    emax = np.maximum.accumulate(e)
-    a, b = onsets + tmin, onsets + tmax
-    k = np.searchsorted(s, b, side="right") - 1  # last interval starting before b
-    valid = k >= 0
-    out[valid] = emax[k[valid]] > a[valid]
+    order = np.argsort(intervals["onset"].to_numpy(float))
+    s = intervals["onset"].to_numpy(float)[order]
+    e = np.maximum.accumulate(s + intervals["duration"].to_numpy(float)[order])
+    k = np.searchsorted(s, onsets + tmax, side="right") - 1  # last one starting before
+    out[k >= 0] = e[k[k >= 0]] > (onsets + tmin)[k >= 0]
     return out
 
 
-def build_group_epochs(raw: mne.io.BaseRaw, groups: dict[str, pd.DataFrame],
-                       settings: EpochSettings, blinks: pd.DataFrame | None = None
-                       ) -> tuple[dict[str, mne.Epochs], pd.DataFrame]:
-    """One ``mne.Epochs`` per group (metadata = event rows + ``group`` column).
+def epochs_from_table(raw, table, tmin=-0.2, tmax=0.8, baseline=(None, 0), reject_uv=None,
+                      picks="eeg") -> mne.Epochs:
+    """MNE Epochs locked to the rows of an event table, with the rows as metadata and
+    their ``name`` as event id (``epochs["fixation"]``, ``epochs['cond == "AI"']``).
+    Rows whose window leaves the recording, or on an already used sample, are dropped
+    (counted in ``epochs.selection_counts``)."""
+    rows, sf = table.reset_index(drop=True), raw.info["sfreq"]
+    samples = np.round(rows["onset"].to_numpy(float) * sf).astype(int) + raw.first_samp
+    inside = (samples >= raw.first_samp + int(np.ceil(-tmin * sf))) & \
+        (samples <= raw.last_samp - int(np.ceil(tmax * sf)))
+    rows, samples = rows[inside], samples[inside]
+    first = np.sort(np.unique(samples, return_index=True)[1])  # MNE needs unique samples
+    counts = {"outside recording": int((~inside).sum()), "same sample": len(rows) - len(first)}
+    rows, samples = rows.iloc[first].reset_index(drop=True), samples[first]
+    if not len(rows):
+        err = ValueError("No selected events fall inside the EEG recording")
+        err.counts = counts
+        raise err
+    event_id = {n: i + 1 for i, n in enumerate(sorted(rows["name"].astype(str).unique()))}
+    events = np.c_[samples, np.zeros_like(samples), rows["name"].astype(str).map(event_id)]
+    if picks == "eeg":
+        picks = mne.pick_types(raw.info, eeg=True, exclude="bads")
+        picks = picks if len(picks) else eeg_picks(raw)
+    epochs = mne.Epochs(raw, events.astype(int), event_id=event_id, tmin=tmin, tmax=tmax,
+                        baseline=baseline, picks=picks, preload=True,
+                        reject=dict(eeg=reject_uv * 1e-6) if reject_uv else None,
+                        metadata=rows.astype({c: object for c in rows.columns
+                                              if isinstance(rows[c].dtype, pd.StringDtype)}))
+    epochs.selection_counts = counts
+    return epochs
 
-    Returns the epochs and a summary table per group: selected; dropped before
-    epoching because of a blink, the window falling outside the recording or another
-    event on the same sample; rejected by amplitude
-    (peak-to-peak/flat) or by a BAD annotation; kept; and the channels behind
-    amplitude rejections.
-    """
+
+def build_group_epochs(raw, groups: dict, settings: EpochSettings, blinks=None):
+    """One ``mne.Epochs`` per group (metadata = the group's event rows), and a summary per
+    group: selected; dropped for a blink, a window leaving the recording or another
+    event on the same sample; rejected by amplitude (peak-to-peak / flat) or a BAD
+    annotation; kept; and the channels behind the amplitude rejections."""
     out, rows = {}, []
-    for name, table in groups.items():
-        tab = table.copy()
-        if settings.delay_ms:  # the EEG lags the events: cut epochs later
-            tab["onset"] = tab["onset"] + settings.delay_ms / 1000.0
-        n_sel = len(tab)
-        n_blink = 0
+    for name, tab in groups.items():
+        tab = tab.assign(onset=tab["onset"] + settings.delay_ms / 1000.0) \
+            if settings.delay_ms else tab.copy()  # the EEG lags the events
+        row = {"group": name, "selected": len(tab), "blink": 0, "outside recording": 0,
+               "same sample": 0, "rejected (amplitude)": 0, "rejected (BAD annotation)": 0,
+               "kept": 0, "rejected by": ""}
         if settings.drop_blinks and blinks is not None and len(tab):
             hit = overlaps(tab["onset"].to_numpy(float), settings.tmin, settings.tmax, blinks)
-            n_blink = int(hit.sum())
-            tab = tab[~hit]
-        row = {"group": name, "selected": n_sel, "blink": n_blink,
-               "outside recording": 0, "same sample": 0,
-               "rejected (amplitude)": 0, "rejected (BAD annotation)": 0, "kept": 0,
-               "rejected by": ""}
+            row["blink"], tab = int(hit.sum()), tab[~hit]
         if len(tab):
-            tab = tab.assign(group=name)
             try:
-                ep = epochs_from_table(raw, tab, settings.tmin, settings.tmax, baseline=None,
-                                         reject_uv=settings.reject_uv)
+                ep = epochs_from_table(raw, tab.assign(group=name), settings.tmin,
+                                       settings.tmax, baseline=None,
+                                       reject_uv=settings.reject_uv)
             except ValueError as e:
                 ep = None
                 row.update(getattr(e, "counts", {"outside recording": len(tab)}))
-            if ep is not None and settings.flat_uv:
-                ep.drop_bad(flat=dict(eeg=settings.flat_uv * 1e-6), verbose="error")
             if ep is not None:
+                if settings.flat_uv:
+                    ep.drop_bad(flat=dict(eeg=settings.flat_uv * 1e-6))
                 row.update(ep.selection_counts)
-                why = drop_reasons(ep)
-                row["rejected (amplitude)"] = why["amplitude"] + why["other"]
-                row["rejected (BAD annotation)"] = why["BAD annotation"]
+                dropped = [r for r in ep.drop_log if r and r != ("IGNORED",)]
+                bad = [any(str(x).upper().startswith(("BAD", "EDGE")) for x in r)
+                       for r in dropped]
+                row["rejected (BAD annotation)"] = sum(bad)
+                row["rejected (amplitude)"] = len(dropped) - sum(bad)
                 row["kept"] = len(ep)
-                causes = rejection_causes(ep)
-                row["rejected by"] = ", ".join(f"{c} ({n})" for c, n in list(causes.items())[:6])
+                causes = pd.Series([x for r in ep.drop_log for x in r if x in ep.ch_names],
+                                   dtype=object).value_counts(sort=False)
+                row["rejected by"] = ", ".join(f"{c} ({n})" for c, n in causes.sort_values(
+                    ascending=False, kind="stable").head(6).items())
                 if len(ep):
                     out[name] = ep
         rows.append(row)
@@ -2179,58 +2123,42 @@ def build_group_epochs(raw: mne.io.BaseRaw, groups: dict[str, pd.DataFrame],
     return out, summary
 
 
-def apply_autoreject(epochs: dict[str, mne.Epochs], summary: pd.DataFrame,
-                     fraction: float = 1.0, seed: int = 42
-                     ) -> tuple[dict[str, mne.Epochs], pd.DataFrame]:
-    """AutoReject (``n_interpolate=[1, 2, 4]``, ``random_state=42``), as in the ERP guide:
-    fitted once on the epochs of every group (all, or a random share), then each
-    group is cleaned — bad channels are interpolated within an epoch and the epochs that
-    cannot be repaired are dropped. Needs electrode positions and ≥ 10 epochs."""
+def apply_autoreject(epochs: dict, summary, fraction=1.0, seed=42):
+    """AutoReject (ERP guide), fitted once on the epochs of every group (all, or a share),
+    then each group cleaned: bad channels interpolated within an epoch, the epochs that
+    cannot be repaired dropped. Needs electrode positions and ≥ 10 epochs."""
     import warnings
-
-    summary = summary.copy()
-    summary["rejected (AutoReject)"] = 0
-    summary["interpolated (AutoReject)"] = 0
+    summary = summary.assign(**{"rejected (AutoReject)": 0, "interpolated (AutoReject)": 0})
     every = list(epochs.values())
     n = sum(len(e) for e in every)
-    if not has_positions(every[0]):
-        summary.attrs["autoreject"] = "not applied: the EEG channels have no positions"
+    why = ("the EEG channels have no positions" if not has_positions(every[0]) else
+           "fewer than 10 epochs" if n < 10 else "")
+    if why:
+        summary.attrs["autoreject"] = f"not applied: {why}"
         return epochs, summary
-    if n < 10:
-        summary.attrs["autoreject"] = "not applied: fewer than 10 epochs"
-        return epochs, summary
-    from autoreject import AutoReject
-    with warnings.catch_warnings(), mne.utils.use_log_level("error"):
-        warnings.simplefilter("ignore")
-        # fitting needs only the data: one array of every group's epochs (their event
-        # codes may clash, which mne.concatenate_epochs refuses)
-        sizes = [len(e) for e in every]
-        pick = fit_subset(n, fraction, seed)
-        pick = np.arange(n) if isinstance(pick, slice) else pick
-        starts = np.cumsum([0] + sizes)
-        data = np.concatenate([every[k].get_data(item=pick[(pick >= starts[k]) &
-                                                         (pick < starts[k + 1])] - starts[k])
-                               for k in range(len(every))])
-        allep = mne.EpochsArray(data, every[0].info, tmin=every[0].tmin, baseline=None,
-                                verbose="error")
-        ar = AutoReject(n_interpolate=[1, 2, 4], random_state=seed, n_jobs=1,
-                        verbose=False, picks=mne.pick_types(allep.info, eeg=True, eog=False))
-        ar.fit(allep)
-        out = {}
-        for g, ep in epochs.items():
+    # fitted on one array of (a share of) every group's epochs: their event codes may
+    # clash, which mne.concatenate_epochs refuses
+    pick = fit_subset(n, fraction, seed)
+    pick = np.arange(n) if isinstance(pick, slice) else pick
+    starts = np.cumsum([0] + [len(e) for e in every])
+    data = np.concatenate([e.get_data(item=pick[(pick >= a) & (pick < b)] - a)
+                           for e, a, b in zip(every, starts, starts[1:])])
+    ar = autoreject(mne.EpochsArray(data, every[0].info, tmin=every[0].tmin, baseline=None),
+                    seed)
+    out = {}
+    for g, ep in epochs.items():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
             ep = ep.copy().load_data()
-            log = ar.get_reject_log(ep)
-            clean = ar.transform(ep)
-            i = summary.index[summary["group"] == g][0]
-            summary.loc[i, "rejected (AutoReject)"] = int(np.sum(log.bad_epochs))
-            summary.loc[i, "interpolated (AutoReject)"] = int(
-                (log.labels[~log.bad_epochs] == 2).sum())
-            summary.loc[i, "kept"] = len(clean)
-            if len(clean):
-                out[g] = clean
+            log, clean = ar.get_reject_log(ep), ar.transform(ep)
+        i = summary.index[summary["group"] == g][0]
+        summary.loc[i, "rejected (AutoReject)"] = int(np.sum(log.bad_epochs))
+        summary.loc[i, "interpolated (AutoReject)"] = int((log.labels[~log.bad_epochs] == 2).sum())
+        summary.loc[i, "kept"] = len(clean)
+        if len(clean):
+            out[g] = clean
     summary.attrs["autoreject"] = "applied"
     return out, summary
-
 
 
 # =========================================================================== EEG: montages, triggers, ERP
@@ -2239,7 +2167,7 @@ def compute_psd(raw: mne.io.BaseRaw, fmax: float = 60.0, tmin=None, tmax=None):
     if not len(picks):
         picks = eeg_picks(raw)
     fmax = min(fmax, raw.info["sfreq"] / 2)
-    return raw.compute_psd(fmax=fmax, picks=picks, tmin=tmin, tmax=tmax, verbose="error")
+    return raw.compute_psd(fmax=fmax, picks=picks, tmin=tmin, tmax=tmax)
 
 
 def add_gaze_annotations(raw: mne.io.BaseRaw, ev, kinds=("blinks", "saccades")) -> None:
@@ -2265,7 +2193,7 @@ def set_standard_montage(raw: mne.io.BaseRaw) -> None:
     available = mne.channels.get_builtin_montages()
     name = "colin27_1005" if "colin27_1005" in available else "standard_1005"
     try:
-        raw.set_montage(name, on_missing="ignore", match_case=False, verbose="error")
+        raw.set_montage(name, on_missing="ignore", match_case=False)
     except Exception:
         pass
 
@@ -2362,16 +2290,16 @@ def apply_montage(raw: mne.io.BaseRaw, montage: mne.channels.DigMontage | None,
         if len(set(mapping.values())) != len(mapping) or \
                 set(mapping.values()) & (set(raw.ch_names) - set(mapping)):
             raise ValueError("Channel names must be unique")
-        raw.rename_channels(mapping, verbose="error")
+        raw.rename_channels(mapping)
         report["n_renamed"] = len(mapping)
     if set_types:
         types = {ch: guess_channel_type(ch) for ch in raw.ch_names}
         changed = {ch: t for ch, t in types.items()
                    if t != "eeg" and raw.get_channel_types([ch])[0] == "eeg"}
         if changed:
-            raw.set_channel_types(changed, verbose="error")
+            raw.set_channel_types(changed)
     if montage is not None:
-        raw.set_montage(montage, match_case=False, on_missing="ignore", verbose="error")
+        raw.set_montage(montage, match_case=False, on_missing="ignore")
     eeg = mne.pick_types(raw.info, eeg=True, exclude=[])
     has = [i for i in eeg if np.isfinite(raw.info["chs"][i]["loc"][:3]).all()
            and np.abs(raw.info["chs"][i]["loc"][:3]).sum() > 0]
@@ -2422,10 +2350,9 @@ def trigger_codes(raw: mne.io.BaseRaw, channel: str, mask: int | None = None,
         unit = getattr(raw, "_orig_units", {}).get(channel, "")
         data = np.round(x * _UNIT_BACK.get(unit, 1.0))
     info = mne.create_info(["TRIG"], raw.info["sfreq"], "stim")
-    trig = mne.io.RawArray(data[None], info, first_samp=raw.first_samp, verbose="error")
+    trig = mne.io.RawArray(data[None], info, first_samp=raw.first_samp)
     ev = mne.find_events(trig, stim_channel="TRIG", shortest_event=1, consecutive=True,
-                         initial_event=True, mask=mask or None, mask_type="and",
-                         verbose="error")
+                         initial_event=True, mask=mask or None, mask_type="and")
     onsets = (ev[:, 0] - raw.first_samp) / raw.info["sfreq"]
     return pd.DataFrame({"onset": onsets, "code": ev[:, 2].astype(int)})
 
@@ -2485,8 +2412,7 @@ def component_analysis(groups: dict[str, mne.BaseEpochs], comp: Component
         amps = x[:, m].mean(1)
         vals[g] = amps
         roi = mne.channels.combine_channels(
-            ep.average(), {"roi": [ep.ch_names.index(c) for c in chans]}, method="mean",
-            verbose="error")
+            ep.average(), {"roi": [ep.ch_names.index(c) for c in chans]}, method="mean")
         _, lat, amp = roi.get_peak(tmin=comp.tmin, tmax=comp.tmax,
                                    mode="neg" if comp.polarity < 0 else "pos",
                                    return_amplitude=True, strict=False)
@@ -2570,7 +2496,7 @@ def _roi_wave(ev: mne.Evoked, chans: list[str]) -> np.ndarray:
 
 def _peak(ev: mne.Evoked, chans: list[str], comp: "Component") -> tuple[float, float]:
     roi = mne.channels.combine_channels(ev, {"roi": [ev.ch_names.index(c) for c in chans]},
-                                        method="mean", verbose="error")
+                                        method="mean")
     _, lat, amp = roi.get_peak(tmin=comp.tmin, tmax=comp.tmax,
                                mode="neg" if comp.polarity < 0 else "pos",
                                return_amplitude=True, strict=False)
@@ -2725,10 +2651,9 @@ def group_cluster_test(diffs: list[mne.Evoked], tfce: bool = False,
                   for d in diffs])                       # subjects × times × channels
     adjacency, _ = mne.channels.find_ch_adjacency(ev0.info, ch_type="eeg")
     kw = dict(threshold=dict(start=0, step=0.2)) if tfce else {}
-    with mne.utils.use_log_level("error"):
-        t_obs, clusters, pv, _ = spatio_temporal_cluster_1samp_test(
-            x, adjacency=adjacency, n_permutations=int(n_permutations), out_type="mask",
-            seed=seed, n_jobs=1, **kw)
+    t_obs, clusters, pv, _ = spatio_temporal_cluster_1samp_test(
+        x, adjacency=adjacency, n_permutations=int(n_permutations), out_type="mask",
+        seed=seed, n_jobs=1, **kw)
     mask = np.zeros(t_obs.shape, bool)
     rows = []
     if tfce:
@@ -2810,7 +2735,7 @@ def reference_epochs(epochs: mne.BaseEpochs, ref) -> mne.BaseEpochs:
     if ref is None:
         return epochs
     out = epochs.copy()
-    out.set_eeg_reference(ref, projection=False, verbose="error")
+    out.set_eeg_reference(ref, projection=False)
     return out
 
 
@@ -2959,7 +2884,7 @@ def band_power(epochs: mne.BaseEpochs, settings: BandSettings) -> np.ndarray:
         seg = min(n, int(2 * epochs.info["sfreq"]))  # ≤ 2 s segments, 50 % overlap
         kw = dict(n_fft=seg, n_per_seg=seg, n_overlap=seg // 2)
     psd = epochs.compute_psd(method=settings.method, fmin=fmin, fmax=fmax, tmin=tmin,
-                             tmax=tmax, picks="eeg", exclude=(), verbose="error", **kw)
+                             tmax=tmax, picks="eeg", exclude=(), **kw)
     data, freqs = psd.get_data(return_freqs=True)
     bp = _integrate(data, freqs, bands)
     bp[bp <= 0] = np.nan  # flat (reference) channels
@@ -2993,8 +2918,7 @@ def baseline_epochs(raw: mne.io.BaseRaw, base: BandBaseline, seg_len: float,
     events = np.column_stack([samples, np.zeros_like(samples), np.ones_like(samples)])
     picks = [c for c in ch_names if c in raw.ch_names]
     ep = mne.Epochs(raw, events, {"baseline": 1}, tmin=0.0, tmax=seg_len - 1 / sf,
-                    baseline=None, picks=picks, preload=True, reject_by_annotation=True,
-                    verbose="error")
+                    baseline=None, picks=picks, preload=True, reject_by_annotation=True)
     owner = owner[[i for i, d in enumerate(ep.drop_log) if not d]]
     if not len(ep):
         raise ValueError("All baseline segments overlap BAD annotations")
@@ -3188,7 +3112,7 @@ def morlet_band(data: np.ndarray, sfreq: float, band: tuple[float, float]) -> np
         freqs = np.array([lo, hi])
     n_cycles = np.maximum(freqs / 2.0, 3.0)
     p = mne.time_frequency.tfr_array_morlet(data, sfreq, freqs, n_cycles=n_cycles,
-                                            output="power", verbose="error")
+                                            output="power")
     with np.errstate(invalid="ignore"):
         return np.nanmean(p, axis=(1, 2)) * 1e12
 
@@ -3304,7 +3228,7 @@ def run_erp(epochs: dict[str, mne.BaseEpochs], spec: ErpSpec) -> dict:
     comp, bl = spec.component, spec.baseline
     notes = []
     eps = {g: reference_epochs(ep, ref) for g, ep in groups.items()}
-    eps = {g: (ep.copy().apply_baseline(bl, verbose="error") if bl else ep)
+    eps = {g: (ep.copy().apply_baseline(bl) if bl else ep)
            for g, ep in eps.items()}
     evokeds = {}
     for g, ep in eps.items():
