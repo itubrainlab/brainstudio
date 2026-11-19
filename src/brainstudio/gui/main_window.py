@@ -15,7 +15,6 @@ from .. import eeg as E
 from .. import events as EV
 from .. import gaze as G
 from .. import io as bio
-from .. import workflow as W
 from ..io.multi import subject_spans
 from ..model import Recording
 from . import icons, style
@@ -23,7 +22,9 @@ from .eeg_analysis import AnalysisTab
 from .epoch_tab import EpochTab
 from .gaze_tab import GazeTab
 from .montage_dialog import MontageDialog
-from .pipeline import STAGES, EEGPipeline
+from ..session import STAGES, Session
+from .controllers import Controller
+from .pipeline import EEGPipeline
 from .preprocess_tab import PreprocessTab
 from .screenview import ScreenView
 from .stream_dialog import StreamDialog
@@ -37,27 +38,27 @@ pg.setConfigOptions(antialias=False, useOpenGL=False)
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    # the session's state, read by the views
+    rec = property(lambda self: self.session.rec)
+    gaze_events = property(lambda self: self.session.gaze_events)
+    event_df = property(lambda self: self.session.event_table)
+    load_steps = property(lambda self: self.session.load_steps)
+
     def __init__(self):
         style.apply(QtWidgets.QApplication.instance())
         super().__init__()
         self.setWindowTitle("brAInStudio — EEG & eye-tracking analysis")
         self.setWindowIcon(icons.app())
         self.resize(1600, 950)
-        self.rec: Recording | None = None
+        # model (Session), its Qt bridge (pipeline) and the controller of the actions
+        self.session = Session()
+        self.pipeline = EEGPipeline(self.session, self)
+        self.worker = Worker(self)
+        self.ctl = Controller(self.session, self.worker)
         self.display_raw: mne.io.BaseRaw | None = None
-        self.gaze_events = None
         self.pupil_clean = None
         self.bids_root: Path | None = None
         self.cursor_t = 0.0
-        self.gaze_offset = 0.0  # manual sync correction (s), applied to gaze
-        self._raw_gaze = None
-        self.pipeline = EEGPipeline(self)
-        # how the recording was loaded and edited, in order (for exported scripts)
-        self.load_steps: list[dict] = []
-        self._gaze_used = None      # gaze detection parameters of the current gaze events
-        self._aois_used: dict = {}  # AOIs of the current event table
-        self.pipeline.load_recipe_fn = self._load_recipe
-        self.worker = Worker(self)
 
         self._build_toolbar()
         self._build_central()
@@ -68,7 +69,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.play_timer.setInterval(40)
         self.play_timer.timeout.connect(self._play_step)
         self.statusBar().showMessage("Open a BIDS dataset (File ▸ Open BIDS…) or an XDF file.")
-        self.event_df = EV.build_event_table(None)
         self.pipeline.changed.connect(self._on_pipeline)
         self.pipeline.stateChanged.connect(self._update_pipeline_titles)
         self._update_pipeline_titles()
@@ -556,56 +556,28 @@ class MainWindow(QtWidgets.QMainWindow):
         elif fns:
             self.open_files(fns)
 
-    def _load_recipe(self) -> dict:
-        return {"steps": list(self.load_steps),
-                "gaze": {"params": self._gaze_used, "aois": dict(self._aois_used)}}
 
-    def _load_async(self, label: str, load, on_loaded, error_title: str,
-                    step: dict | None = None) -> bool:
+    def _load_async(self, label: str, step: dict, shown, error_title: str) -> bool:
         """Read a recording in the background (the window stays responsive and the
-        status bar shows the elapsed time), then show it on the GUI thread. ``step``
-        records the load for exported scripts."""
-        if step is not None:
-            shown = on_loaded
-
-            def on_loaded(rec):
-                try:  # what an exported script needs to know about the files
-                    step["recording"] = W.recording_info(rec, step)
-                except Exception:  # noqa: BLE001  (export will say it cannot)
-                    step["recording"] = {}
-                self.load_steps = [step]
-                shown(rec)
-        # gaze events are detected in the background too (pymovements takes a while on
-        # long recordings)
-        auto, fixed, read = self.p_preset.currentData() == "auto", self._gaze_params(), load
-
-        def load():
-            rec = read()
-            if rec is not None and rec.has_gaze:
-                params = G.PRESETS[G.suggest_preset(rec.gaze)][1] if auto else fixed
-                rec.gaze_events = G.detect_events(rec.gaze, params)
-                rec.detected_with = params
-            return rec
+        status bar shows the elapsed time), then show it on the GUI thread."""
         if self.worker.busy:
             QtWidgets.QMessageBox.information(self, "Busy", "Wait for the running "
                                               "computation to finish.")
             return False
+        return self.ctl.load(step, label, self.p_preset.currentData(), self._gaze_params(),
+                             shown, lambda msg: QtWidgets.QMessageBox.critical(
+                                 self, error_title, msg))
 
-        def failed(msg):
-            QtWidgets.QMessageBox.critical(self, error_title, msg)
-
-        return self.worker.run(label, load, on_loaded, failed)
 
     def open_files(self, paths, roles_by_name=None, options_by_name=None):
         """Several files joined into one recording (one segment per file)."""
         paths = [Path(p) for p in paths]
-        size = self.screen_size()
         self._load_async(f"Loading {len(paths)} files…",
-                         lambda: bio.load_many(paths, size, roles_by_name, options_by_name),
-                         lambda rec: self._show_files(paths, rec), "Could not load the files",
-                         step={"kind": "load_many", "paths": [str(p) for p in paths],
-                               "screen_size": tuple(size), "roles_by_name": roles_by_name,
-                               "options_by_name": options_by_name})
+                         {"kind": "load_many", "paths": [str(p) for p in paths],
+                          "screen_size": tuple(self.screen_size()),
+                          "roles_by_name": roles_by_name, "options_by_name": options_by_name},
+                         lambda rec: self._show_files(paths, rec), "Could not load the files")
+
 
     def _show_files(self, paths, rec):
         self.tree.clear()
@@ -618,7 +590,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                                  + (f"   ({ent})" if ent else "")])
             it.setToolTip(0, f"starts at {seg['start']:.1f} s on the combined time base")
         self.tree.expandAll()
-        self.set_recording(rec)
+        self.show_recording()
+
 
     def action_attach_gaze(self):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -626,14 +599,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "Eye tracking (*.asc *.tsv *.tsv.gz *.xdf);;All files (*)")
         if fn and self.rec is not None:
             with self._busy("Loading eye tracking…"):
-                g = bio.load_eyetracking_file(fn, self.screen_size())
-                self.rec.gaze = g
-                self._raw_gaze = g
-                self.gaze_offset = 0.0
+                self.offset.blockSignals(True)
                 self.offset.setValue(0)
-                self.load_steps.append({"kind": "attach_gaze", "path": str(fn),
-                                        "screen_size": tuple(self.screen_size())})
-                self._after_gaze_change()
+                self.offset.blockSignals(False)
+                self.ctl.attach_gaze(fn, self.screen_size())
+
 
     def action_stimulus(self):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Stimulus image", "",
@@ -703,44 +673,40 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _load_selected_runs(self):
         runs = self._selected_runs()
-        if not runs:
-            return
         if len(runs) == 1:
             self.load_run(runs[0])
-            return
-        root, size = self.bids_root, self.screen_size_or_none()
-        self._load_async(f"Loading {len(runs)} runs…",
-                         lambda: bio.load_bids_runs(root, runs, size), self.set_recording,
-                         "Could not load the runs",
-                         step={"kind": "load_bids", "root": str(root),
-                               "runs": [list(r.key) for r in runs], "screen_size": size})
+        elif runs:
+            self._load_bids(runs, f"Loading {len(runs)} runs…", "Could not load the runs")
+
 
     def load_run(self, run):
-        root, size = self.bids_root, self.screen_size_or_none()
-        self._load_async(f"Loading {run.label}…", lambda: bio.load_bids_runs(root, [run], size),
-                         self.set_recording, "Could not load run",
-                         step={"kind": "load_bids", "root": str(root), "runs": [list(run.key)],
-                               "screen_size": size})
+        self._load_bids([run], f"Loading {run.label}…", "Could not load run")
+
+    def _load_bids(self, runs, label, error_title):
+        self._load_async(label, {"kind": "load_bids", "root": str(self.bids_root),
+                                 "runs": [list(r.key) for r in runs],
+                                 "screen_size": self.screen_size_or_none()},
+                         lambda rec: self.show_recording(), error_title)
+
 
     def open_file(self, path, roles=None, options=None):
         path = Path(path)
         if path.is_dir():
             self.open_bids(path)
             return
-        size = self.screen_size()
 
         def show(rec):
             self.tree.clear()
             self.bids_root = None
             self.btn_runs.setVisible(False)
             QtWidgets.QTreeWidgetItem(self.tree, [path.name])
-            self.set_recording(rec)
+            self.show_recording()
 
         self._load_async(f"Loading {path.name}…",
-                         lambda: bio.load(path, size, roles=roles, options=options), show,
-                         "Could not load file",
-                         step={"kind": "load", "path": str(path), "screen_size": tuple(size),
-                               "roles": roles, "options": options})
+                         {"kind": "load", "path": str(path),
+                          "screen_size": tuple(self.screen_size()), "roles": roles,
+                          "options": options}, show, "Could not load file")
+
 
     def screen_size(self):
         return (self.scr_w.value(), self.scr_h.value())
@@ -749,23 +715,22 @@ class MainWindow(QtWidgets.QMainWindow):
         return None if self.screen_size() == (1920, 1080) else self.screen_size()
 
     # ================================================================== state
-    def set_recording(self, rec: Recording):
+    def show_recording(self):
+        """Show the session's (newly loaded) recording."""
         # one repaint at the end instead of one per table/plot/layout change
         self.setUpdatesEnabled(False)
         try:
-            self._set_recording(rec)
+            self._show_recording(self.rec)
         finally:
             self.setUpdatesEnabled(True)
 
-    def _set_recording(self, rec: Recording):
+
+    def _show_recording(self, rec: Recording):
         self.stop_play()
-        self.rec = rec
-        self._raw_gaze = rec.gaze
+        self.offset.blockSignals(True)
         self.offset.setValue(0)
-        self.gaze_offset = 0.0
-        self.gaze_events = None
+        self.offset.blockSignals(False)
         self.pupil_clean = None
-        self.pipeline.set_gaze_events(None)
         self.eeg_plot.gaze_events = self.gaze_plot.gaze_events = None
         if rec.has_gaze:
             self.scr_w.setValue(rec.gaze.screen_size[0])
@@ -773,7 +738,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.screen.set_screen(rec.gaze.screen_size)
         self.display_raw = rec.raw
         self.screen.reset_view()
-        self.pipeline.set_recording(rec)
         if rec.raw is not None:
             self._load_eeg_plot()
         else:
@@ -783,13 +747,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.topo.set_raw(self.display_raw)
         self.gaze_plot.set_gaze(rec.gaze)
         self._update_gaze_visibility()
-        if rec.has_gaze:  # the event table is built once, below
-            self.detect_gaze_events(rebuild=False)
+        if self.gaze_events is not None:  # detected while loading
+            self._show_gaze_events(rebuilt=False)
         self.info.setPlainText(rec.summary() + ("\n" + rec.description if rec.description else ""))
         self._fill_streams()
         self._fill_trigger_channels()
         self._refresh_events()
-        self._rebuild_event_table()
+        self._fill_event_list()
         self.gaze_tab.update_gaze_stats()
         if rec.raw is not None:  # default preprocessing (0.1–30 Hz, 50 Hz notch) for the viewer
             self.pre_tab.run()
@@ -804,6 +768,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.title_label.setToolTip(tip)
         self._update_ribbon()
         self.statusBar().showMessage(rec.summary().replace("\n", "  |  "))
+
 
     def _recording_title(self, rec) -> tuple[str, str]:
         """Name shown in the top bar and window title, and its tooltip: the dataset
@@ -958,37 +923,18 @@ class MainWindow(QtWidgets.QMainWindow):
             if it.checkState() == QtCore.Qt.Checked:
                 names[it.data(QtCore.Qt.UserRole)] = \
                     self.trig_table.item(i, 2).text().strip() or f"trigger_{it.text()}"
-        as_stim = self.trig_stim.isChecked()
-        was_stim = self.rec.raw.get_channel_types([ch])[0] == "stim"
-        W.add_trigger_events(self.rec, ch, mask, mode, names, as_stim)
-        self.load_steps.append({"kind": "trigger_events", "channel": ch, "mask": mask,
-                                "mode": mode, "names": {int(k): v for k, v in names.items()},
-                                "as_stim": as_stim})
+        self.ctl.set_trigger_events(ch, mask, mode, names, self.trig_stim.isChecked())
         self._after_trigger_events()
-        if as_stim and not was_stim:
-            self.pipeline.params.bads = [b for b in self.pipeline.params.bads if b != ch]
-            self.pipeline.invalidate_ica()
-            self.pre_tab._stats = None
-            self.pre_tab.refresh_channels()
-            self.pre_tab.refresh_reference_choices()
-            self.pre_tab._fill_ica_table()
-            self.display_raw = self.rec.raw
-            self._load_eeg_plot()
-            self.pipeline.mark_stale("preprocessing")
-            self.pre_tab.run()
+
 
     def _set_trigger_events(self, ev):
         """``None`` removes the trigger events."""
-        if self.rec is None:
-            return
-        W.replace_trigger_events(self.rec, ev)
-        if ev is None:
-            self.load_steps.append({"kind": "remove_trigger_events"})
-        self._after_trigger_events()
+        if self.rec is not None and ev is None:
+            self.ctl.remove_trigger_events()
+            self._after_trigger_events()
 
     def _after_trigger_events(self, _=None):
         self._refresh_events()
-        self._rebuild_event_table()
         self.info.setPlainText(self.rec.summary() + ("\n" + self.rec.description
                                                      if self.rec.description else ""))
         n = int(self.rec.events["description"].astype(str)
@@ -1113,6 +1059,27 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_pipeline(self, what):
         if what == "preprocessing":
             self._update_display()
+        elif what == "events":
+            self._fill_event_list()
+        elif what == "gaze":
+            self._after_gaze_change()
+        elif what == "gaze_events":
+            self._show_gaze_events()
+        elif what == "channels":
+            self._channels_changed()
+
+    def _channels_changed(self):
+        """Channels renamed or retyped (montage, trigger channel): the preprocessing
+        views follow and the viewer's default preprocessing runs again."""
+        self.pre_tab._stats = None
+        self.pre_tab.refresh_channels()
+        self.pre_tab.refresh_reference_choices()
+        self.pre_tab._fill_ica_table()
+        self.display_raw = self.rec.raw
+        self._load_eeg_plot()
+        self.topo.set_raw(self.display_raw)
+        self.pre_tab.run()
+
 
     def _update_display(self):
         if self.rec is None or self.rec.raw is None:
@@ -1212,56 +1179,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.p_preset_note.setText("")
 
     def detect_gaze_events(self, rebuild: bool = True):
-        """Detect fixations, saccades and blinks (pymovements) in the background; on a
-        fresh recording the events detected while loading are used."""
-        if self.rec is None or not self.rec.has_gaze:
-            return
-        rec = self.rec
-        if not rebuild and getattr(rec, "detected_with", None) is not None:
-            self._apply_gaze_events(rec.gaze_events, rec.detected_with, rebuild)
-            return
-        params, gaze = self._gaze_params(), rec.gaze
-        if self.worker.busy:  # e.g. while preprocessing runs: wait for it here
-            with self._busy("Detecting fixations, saccades and blinks…"):
-                ev = G.detect_events(gaze, params)
-            self._apply_gaze_events(ev, params, rebuild)
-            return
+        """Detect fixations, saccades and blinks (pymovements) in the background."""
+        if self.rec is not None and self.rec.has_gaze:
+            self.ctl.detect_gaze(self._gaze_params(), rebuild)
 
-        def done(ev):
-            if self.rec is rec and rec.gaze is gaze:  # still the same data
-                self._apply_gaze_events(ev, params, rebuild)
 
-        self.worker.run("Detecting fixations, saccades and blinks (pymovements)…",
-                        lambda: G.detect_events(gaze, params), done)
-
-    def _apply_gaze_events(self, ev, params, rebuild: bool = True):
-        self._gaze_used = params
-        self._show_params(params)
-        self.gaze_events = ev
-        self.rec.gaze_events = ev
-        self.rec.detected_with = None
-        self.pipeline.set_gaze_events(ev)
+    def _show_gaze_events(self, rebuilt: bool = True):
+        ev = self.gaze_events
+        self._show_params(self.session.gaze_params)
         self.pupil_clean = (G.clean_pupil(self.rec.gaze, ev.blinks)
                             if self.cb_pupil_clean.isChecked() else None)
         self.gaze_plot.set_gaze(self.rec.gaze, self.pupil_clean)
-        self.eeg_plot.gaze_events = self.gaze_events
-        self.gaze_plot.gaze_events = self.gaze_events
+        self.eeg_plot.gaze_events = ev
+        self.gaze_plot.gaze_events = ev
         self._overlay_toggled()
         self._heat_toggled()
-        if rebuild:
+        if rebuilt:
             self.gaze_tab.update_gaze_stats()
-            self._rebuild_event_table()
             self.pre_tab.gaze_events_changed()  # ICA scores and blink check use the blinks
         self._update_screen()
         self._update_ribbon()
 
+
     # ================================================================== events / montage
-    def _rebuild_event_table(self):
-        self._aois_used = self.screen.aoi_specs()
-        aois = G.make_aois(self._aois_used)
-        self.event_df = EV.build_event_table(self.rec, self.gaze_events, aois)
-        self.pipeline.set_event_table(self.event_df)
-        self._fill_event_list()
 
     def _fill_event_list(self):
         """Dataset panel: the markers with every column they carry."""
@@ -1280,8 +1220,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _aois_changed(self):
         self.gaze_tab.update_aoi_stats()
-        if self.rec is not None:
-            self._rebuild_event_table()
+        self.ctl.set_aois(self.screen.aoi_specs())
+
 
     def action_montage(self):
         if self.rec is None or self.rec.raw is None:
@@ -1294,33 +1234,18 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg = MontageDialog(self.rec.raw, self)
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
-        old = list(self.rec.raw.ch_names)
         try:
             with self._busy("Applying montage…"):
-                rep = W.set_montage(self.rec, dlg.montage_source, dlg.names_out)
-                self.load_steps.append({"kind": "montage", "source": dlg.montage_source,
-                                        "names": list(dlg.names_out)})
+                rep = self.ctl.set_montage(dlg.montage_source, dlg.names_out,
+                                           self.pre_tab.bads())
         except Exception as e:
             self._error("Montage", e)
             return
-        # carry the preprocessing choices over to the new names; ICA must be refitted
-        rename = dict(zip(old, self.rec.raw.ch_names))
-        pl = self.pipeline
-        pl.params.bads = [rename.get(b, b) for b in self.pre_tab.bads()]
-        pl.invalidate_ica()
-        self.pre_tab._stats = None
-        self.pre_tab.refresh_channels()
-        self.pre_tab.refresh_reference_choices()
-        self.pre_tab._fill_ica_table()
-        self.display_raw = self.rec.raw
-        self._load_eeg_plot()
-        self.topo.set_raw(self.display_raw)
-        pl.mark_stale("preprocessing")
-        self.pre_tab.run()
         self.info.setPlainText(self.rec.summary() + "\n" + self.rec.description)
         self.statusBar().showMessage(
             f"Montage applied: {rep['n_renamed']} channels renamed, "
             f"{rep['n_positioned']} EEG channels with positions", 8000)
+
 
     # ================================================================== theme
     def _apply_theme(self):
@@ -1361,18 +1286,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.info.setPlainText(self.rec.summary())
 
     def _offset_changed(self):
-        if self.rec is None or self._raw_gaze is None:
-            return
-        new = self.offset.value() / 1000.0
-        if new == self.gaze_offset:
-            return
-        self.gaze_offset = new
-        self.rec.gaze = self._raw_gaze.shifted(new)
-        # one offset step: it shifts the gaze as loaded, so it replaces an earlier one
-        self.load_steps = [st for st in self.load_steps if st["kind"] != "gaze_offset"]
-        if new:
-            self.load_steps.append({"kind": "gaze_offset", "seconds": new})
-        self._after_gaze_change()
+        self.ctl.set_gaze_offset(self.offset.value() / 1000.0)
+
 
     def _screen_changed(self):
         size = self.screen_size()
