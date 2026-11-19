@@ -13,6 +13,8 @@ import mne
 import numpy as np
 import pandas as pd
 
+from .core import GazeEvents  # noqa: F401
+
 
 @dataclass
 class GazeData:
@@ -65,24 +67,6 @@ class GazeData:
         return GazeData(
             self.times + dt, self.x, self.y, self.pupil, self.sfreq,
             self.screen_size, self.label, dict(self.extra),
-        )
-
-
-@dataclass
-class GazeEvents:
-    """Result of oculomotor event detection (all times in seconds)."""
-
-    fixations: pd.DataFrame  # onset, offset, duration, x, y
-    saccades: pd.DataFrame  # onset, offset, duration, x0, y0, x1, y1, amplitude, peak_velocity
-    blinks: pd.DataFrame  # onset, offset, duration
-
-    @classmethod
-    def empty(cls) -> GazeEvents:
-        return cls(
-            pd.DataFrame(columns=["onset", "offset", "duration", "x", "y"]),
-            pd.DataFrame(columns=["onset", "offset", "duration", "x0", "y0",
-                                  "x1", "y1", "amplitude", "peak_velocity"]),
-            pd.DataFrame(columns=["onset", "offset", "duration"]),
         )
 
 

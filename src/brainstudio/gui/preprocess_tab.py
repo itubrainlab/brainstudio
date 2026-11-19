@@ -312,7 +312,7 @@ class PreprocessTab(QtWidgets.QWidget):
                         [clean.ch_names[i] for i in mne.pick_types(clean.info, eeg=True)]]
             before = E.compute_psd(raw.copy().pick(eeg_good) if eeg_good else raw, 60.0)
             after = E.compute_psd(clean, 60.0)
-            bb = P.blink_locked_average(P._filtered(raw, p.l_freq, p.h_freq, p.notch, picks=fp)
+            bb = P.blink_locked_average(P.filtered_copy(raw, p.l_freq, p.h_freq, p.notch, picks=fp)
                                         if fp else raw, blinks, fp)
             ba = P.blink_locked_average(clean, blinks, fp)
             return clean, before, after, bb, ba
@@ -515,7 +515,7 @@ class PreprocessTab(QtWidgets.QWidget):
                       if ica is not None and fit_raw is not None else None)
             bb = ba = None
             if clean is not None:
-                bb = P.blink_locked_average(P._filtered(raw, p.l_freq, p.h_freq, p.notch,
+                bb = P.blink_locked_average(P.filtered_copy(raw, p.l_freq, p.h_freq, p.notch,
                                                         picks=fp) if fp else raw, blinks, fp)
                 ba = P.blink_locked_average(clean, blinks, fp)
             return scores, bb, ba

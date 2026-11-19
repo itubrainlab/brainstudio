@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import mne
@@ -1088,3 +1089,1213 @@ def scan_bids(root) -> list[BidsRun]:
 def dataset_description(root) -> dict:
     f = Path(root) / "dataset_description.json"
     return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+
+
+# =========================================================================== gaze events
+@dataclass
+class DetectionParams:
+    """pymovements event detection on screen pixels (defaults: pymovements' own, with
+    about 40 px for its 1° dispersion threshold)."""
+    fix_dispersion: float = 40.0        # px, I-DT: (max − min x) + (max − min y)
+    fix_min_dur: float = 0.1            # s
+    sac_threshold_factor: float = 6.0   # λ: multiples of the median-based velocity SD
+    sac_min_dur: float = 0.006          # s
+    blink_min_dur: float = 0.05         # s
+    blink_max_dur: float = 0.5          # s
+    velocity_method: str = "smooth"     # Gaze.pos2vel: smooth (Savitzky-Golay),
+    #                                     neighbors or preceding
+
+
+#: detection settings for common kinds of gaze data: (label, parameters, explanation)
+PRESETS = {
+    "standard": (
+        "pymovements defaults (raw gaze)", DetectionParams(),
+        "pymovements' own settings, with about 40 px for its 1° dispersion: for raw, "
+        "unfiltered gaze (e.g. Gazepoint BPOG, EyeLink, Tobii)."),
+    "gazepoint_fpog": (
+        "Gazepoint, fixation-filtered gaze (FPOG)",
+        DetectionParams(fix_dispersion=100.0, fix_min_dur=0.06, sac_threshold_factor=6.0,
+                        sac_min_dur=0.006, blink_min_dur=0.05, blink_max_dur=0.5,
+                        velocity_method="neighbors"),
+        "For Gazepoint GP3 / GP3 HD data recorded with only the fixation point of gaze "
+        "(FPOG), which wanders within a fixation: a 100 px dispersion and 60 ms minimum "
+        "match the tracker's own fixations (FPOGID); saccades use central-difference "
+        "velocity, as smoothing blurs them at 150 Hz. Saccade timing is usable, but "
+        "amplitude and peak velocity are not (FPOG is a running average)."),
+}
+
+
+def suggest_preset(gaze) -> str:
+    """Gazepoint gaze with FPOG but no BPOG channels is fixation-filtered; anything else
+    is treated as raw gaze."""
+    cols = {c.lower() for c in (gaze.columns if gaze is not None else [])}
+    return "gazepoint_fpog" if "ch_fpogx" in cols and "ch_bpogx" not in cols else "standard"
+
+
+def preset_name(p: DetectionParams) -> str | None:
+    return next((k for k, (_, q, _) in PRESETS.items() if q == p), None)
+
+
+@dataclass
+class GazeEvents:
+    """Fixations (onset, offset, duration, x, y), saccades (… amplitude, peak_velocity)
+    and blinks (onset, offset, duration), in seconds."""
+    fixations: pd.DataFrame
+    saccades: pd.DataFrame
+    blinks: pd.DataFrame
+
+    @classmethod
+    def empty(cls):
+        return cls(pd.DataFrame(columns=["onset", "offset", "duration", "x", "y"]),
+                   pd.DataFrame(columns=["onset", "offset", "duration", "amplitude",
+                                         "peak_velocity"]),
+                   pd.DataFrame(columns=["onset", "offset", "duration"]))
+
+
+def gaze_rate(gaze) -> float:
+    return float(gaze.attrs.get("sfreq") or 1.0 / float(np.median(np.diff(gaze["t"]))))
+
+
+def detect_gaze_events(gaze, p: DetectionParams = DetectionParams()) -> GazeEvents:
+    """Fixations (I-DT), saccades (Engbert & Kliegl) and blinks (from the pupil, or from
+    tracking loss) with pymovements, on the screen-pixel gaze. pymovements gets the
+    sample number as time axis (durations in samples), so any sampling rate works;
+    onsets are mapped back to the sample times."""
+    import warnings
+
+    import polars as pl
+    import pymovements as pm
+    t, xy = gaze["t"].to_numpy(), gaze[["x", "y"]].to_numpy().T
+    sf = gaze_rate(gaze)
+    n = lambda s, least=1: max(int(round(s * sf)), least)  # noqa: E731  seconds → samples
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # "no events were detected" and the like
+        pg = pm.gaze.from_numpy(time=np.arange(len(t), dtype=np.int64), time_unit="ms",
+                                pixel=xy, position=xy, experiment=pm.Experiment(sampling_rate=sf))
+        pupil = gaze["pupil"].to_numpy(float) if "pupil" in gaze else \
+            np.where(np.isfinite(xy).all(0), 1.0, np.nan)  # NaN = tracking lost
+        pg.samples = pg.samples.with_columns(pl.Series("pupil", pupil))
+        pg.pos2vel(method=p.velocity_method)
+        pg.detect("idt", dispersion_threshold=p.fix_dispersion,
+                  minimum_duration=n(p.fix_min_dur, 2))
+        pg.detect("microsaccades", threshold_factor=p.sac_threshold_factor,
+                  minimum_duration=n(p.sac_min_dur), name="saccade")
+        pg.detect("blink", minimum_duration=n(p.blink_min_dur),
+                  maximum_duration=n(p.blink_max_dur), minimum_gap=n(0.005))
+        names = set(pg.events.frame["name"].to_list())
+        if "fixation" in names:
+            pg.compute_event_properties("location", name="fixation")
+        if "saccade" in names:
+            pg.compute_event_properties(["amplitude", "peak_velocity"], name="saccade")
+    ev = pg.events.frame
+    at = lambda i: t[np.clip(np.asarray(i, np.int64), 0, len(t) - 1)]  # noqa: E731
+
+    def table(name, extra=()):
+        e = ev.filter(pl.col("name") == name)
+        on = at(e["onset"].to_numpy()) if len(e) else np.empty(0)
+        off = at(e["offset"].to_numpy()) if len(e) else np.empty(0)
+        df = pd.DataFrame({"onset": on, "offset": off, "duration": off - on})
+        for c in extra:
+            df[c] = e[c].to_numpy().astype(float) if len(e) and c in e.columns else np.nan
+        return df
+    fix = table("fixation")
+    loc = ev.filter(pl.col("name") == "fixation")
+    xy_f = np.array(loc["location"].to_list(), float).reshape(-1, 2) if len(loc) and \
+        "location" in loc.columns else np.empty((0, 2))
+    fix["x"], fix["y"] = xy_f[:, 0], xy_f[:, 1]
+    return GazeEvents(fix, table("saccade", ("amplitude", "peak_velocity")), table("blink"))
+
+
+def clean_pupil(gaze, blinks, pad: float = 0.05):
+    """Pupil with blinks (± ``pad`` s) linearly interpolated."""
+    if "pupil" not in gaze:
+        return None
+    t, pupil = gaze["t"].to_numpy(), gaze["pupil"].to_numpy(float).copy()
+    bad = ~np.isfinite(pupil)
+    for on, off in blinks[["onset", "offset"]].to_numpy():
+        bad |= (t >= on - pad) & (t < off + pad)
+    if (~bad).sum() >= 2:
+        pupil[bad] = np.interp(t[bad], t[~bad], pupil[~bad])
+    return pupil
+
+
+def heatmap(fixations, screen_size, sigma: float = 40.0, downsample: int = 4) -> np.ndarray:
+    """Duration-weighted fixation density map, (height, width) / ``downsample``."""
+    from scipy.ndimage import gaussian_filter
+    w, h = (int(np.ceil(s / downsample)) for s in screen_size)
+    hm = np.zeros((h, w))
+    if len(fixations):
+        x, y = fixations["x"].to_numpy(), fixations["y"].to_numpy()
+        ok = np.isfinite(x) & np.isfinite(y)
+        np.add.at(hm, (np.clip((y[ok] / downsample).astype(int), 0, h - 1),
+                       np.clip((x[ok] / downsample).astype(int), 0, w - 1)),
+                  fixations["duration"].to_numpy()[ok])
+        hm = gaussian_filter(hm, sigma / downsample)
+    return hm
+
+
+def make_aois(specs: dict | None):
+    """Rectangular areas of interest ``{name: (left, top, width, height)}`` (px) as a
+    pymovements AOI table."""
+    if not specs:
+        return None
+    import polars as pl
+    import pymovements as pm
+    names = list(specs)
+    box = np.array([specs[n] for n in names], float).reshape(-1, 4)
+    return pm.stimulus.TextStimulus(
+        pl.DataFrame({"aoi": names, "x": box[:, 0], "y": box[:, 1], "width": box[:, 2],
+                      "height": box[:, 3]}),
+        aoi_column="aoi", start_x_column="x", start_y_column="y", width_column="width",
+        height_column="height")
+
+
+def fixation_aois(fixations, aois) -> np.ndarray:
+    """The AOI each fixation falls in ("" for none), with pymovements' map_to_aois."""
+    out = np.full(len(fixations), "", dtype=object)
+    if aois is None or not len(fixations):
+        return out
+    import warnings
+
+    import polars as pl
+    import pymovements as pm
+    ev = pm.Events(pl.DataFrame({"name": ["fixation"] * len(fixations),
+                                 "onset": np.arange(len(fixations)),
+                                 "offset": np.arange(len(fixations)) + 1,
+                                 "location": fixations[["x", "y"]].to_numpy(float).tolist()}))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ev.map_to_aois(aois, verbose=False)
+    out[:] = ["" if h is None else str(h) for h in ev.frame["aoi"].to_list()]
+    return out
+
+
+def aoi_statistics(fixations, aois) -> pd.DataFrame:
+    """Per AOI: fixations, dwell time, time to first fixation, mean fixation duration."""
+    names = fixation_aois(fixations, aois)
+    rows = []
+    for name in (aois.aois["aoi"].to_list() if aois is not None else []):
+        sel = fixations[names == name]
+        rows.append({"aoi": name, "n_fixations": int(len(sel)),
+                     "dwell_time": float(sel["duration"].sum()) if len(sel) else 0.0,
+                     "first_fixation": float(sel["onset"].min()) if len(sel) else np.nan,
+                     "mean_fix_dur": float(sel["duration"].mean()) if len(sel) else np.nan})
+    return pd.DataFrame(rows)
+
+
+def gaze_summary(ev: GazeEvents, duration: float) -> pd.DataFrame:
+    f, s, b, dur = ev.fixations, ev.saccades, ev.blinks, max(duration, 1e-9)
+    return pd.DataFrame([
+        ("Fixations", len(f)), ("Fixation rate (/s)", len(f) / dur),
+        ("Mean fixation duration (ms)", 1000 * f["duration"].mean() if len(f) else np.nan),
+        ("Saccades", len(s)),
+        ("Mean saccade amplitude (px)", s["amplitude"].mean() if len(s) else np.nan),
+        ("Mean peak velocity (px/s)", s["peak_velocity"].mean() if len(s) else np.nan),
+        ("Blinks", len(b)), ("Blink rate (/min)", 60 * len(b) / dur)],
+        columns=["measure", "value"])
+
+
+# =========================================================================== events
+BASE_COLUMNS = ["onset", "duration", "name", "kind", "description"]
+#: names of detected gaze events; markers with these names get a "_marker" suffix
+GAZE_EVENT_NAMES = ("fixation", "saccade", "blink")
+# "<PHASE>_START" … "<PHASE>_END"; a separator is required, so names that merely
+# end in "on"/"off" (e.g. "fixation") are not phase markers
+_START = re.compile(r"^(.+?)[_\- ](START|BEGIN|ON)$", re.I)
+_END = re.compile(r"^(.+?)[_\- ](END|STOP|OFF)$", re.I)
+
+
+def _safe_key(k: str) -> str:
+    k = re.sub(r"\W+", "_", k.strip()).strip("_").lower() or "attr"
+    if k[0].isdigit():
+        k = "a_" + k
+    if k in BASE_COLUMNS or k in ("phase", "aoi", "x", "y"):
+        k = "attr_" + k
+    return k
+
+
+def parse_description(desc: str) -> tuple[str, dict]:
+    """``"NAME|k=v|k2=v2"`` → ("NAME", {k: v, k2: v2}). Other strings → (desc, {})."""
+    parts = str(desc).split("|")
+    attrs = {}
+    rest = []
+    for p in parts[1:]:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            attrs[_safe_key(k)] = v.strip()
+        elif p.strip():
+            rest.append(p.strip())
+    if rest:
+        attrs["extra"] = "|".join(rest)
+    return parts[0].strip(), attrs
+
+
+def _to_numeric_columns(df: pd.DataFrame, cols) -> pd.DataFrame:
+    for c in cols:
+        if c in df and not pd.api.types.is_numeric_dtype(df[c]):
+            conv = pd.to_numeric(df[c], errors="coerce")
+            # convert only if every non-empty value is numeric
+            nonempty = df[c].notna() & (df[c].astype(str) != "")
+            if nonempty.any() and conv[nonempty].notna().all():
+                df[c] = conv
+    return df
+
+
+def _phase_spans(markers: pd.DataFrame) -> list[tuple[str, float, float, dict]]:
+    """(phase, start, end, attrs) spans from *_START / *_END marker pairs and from
+    markers that have a duration (e.g. paired start/stop rows of a marker stream)."""
+    spans, open_ = [], {}
+    for on, dur, desc in markers[["onset", "duration", "description"]].itertuples(index=False):
+        name, attrs = parse_description(desc)
+        if dur and float(dur) > 0:
+            spans.append((name, float(on), float(on) + float(dur), attrs))
+        if m := _START.match(name):
+            open_[m.group(1).upper()] = (on, attrs)
+        elif (m := _END.match(name)) and m.group(1).upper() in open_:
+            key = m.group(1).upper()
+            start, a = open_.pop(key)
+            spans.append((key, start, on, a))
+    end = float(markers["onset"].max()) if len(markers) else np.inf
+    for key, (start, a) in open_.items():  # never closed: extends to the end
+        spans.append((key, start, max(end, start) + 1e9, a))
+    return spans
+
+
+def event_table(markers, gaze_events: GazeEvents | None = None, aois=None,
+                segments=None) -> pd.DataFrame:
+    """One row per marker and gaze event: onset, duration, name, kind, description, the
+    marker's columns (``NAME|key=value``), the phase (innermost ``*_START``…``*_END``
+    span or marker with a duration) and its attributes, the AOI of fixations and the
+    subject/session/run/file of the part each event falls in."""
+    markers = markers if markers is not None else pd.DataFrame(
+        columns=["onset", "duration", "description"])
+    rows = []
+    for on, dur, desc in markers[["onset", "duration", "description"]].itertuples(index=False):
+        name, attrs = parse_description(desc)
+        if name.lower() in GAZE_EVENT_NAMES:  # e.g. a "fixation" cross marker
+            name = f"{name}_marker"
+        rows.append({"onset": float(on), "duration": float(dur or 0.0), "name": name,
+                     "kind": "marker", "description": str(desc), **attrs})
+    tables = [pd.DataFrame(rows)] if rows else []
+    attr_cols = sorted({k for r in rows for k in r} - set(BASE_COLUMNS))
+
+    if gaze_events is not None:
+        f = gaze_events.fixations.copy()
+        if len(f):
+            f["name"] = "fixation"
+            f["kind"] = "fixation"
+            f["description"] = "fixation"
+            if aois is not None:  # pymovements AOI table
+                f["aoi"] = fixation_aois(f, aois)
+            tables.append(f.drop(columns=["offset"]))
+        s = gaze_events.saccades.copy()
+        if len(s):
+            s["name"] = s["kind"] = s["description"] = "saccade"
+            tables.append(s.drop(columns=[c for c in ("offset", "x0", "y0", "x1", "y1")
+                                          if c in s]))
+        b = gaze_events.blinks.copy()
+        if len(b):
+            b["name"] = b["kind"] = b["description"] = "blink"
+            tables.append(b.drop(columns=["offset"]))
+
+    if not tables:
+        return pd.DataFrame(columns=BASE_COLUMNS + ["phase"])
+    df = pd.concat(tables, ignore_index=True).sort_values("onset", ignore_index=True)
+
+    # ---- context from phases: the innermost (latest-starting) span decides the
+    # phase and fills attributes first; outer spans fill what is still empty.
+    # Inherited attributes never overwrite an event's own value.
+    spans = sorted(_phase_spans(markers), key=lambda x: -x[1])
+    df["phase"] = ""
+    if spans:
+        onset = df["onset"].to_numpy()
+        phase = np.full(len(df), "", dtype=object)
+        cols: dict[str, np.ndarray] = {}
+        for key, start, end, attrs in spans:
+            lo, hi = np.searchsorted(onset, start, "left"), np.searchsorted(onset, end, "right")
+            if hi <= lo:
+                continue
+            seg = phase[lo:hi]
+            seg[seg == ""] = key
+            for k, v in attrs.items():
+                if k not in cols:
+                    base = df[k].to_numpy(dtype=object, copy=True) if k in df else \
+                        np.full(len(df), None, dtype=object)
+                    cols[k] = base
+                    attr_cols.append(k)
+                c = cols[k][lo:hi]
+                empty = np.array([x is None or (isinstance(x, float) and np.isnan(x)) or x == ""
+                                  for x in c], dtype=bool)
+                c[empty] = v
+        df["phase"] = phase
+        for k, arr in cols.items():
+            df[k] = arr
+    # ---- which file / subject / session / run each event comes from
+    seg_cols: list[str] = []
+    if segments:
+        
+        for k, v in segment_columns(df["onset"].to_numpy(float), segments).items():
+            if k in df:  # an event's own value wins
+                own = df[k]
+                empty = own.isna() | (own.astype(str) == "")
+                df.loc[empty, k] = v[empty.to_numpy()]
+            else:
+                df[k] = v
+            seg_cols.append(k)
+    df = _to_numeric_columns(df, set(attr_cols) - set(seg_cols))  # entities stay text
+    order = BASE_COLUMNS + ["phase"] + [c for c in df.columns
+                                        if c not in BASE_COLUMNS and c != "phase"]
+    return df[order]
+
+
+#: operators of a filter condition (column, operator, value)
+OPERATORS = ("=", "≠", "<", "≤", ">", "≥", "contains", "one of")
+
+
+def _cond_mask(s: pd.Series, op: str, value: str, col: str) -> pd.Series:
+    value = str(value).strip()
+    if op == "contains":
+        return s.astype(str).str.contains(value, case=False, regex=False, na=False)
+    if op == "one of":
+        wanted = [v.strip() for v in value.split(",") if v.strip()]
+        if pd.api.types.is_numeric_dtype(s):
+            try:
+                return s.isin([float(v) for v in wanted])
+            except ValueError:
+                pass
+        return s.astype(str).isin(wanted)
+    num = pd.to_numeric(s, errors="coerce")
+    try:
+        v = float(value)
+        numeric = num.notna().any()
+    except ValueError:
+        v, numeric = value, False
+    if op in ("=", "≠"):
+        if numeric and pd.api.types.is_numeric_dtype(s):
+            m = num == v
+        else:
+            m = s.astype(str) == value
+        return m if op == "=" else ~m
+    if not numeric:
+        raise ValueError(f"“{col} {op} {value}” compares numbers: use a number "
+                         "(or =, ≠, contains, one of for text)")
+    return {"<": num < v, "≤": num <= v, ">": num > v, "≥": num >= v}[op].fillna(False)
+
+
+def apply_conditions(df: pd.DataFrame, conditions) -> pd.DataFrame:
+    """Keep rows matching every (column, operator, value) condition (see OPERATORS)."""
+    out = df
+    for col, op, value in conditions or ():
+        if not col or (value in (None, "") and op != "≠"):
+            continue
+        if col not in out:
+            raise ValueError(f"No column “{col}” in the event table")
+        if op not in OPERATORS:
+            raise ValueError(f"Unknown operator {op!r}")
+        out = out[_cond_mask(out[col], op, value, col).to_numpy()]
+    return out
+
+
+def describe_conditions(conditions) -> str:
+    return " and ".join(f"{c} {op} {v}" for c, op, v in conditions or () if c and v != "")
+
+
+def filter_events(df: pd.DataFrame, text: str = "", query: str = "",
+                  names: set[str] | None = None, conditions=None) -> pd.DataFrame:
+    """Apply column ``conditions`` [(column, operator, value), …], a regex on
+    ``description``, a pandas ``query`` and a name whitelist.
+
+    Raises ``ValueError`` with a readable message for invalid filters.
+    """
+    out = apply_conditions(df, conditions)
+    if text.strip():
+        try:
+            out = out[out["description"].astype(str).str.contains(text, case=False, regex=True)]
+        except re.error as e:
+            raise ValueError(f"Invalid text pattern: {e}") from e
+    if query.strip():
+        try:
+            out = out.query(query, engine="python")
+        except Exception as e:  # pandas raises many types here
+            raise ValueError(f"Invalid filter expression: {e}") from e
+    if names is not None:
+        out = out[out["name"].isin(names)]
+    return out
+
+
+def first_event_time(table: pd.DataFrame) -> float | None:
+    """Onset of the first marker (not gaze events, file boundaries or BAD_ spans)."""
+    if table is None or not len(table) or "kind" not in table:
+        return None
+    m = table[(table["kind"] == "marker")]
+    name = m["name"].astype(str)
+    m = m[~name.str.upper().str.startswith(("BAD", "EDGE"))]
+    return float(m["onset"].min()) if len(m) else None
+
+
+# =========================================================================== EEG basics
+def has_positions(inst) -> bool:
+    """True if at least 4 EEG channels of an MNE object have sensor locations."""
+    locs = np.array([ch["loc"][:3] for ch in inst.info["chs"]
+                     if ch["kind"] == mne.io.constants.FIFF.FIFFV_EEG_CH])
+    return len(locs) > 0 and int((np.isfinite(locs).all(1) &
+                                  (np.abs(locs).sum(1) > 0)).sum()) >= 4
+
+
+def eeg_picks(raw: mne.io.BaseRaw) -> np.ndarray:
+    picks = mne.pick_types(raw.info, eeg=True, eog=True, ecg=True, emg=True,
+                           misc=False, stim=False, exclude=[])
+    if not len(picks):  # e.g. unknown channel types from XDF
+        picks = mne.pick_types(raw.info, misc=True, exclude=[])
+    return picks
+
+
+def parse_reference(ref, raw: mne.io.BaseRaw):
+    """Normalise a reference spec → None, "average" or a list of EEG channel names.
+
+    Accepts None/"keep", "average"/"avg"/"car", a channel name, a comma- or
+    space-separated string of names, or a list. Matching is case-insensitive.
+    """
+    if ref is None:
+        return None
+    if isinstance(ref, str):
+        r = ref.strip()
+        if not r or r.lower() in ("keep", "none", "as recorded"):
+            return None
+        if r.lower() in ("average", "avg", "car", "common average"):
+            return "average"
+        names = [n for n in r.replace(";", ",").replace(",", " ").split() if n]
+    else:
+        names = list(ref)
+    eeg = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude=[])]
+    lower = {n.lower(): n for n in eeg}
+    out, missing = [], []
+    for n in names:
+        (out if n.lower() in lower else missing).append(lower.get(n.lower(), n))
+    if missing:
+        raise ValueError(f"Reference channel(s) not found among EEG channels: "
+                         f"{', '.join(missing)}")
+    return out
+
+
+def epochs_from_table(raw: mne.io.BaseRaw, table, tmin: float = -0.2, tmax: float = 0.8,
+                      baseline=(None, 0), reject_uv: float | None = None,
+                      picks="eeg") -> mne.Epochs:
+    """MNE Epochs locked to the rows of an event table, with the table as metadata.
+
+    Event IDs are the table's ``name`` column, so standard MNE selection works:
+    ``epochs["fixation"]``, ``epochs['cond == "AI"']`` (metadata query), etc.
+    Rows outside the recording, or falling on an already used sample, are
+    dropped.
+    """
+    tab = table.reset_index(drop=True).copy()
+    sf = raw.info["sfreq"]
+    samples = np.round(tab["onset"].to_numpy(float) * sf).astype(int) + raw.first_samp
+    lo = raw.first_samp + int(np.ceil(-tmin * sf))
+    hi = raw.last_samp - int(np.ceil(tmax * sf))
+    ok = (samples >= lo) & (samples <= hi)
+    counts = {"outside recording": int((~ok).sum())}
+    tab, samples = tab[ok], samples[ok]
+    _, first = np.unique(samples, return_index=True)  # MNE needs unique samples
+    keep = np.sort(first)
+    counts["same sample"] = len(tab) - len(keep)
+    tab, samples = tab.iloc[keep], samples[keep]
+    if not len(tab):
+        err = ValueError("No selected events fall inside the EEG recording")
+        err.counts = counts
+        raise err
+    names = sorted(tab["name"].astype(str).unique())
+    event_id = {n: i + 1 for i, n in enumerate(names)}
+    codes = tab["name"].astype(str).map(event_id).to_numpy()
+    events = np.column_stack([samples, np.zeros_like(samples), codes]).astype(int)
+    picks_idx = mne.pick_types(raw.info, eeg=True, exclude="bads") if picks == "eeg" else picks
+    if picks == "eeg" and not len(picks_idx):
+        picks_idx = eeg_picks(raw)
+    reject = dict(eeg=reject_uv * 1e-6) if reject_uv else None
+    meta = tab.reset_index(drop=True)
+    meta = meta.astype({c: object for c in meta.columns
+                        if isinstance(meta[c].dtype, pd.StringDtype)})
+    epochs = mne.Epochs(raw, events, event_id=event_id, tmin=tmin, tmax=tmax,
+                        baseline=baseline, picks=picks_idx, reject=reject, preload=True,
+                        metadata=meta, verbose="error")
+    epochs.selection_counts = counts  # events never epoched, by reason
+    return epochs
+
+
+def drop_reasons(epochs: mne.BaseEpochs) -> dict[str, int]:
+    """Dropped epochs by kind: amplitude (peak-to-peak or flat, named by channels) and
+    BAD annotation (overlaps a BAD_… span or a file boundary); anything else is other."""
+    out = {"amplitude": 0, "BAD annotation": 0, "other": 0}
+    chans = set(epochs.ch_names)
+    for reasons in epochs.drop_log:
+        if not reasons:
+            continue
+        if any(str(r).upper().startswith(("BAD", "EDGE")) for r in reasons):
+            out["BAD annotation"] += 1
+        elif any(r in chans for r in reasons):
+            out["amplitude"] += 1
+        elif reasons != ("IGNORED",):
+            out["other"] += 1
+    return out
+
+
+def rejection_causes(epochs: mne.BaseEpochs) -> dict[str, int]:
+    """How many epochs each channel caused to be rejected, worst first."""
+    counts: dict[str, int] = {}
+    for reasons in epochs.drop_log:
+        for r in reasons:
+            if r in epochs.ch_names:
+                counts[r] = counts.get(r, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
+# =========================================================================== preprocessing
+# =========================================================================== bad channels
+@dataclass
+class BadChannelParams:
+    ptp_max_uv: float = 250.0     # a window above this peak-to-peak is "noisy"
+    ptp_min_uv: float = 1.0       # a window below this is "flat"
+    window: float = 1.0           # s
+    max_bad_fraction: float = 0.2  # channel is bad above this fraction of bad windows
+    z_thresh: float = 4.0         # robust z of log median ptp across channels
+    l_freq: float | None = 0.1    # band-pass before measuring, so drifts and line
+    h_freq: float | None = 30.0   # noise don't count as "noisy"
+    notch: float | None = 50.0
+
+
+def _eeg_idx(raw: mne.io.BaseRaw) -> np.ndarray:
+    idx = mne.pick_types(raw.info, eeg=True, exclude=[])
+    return idx if len(idx) else eeg_picks(raw)
+
+
+def detect_bad_channels(raw: mne.io.BaseRaw, p: BadChannelParams | None = None,
+                        tmin: float | None = None) -> pd.DataFrame:
+    """Peak-to-peak statistics per EEG channel and a suggested ``bad`` flag.
+
+    The data are cut into ``p.window`` s windows (after a ``p.l_freq`` high-pass).
+    The data are band-passed (and notched) like the preprocessing will do.
+    A channel is flagged when more than ``p.max_bad_fraction`` of its windows
+    exceed ``p.ptp_max_uv`` or fall below ``p.ptp_min_uv``, or when its median
+    peak-to-peak amplitude is a robust-z outlier among channels. Data before
+    ``tmin`` (s, e.g. the first event) are ignored.
+    """
+    p = p or BadChannelParams()
+    picks = _eeg_idx(raw)
+    sf = raw.info["sfreq"]
+    win = max(int(round(p.window * sf)), 2)
+    first = _start_sample(raw, tmin)
+    n_win = (raw.n_times - first) // win
+    if n_win < 1:
+        raise ValueError("Recording is shorter than one window")
+    rows = []
+    for start in range(0, len(picks), 8):  # blocks of channels bound memory use
+        block = picks[start:start + 8]
+        x = raw.get_data(picks=block, start=first) * 1e6
+        h = p.h_freq if p.h_freq and p.h_freq < sf / 2 else None
+        lf = p.l_freq if p.l_freq and p.l_freq > 0 else None
+        if lf and highpass_method(lf):
+            x = mne.filter.filter_data(x, sf, lf, None, verbose="error", **highpass_method(lf))
+            lf = None
+        if lf or h:
+            x = mne.filter.filter_data(x, sf, lf, h, verbose="error")
+        if p.notch and p.notch < sf / 2:
+            x = mne.filter.notch_filter(x, sf, np.arange(p.notch, sf / 2, p.notch),
+                                        verbose="error")
+        x = x[:, : n_win * win].reshape(len(block), n_win, win)
+        ptp = np.ptp(x, axis=2)
+        for k, ch in enumerate(block):
+            rows.append({"channel": raw.ch_names[ch],
+                         "median_ptp_uv": float(np.median(ptp[k])),
+                         "noisy_pct": 100 * float((ptp[k] > p.ptp_max_uv).mean()),
+                         "flat_pct": 100 * float((ptp[k] < p.ptp_min_uv).mean())})
+    df = pd.DataFrame(rows)
+    lg = np.log(np.maximum(df["median_ptp_uv"].to_numpy(), 1e-6))
+    mad = np.median(np.abs(lg - np.median(lg))) * 1.4826 or 1.0
+    df["z"] = (lg - np.median(lg)) / mad
+    reasons = []
+    for r in df.itertuples():
+        why = []
+        if r.flat_pct > 100 * p.max_bad_fraction:
+            why.append("flat")
+        if r.noisy_pct > 100 * p.max_bad_fraction:
+            why.append(f"ptp > {p.ptp_max_uv:g} µV")
+        if abs(r.z) > p.z_thresh:
+            why.append("outlier")
+        reasons.append(", ".join(why))
+    df["reason"] = reasons
+    df["bad"] = df["reason"] != ""
+    return df
+
+
+# =========================================================================== ICA
+@dataclass
+class ICAParams:
+    """ICA as in the ERP guide (neuraldatascience.io): fitted on a 1–30 Hz copy cut into
+    1 s segments, the bad segments found by AutoReject, enough components for 99 % of the
+    variance, ``random_state=42``, every 3rd sample."""
+    n_components: float = 0.99    # < 1: fraction of variance; ≥ 1: number of components
+    method: str = "picard"        # picard (extended, as ICLabel expects) | fastica | infomax
+    l_freq: float = 1.0           # ICA is fitted on ≥ 1 Hz high-passed data
+    h_freq: float | None = 30.0   # … and ≤ 30 Hz low-passed
+    clean: str = "autoreject"     # bad 1 s segments: "autoreject" | "threshold"
+    reject_uv: float | None = 500.0  # threshold cleaning: skip segments above this ptp
+    target_sfreq: float = 128.0   # resample the fitting data to about this rate
+    decim: int = 3                # fit on every 3rd sample
+    max_samples: int = 300_000    # … or fewer, so long recordings stay bounded
+    autoreject_fraction: float = 1.0  # share of the segments AutoReject is fitted on
+    max_iter: int = 500           # stop a fit that does not converge
+    seed: int = 42
+    iclabel: bool = True          # label the components with ICLabel (needs positions)
+
+
+#: below this high-pass cut-off an FIR filter gets very long: use a zero-phase IIR
+IIR_BELOW_HZ = 0.5
+IIR_PARAMS = dict(order=4, ftype="butter", output="sos")
+
+
+def highpass_method(l_freq) -> dict:
+    """Filter arguments for a high-pass: FIR, or zero-phase Butterworth below 0.5 Hz."""
+    if l_freq and l_freq < IIR_BELOW_HZ:
+        return dict(method="iir", iir_params=IIR_PARAMS)
+    return {}
+
+
+def _iir_highpass(raw: mne.io.BaseRaw, l_freq: float, picks) -> None:
+    """Zero-phase Butterworth high-pass, in place, on each stretch between
+    ``edge``/``bad_acq_skip`` annotations (as ``Raw.filter`` does). Empty stretches are
+    skipped: MNE's IIR path divides by their length (a boundary annotation at the very
+    start or end of the data would crash it)."""
+    from mne.annotations import _annotations_starts_stops
+    starts, stops = _annotations_starts_stops(raw, ("edge", "bad_acq_skip"), invert=True)
+    if not len(starts):
+        starts, stops = np.array([0]), np.array([raw.n_times])
+    data = raw._data
+    for a, b in zip(starts, stops):
+        if b - a < 2:
+            continue
+        data[:, a:b] = mne.filter.filter_data(
+            data[:, a:b], raw.info["sfreq"], l_freq, None, picks=picks, method="iir",
+            iir_params=IIR_PARAMS, verbose="error")
+
+
+def filtered_copy(raw: mne.io.BaseRaw, l_freq, h_freq, notch, picks=None,
+                  tmin: float | None = None) -> mne.io.BaseRaw:
+    """A filtered copy of ``raw`` (``picks`` only, from ``tmin`` s): MNE's ``Raw.filter``
+    and ``Raw.notch_filter`` on the EEG/EOG/ECG/EMG channels. A high-pass below 0.5 Hz
+    is a zero-phase 4th-order Butterworth applied with MNE's ``filter_data`` to each
+    stretch between boundaries (``Raw.filter``'s IIR path fails on a boundary at the
+    first sample, which joined BIDS runs and cropped data have)."""
+    out = raw.copy().load_data()
+    if picks is not None:
+        out.pick(picks)
+    a = _start_sample(raw, tmin)
+    if a:
+        out.crop(tmin=a / raw.info["sfreq"], include_tmax=True)
+    fp = mne.pick_types(out.info, eeg=True, eog=True, ecg=True, emg=True, exclude=[])
+    nyq = out.info["sfreq"] / 2
+    h = h_freq if h_freq and h_freq < nyq else None
+    l_freq = l_freq if l_freq and l_freq > 0 else None  # 0 Hz = no high-pass
+    if len(fp) and l_freq and highpass_method(l_freq):
+        _iir_highpass(out, l_freq, fp)
+        if h:
+            out.filter(None, h, picks=fp, verbose="error")
+    elif len(fp) and (l_freq or h):
+        out.filter(l_freq, h, picks=fp, verbose="error")
+    if len(fp) and notch and notch < nyq:
+        out.notch_filter(np.arange(notch, nyq, notch), picks=fp, verbose="error")
+    return out
+
+
+def _start_sample(raw: mne.io.BaseRaw, tmin: float | None) -> int:
+    """Sample index of recording time ``tmin`` (0 when None or outside the data)."""
+    if not tmin or tmin <= 0:
+        return 0
+    i = int(round(tmin * raw.info["sfreq"]))
+    return i if i < raw.n_times - int(raw.info["sfreq"]) else 0  # keep ≥ 1 s of data
+
+
+def ica_channels(raw: mne.io.BaseRaw, bads=(), tmin: float | None = None) -> list[str]:
+    """Good, non-flat EEG channels (a reference channel is flat and would break ICA)."""
+    names = [raw.ch_names[i] for i in _eeg_idx(raw) if raw.ch_names[i] not in set(bads)]
+    a = _start_sample(raw, tmin)
+    sd = raw.get_data(picks=names, start=a, stop=min(raw.n_times, a + int(60 * raw.info["sfreq"])))
+    return [n for n, s in zip(names, sd.std(1)) if s > 1e-12]
+
+
+def fit_times(fit_raw: mne.io.BaseRaw) -> np.ndarray:
+    """Recording times of the samples ICA was fitted on (it may start at an event)."""
+    return fit_raw.times + getattr(fit_raw, "recording_t0", 0.0)
+
+
+def fit_ica(raw: mne.io.BaseRaw, bads=(), h_freq=None, notch=None,
+            p: ICAParams | None = None, tmin: float | None = None
+            ) -> tuple[mne.preprocessing.ICA, mne.io.BaseRaw]:
+    """Fit ICA on good EEG channels of a ≥ 1 Hz high-passed copy of ``raw``.
+
+    Data before ``tmin`` (s, e.g. the first event) are left out of the fit; the
+    ICA is still applied to the whole recording. Returns the ICA and the
+    (decimated) data it was fitted on, which :func:`score_blink_components` and
+    MNE's ICA plots need (:func:`fit_times` gives its recording times).
+    """
+    p = p or ICAParams()
+    chans = ica_channels(raw, bads, tmin)
+    if len(chans) < 3:
+        raise ValueError("ICA needs at least 3 good EEG channels")
+    h = p.h_freq if h_freq is None else h_freq
+    start = _start_sample(raw, tmin) / raw.info["sfreq"]
+    fit_raw = filtered_copy(raw, max(p.l_freq, 0.1), h, notch, picks=chans, tmin=tmin)
+    # ``chans`` are the channels the user kept: the file's own bad list (e.g. BIDS
+    # channels.tsv) must not drop any of them again inside ICA.fit
+    fit_raw.info["bads"] = []
+    # average reference, as ICLabel expects (it does not change what ICA removes: the
+    # common mode is not a component of average-referenced data)
+    fit_raw.set_eeg_reference("average", projection=False, verbose="error")
+    fit_raw.recording_t0 = start
+    decim = max(1, int(fit_raw.info["sfreq"] // p.target_sfreq))
+    if decim > 1:
+        fit_raw.resample(fit_raw.info["sfreq"] / decim, verbose="error")
+    rank = len(chans) - 1  # average reference removes one dimension
+    nc = p.n_components if p.n_components < 1 else int(min(p.n_components, rank))
+    method = p.method
+    if method == "picard":
+        try:
+            import picard  # noqa: F401
+        except ImportError:
+            method = "infomax"
+    fit_params = (dict(ortho=False, extended=True) if method == "picard" else
+                  dict(extended=True) if method == "infomax" else None)
+    ica = mne.preprocessing.ICA(n_components=nc, method=method, rng=p.seed,
+                                max_iter=p.max_iter, fit_params=fit_params)
+    notes = []
+    # 1 s segments; bad ones (AutoReject, or a peak-to-peak threshold) are left out
+    seg = ica_segments(fit_raw)
+    how = "all"
+    if p.clean == "autoreject" and len(seg) >= 20 and has_positions(seg):
+        try:
+            good = ~autoreject_bad_segments(seg, p.seed, p.autoreject_fraction)
+            how = "autoreject"
+            notes.append(f"AutoReject left out {int((~good).sum())} of {len(seg)} 1 s "
+                         "segments")
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"AutoReject failed ({type(e).__name__}), threshold used")
+            good, how = ptp_good_segments(seg, p.reject_uv), "threshold"
+    else:
+        if p.clean == "autoreject":
+            notes.append("AutoReject needs electrode positions and ≥ 20 segments: "
+                         "peak-to-peak threshold used")
+        good, how = ptp_good_segments(seg, p.reject_uv), "threshold"
+    if good.sum() < max(10, len(good) // 10):
+        notes.insert(0, f"only {int(good.sum())} of {len(good)} 1 s segments were clean "
+                        "(noisy channels kept?), so ICA was fitted on all of them")
+        good[:] = True
+        how = "all"
+    fit_on = seg[np.flatnonzero(good)]
+    every = max(p.decim, int(np.ceil(len(fit_on) * len(fit_on.times) / p.max_samples)))
+    if every > p.decim:
+        notes.append(f"fitted on every {every}th sample")
+    ica.fit(fit_on, decim=every, verbose="error")
+    if getattr(ica, "n_iter_", 0) >= p.max_iter:
+        notes.append(f"stopped after {p.max_iter} iterations without converging — fewer "
+                     "components or more bad channels may help")
+    fit_raw.ic_labels = fit_raw.ic_proba = None
+    if p.iclabel:
+        try:
+            fit_raw.ic_labels, fit_raw.ic_proba = iclabel(raw, ica, chans, notch, tmin)
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"ICLabel not run: {e}")
+    fit_raw.fit_note = "; ".join(notes)
+    # every decision taken, so an exported script can repeat exactly this fit
+    fit_raw.fit_steps = dict(
+        chans=list(chans), l_freq=max(p.l_freq, 0.1), h_freq=h, notch=notch,
+        tmin=start or None, resample=(fit_raw.info["sfreq"] if decim > 1 else None),
+        n_components=nc, method=method, fit_params=fit_params, max_iter=p.max_iter,
+        seed=p.seed, segments=how, reject_uv=p.reject_uv,
+        autoreject_fraction=p.autoreject_fraction, decim=every)
+    return ica, fit_raw
+
+
+def ica_segments(fit_raw: mne.io.BaseRaw) -> mne.Epochs:
+    """The ICA data cut into 1 s segments (ERP guide)."""
+    events = mne.make_fixed_length_events(fit_raw, duration=1.0)
+    return mne.Epochs(fit_raw, events, tmin=0.0, tmax=1.0, baseline=None, preload=True,
+                      reject_by_annotation=True, verbose="error")
+
+
+def ptp_good_segments(seg: mne.BaseEpochs, reject_uv) -> np.ndarray:
+    """Segments within a peak-to-peak threshold (MNE's ``drop_bad``)."""
+    good = np.ones(len(seg), bool)
+    if reject_uv:
+        kept = seg.copy().drop_bad(reject=dict(eeg=reject_uv * 1e-6), verbose="error")
+        good[:] = False
+        good[np.searchsorted(seg.selection, kept.selection)] = True
+    return good
+
+
+def fit_subset(n: int, fraction: float, seed: int = 42):
+    """Indices of the epochs AutoReject is fitted on: all of them (``fraction`` 1), or a
+    random, reproducible share. Fitting on a share is quicker and needs less memory, but
+    on noisy data the result can depend strongly on which epochs are drawn."""
+    if fraction >= 1 or n < 2:
+        return slice(None)
+    k = max(2, int(round(fraction * n)))
+    return np.sort(np.random.default_rng(seed).choice(n, k, replace=False))
+
+
+#: AutoReject's fit needs roughly this many times the memory of the epochs it is fitted
+#: on (measured: 1.16 GB of epochs → +14.2 GB)
+AUTOREJECT_MEMORY_FACTOR = 12.5
+
+
+def autoreject_bad_segments(epochs: mne.BaseEpochs, seed: int = 42,
+                            fraction: float = 1.0) -> np.ndarray:
+    """AutoReject (``n_interpolate=[1, 2, 4]``, ``random_state=42``) marks bad segments,
+    fitted on all segments or on a random share (:func:`fit_subset`)."""
+    import warnings
+
+    from autoreject import AutoReject
+    ar = AutoReject(n_interpolate=[1, 2, 4], random_state=seed, n_jobs=1, verbose=False,
+                    picks=mne.pick_types(epochs.info, eeg=True, eog=False))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ar.fit(epochs[fit_subset(len(epochs), fraction, seed)])
+        return np.asarray(ar.get_reject_log(epochs).bad_epochs, bool)
+
+
+#: ICLabel classes (MNE-ICALabel)
+IC_CLASSES = ("brain", "muscle artifact", "eye blink", "heart beat", "line noise",
+              "channel noise", "other")
+
+
+def iclabel(raw: mne.io.BaseRaw, ica: mne.preprocessing.ICA, chans: list[str], notch=None,
+            tmin: float | None = None) -> tuple[list[str], np.ndarray]:
+    """ICLabel class and probability of every component (MNE-ICALabel). ICLabel was
+    trained on 1–100 Hz, average-referenced data, so it gets such a copy of the channels
+    the ICA was fitted on."""
+    from mne_icalabel import label_components
+    if not has_positions(raw.copy().pick(chans)):
+        raise ValueError("the EEG channels have no electrode positions (load a montage)")
+    nyq = raw.info["sfreq"] / 2
+    lab_raw = filtered_copy(raw, 1.0, min(100.0, nyq - 1), notch, picks=chans, tmin=tmin)
+    lab_raw.info["bads"] = []
+    lab_raw.set_eeg_reference("average", projection=False, verbose="error")
+    with mne.utils.use_log_level("error"):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out = label_components(lab_raw, ica, method="iclabel")
+    return list(out["labels"]), np.asarray(out["y_pred_proba"], float)
+
+
+FRONTAL = ("Fp1", "Fp2", "Fpz", "AF7", "AF8", "AF3", "AF4")
+#: EOG stand-ins without EOG electrodes (ERP guide: Fp1, Fp2, F7, F8)
+EOG_PROXIES = ("Fp1", "Fp2", "F7", "F8")
+
+
+
+def blink_locked_score(src: np.ndarray, sfreq: float, times: np.ndarray,
+                       blinks: pd.DataFrame | None, tmin=-0.2, tmax=0.5) -> np.ndarray | None:
+    """Per component: max over time of |mean| / SEM of blink-locked segments."""
+    if blinks is None or len(blinks) < 5:
+        return None
+    on = np.searchsorted(times, blinks["onset"].to_numpy(float))
+    i0, i1 = int(round(tmin * sfreq)), int(round(tmax * sfreq))
+    on = on[(on + i0 >= 0) & (on + i1 < src.shape[1])][:3000]
+    if len(on) < 5:
+        return None
+    z = (src - src.mean(1, keepdims=True)) / (src.std(1, keepdims=True) + 1e-20)
+    idx = on[:, None] + np.arange(i0, i1)[None, :]
+    seg = z[:, idx]                                  # (comp, blinks, time)
+    seg = seg - seg[:, :, : -i0].mean(2, keepdims=True)
+    t = seg.mean(1) / (seg.std(1) / np.sqrt(len(on)) + 1e-20)
+    return np.abs(t).max(1)
+
+
+def score_blink_components(ica: mne.preprocessing.ICA, fit_raw: mne.io.BaseRaw,
+                           blinks: pd.DataFrame | None = None, eog_channels=None,
+                           z_thresh: float = 3.0, max_ic: int = 2,
+                           iclabel_p: float = 0.7) -> pd.DataFrame:
+    """Rank ICA components as blink candidates.
+
+    * ``eog_score``: |correlation| with EOG channels via ``ICA.find_bads_eog``.
+      Without EOG channels, the frontal electrodes Fp1, Fp2, F7 and F8 act as proxies.
+      As in the ERP guide, the z threshold starts at 3.5 and steps down by 0.05 until
+      ``max_ic`` components are found (not below 2.0).
+    * ``blink_t``: how strongly the component's blink-locked average (eye-tracker
+      blink onsets, −0.2…0.5 s) stands out: max |mean| / SEM, robust to jitter
+      (z-outliers above ``z_thresh`` are suggested).
+    * ``iclabel`` / ``iclabel_p``: the ICLabel class and its probability (from
+      :func:`fit_ica`); "eye blink" with p ≥ ``iclabel_p`` is suggested.
+    """
+    n = ica.n_components_
+    df = pd.DataFrame({"component": np.arange(n)})
+    eog = [c for c in (eog_channels or []) if c in fit_raw.ch_names]
+    if not eog:
+        eog = [c for c in fit_raw.ch_names
+               if mne.channel_type(fit_raw.info, fit_raw.ch_names.index(c)) == "eog"]
+    proxy = False
+    if not eog:
+        lower = {c.lower(): c for c in fit_raw.ch_names}
+        eog = [lower[c.lower()] for c in EOG_PROXIES if c.lower() in lower]
+        if not eog:
+            eog = [lower[c.lower()] for c in FRONTAL if c.lower() in lower][:2]
+        proxy = True
+    flagged = set()
+    if eog:
+        z = 3.5
+        while True:
+            idx, scores = ica.find_bads_eog(fit_raw, ch_name=eog, threshold=z,
+                                            measure="zscore", verbose="error")
+            if len(idx) >= max_ic or z <= 2.0:
+                break
+            z = round(z - 0.05, 2)
+        df.attrs["eog_z"] = z
+        scores = np.atleast_2d(np.asarray(scores))
+        df["eog_score"] = np.abs(scores).max(0)
+        flagged |= set(int(i) for i in idx)
+    else:
+        df["eog_score"] = np.nan
+    src = ica.get_sources(fit_raw).get_data()
+    t_score = blink_locked_score(src, fit_raw.info["sfreq"], fit_times(fit_raw), blinks)
+    if t_score is not None:
+        df["blink_t"] = t_score
+        mad = np.median(np.abs(t_score - np.median(t_score))) * 1.4826 or 1e-9
+        z = (t_score - np.median(t_score)) / mad
+        flagged |= set(np.flatnonzero((z > z_thresh) & (t_score > 5)).tolist())
+    else:
+        df["blink_t"] = np.nan
+    labels, proba = getattr(fit_raw, "ic_labels", None), getattr(fit_raw, "ic_proba", None)
+    if labels is not None and len(labels) == n:
+        df["iclabel"] = labels
+        df["iclabel_p"] = proba
+        flagged |= set(np.flatnonzero((df["iclabel"] == "eye blink") &
+                                      (df["iclabel_p"] >= iclabel_p)).tolist())
+    else:
+        df["iclabel"] = ""
+        df["iclabel_p"] = np.nan
+    df["suggested"] = df["component"].isin(flagged)
+    df.attrs["eog_channels"] = eog
+    df.attrs["proxy"] = proxy
+    return df
+
+
+# =========================================================================== pipeline
+@dataclass
+class PreprocParams:
+    bads: list[str] = field(default_factory=list)
+    l_freq: float | None = 0.1    # default band-pass 0.1–30 Hz with a 50 Hz notch
+    h_freq: float | None = 30.0
+    notch: float | None = 50.0
+    reference: str | list[str] | None = None
+    ica_exclude: list[int] = field(default_factory=list)
+    interpolate_bads: bool = False
+
+    def describe(self) -> str:
+        parts = [f"{len(self.bads)} bad channel(s)" + (" interpolated" if self.bads and
+                                                        self.interpolate_bads else "")]
+        band = f"{self.l_freq or 0:g}–{self.h_freq:g} Hz" if self.h_freq else \
+            (f"high-pass {self.l_freq:g} Hz" if self.l_freq else "no band-pass")
+        parts.append(band)
+        if self.notch:
+            parts.append(f"notch {self.notch:g} Hz")
+        if self.ica_exclude:
+            parts.append(f"ICA −{len(self.ica_exclude)} comp.")
+        parts.append(f"ref: {self.reference or 'as recorded'}")
+        return " · ".join(parts)
+
+
+def run_preprocessing(raw: mne.io.BaseRaw, p: PreprocParams,
+                      ica: mne.preprocessing.ICA | None = None) -> mne.io.BaseRaw:
+    """Apply the preprocessing stage to a copy of ``raw``."""
+    out = filtered_copy(raw, p.l_freq, p.h_freq, p.notch)
+    out.info["bads"] = [b for b in p.bads if b in out.ch_names]
+    if ica is not None and p.ica_exclude:
+        missing = [c for c in ica.ch_names if c not in out.ch_names]
+        if missing:
+            raise ValueError(f"ICA was fitted on channels that no longer exist: {missing}")
+        ica = ica.copy()
+        ica.exclude = list(p.ica_exclude)
+        ica.apply(out, verbose="error")
+    if p.interpolate_bads and out.info["bads"]:
+        out.interpolate_bads(reset_bads=True, verbose="error")
+    ref = parse_reference(p.reference, out)
+    if ref == "average":
+        out.set_eeg_reference("average", projection=False, verbose="error")
+    elif ref:
+        out.set_eeg_reference(ref, projection=False, verbose="error")
+    return out
+
+
+def blink_locked_average(raw: mne.io.BaseRaw, blinks: pd.DataFrame, channels,
+                         tmin=-0.3, tmax=0.6) -> tuple[np.ndarray, np.ndarray] | None:
+    """Average of ``channels`` around eye-tracker blink onsets (µV), to check ICA."""
+    chans = [c for c in channels if c in raw.ch_names and c not in raw.info["bads"]]
+    if blinks is None or not len(blinks) or not chans:
+        return None
+    sf = raw.info["sfreq"]
+    on = np.round(blinks["onset"].to_numpy(float) * sf).astype(int)
+    i0, i1 = int(round(tmin * sf)), int(round(tmax * sf))
+    on = on[(on + i0 >= 0) & (on + i1 < raw.n_times)]
+    if not len(on):
+        return None
+    x = raw.get_data(picks=chans).mean(0) * 1e6
+    seg = np.stack([x[o + i0:o + i1] for o in on[:2000]])
+    seg -= seg[:, : -i0].mean(1, keepdims=True) if i0 < 0 else 0
+    return np.arange(i0, i1) / sf, seg.mean(0)
+
+
+
+
+
+# =========================================================================== epoching
+@dataclass
+class EpochSettings:
+    """Defaults follow the ERP guide (neuraldatascience.io): −0.1 … 1.0 s, no fixed
+    amplitude threshold, AutoReject interpolates bad channels per epoch and drops the
+    epochs it cannot repair."""
+    tmin: float = -0.1
+    tmax: float = 1.0
+    reject_uv: float | None = None    # peak-to-peak rejection (EEG)
+    autoreject: bool = True           # AutoReject (local): interpolate, then drop
+    autoreject_fraction: float = 1.0  # share of the epochs AutoReject is fitted on
+    flat_uv: float | None = None      # reject epochs flatter than this
+    drop_blinks: bool = False         # drop epochs overlapping an eye-tracker blink
+    delay_ms: float = 0.0             # EEG recording delay: + moves events later
+
+    def describe(self) -> str:
+        s = f"{self.tmin:g} … {self.tmax:g} s"
+        if self.reject_uv:
+            s += f", reject ptp > {self.reject_uv:g} µV"
+        if self.flat_uv:
+            s += f", flat < {self.flat_uv:g} µV"
+        if self.autoreject:
+            s += ", AutoReject" + (f" (fitted on {self.autoreject_fraction:.0%})"
+                                   if self.autoreject_fraction < 1 else "")
+        if self.drop_blinks:
+            s += ", no blinks"
+        if self.delay_ms:
+            s += f", EEG delay {self.delay_ms:+g} ms"
+        return s
+
+
+def overlaps(onsets: np.ndarray, tmin: float, tmax: float,
+             intervals: pd.DataFrame | None) -> np.ndarray:
+    """True for each onset whose window [onset+tmin, onset+tmax] overlaps an interval."""
+    out = np.zeros(len(onsets), bool)
+    if intervals is None or not len(intervals):
+        return out
+    s = intervals["onset"].to_numpy(float)
+    e = s + intervals["duration"].to_numpy(float)
+    order = np.argsort(s)
+    s, e = s[order], e[order]
+    emax = np.maximum.accumulate(e)
+    a, b = onsets + tmin, onsets + tmax
+    k = np.searchsorted(s, b, side="right") - 1  # last interval starting before b
+    valid = k >= 0
+    out[valid] = emax[k[valid]] > a[valid]
+    return out
+
+
+def build_group_epochs(raw: mne.io.BaseRaw, groups: dict[str, pd.DataFrame],
+                       settings: EpochSettings, blinks: pd.DataFrame | None = None
+                       ) -> tuple[dict[str, mne.Epochs], pd.DataFrame]:
+    """One ``mne.Epochs`` per group (metadata = event rows + ``group`` column).
+
+    Returns the epochs and a summary table per group: selected; dropped before
+    epoching because of a blink, the window falling outside the recording or another
+    event on the same sample; rejected by amplitude
+    (peak-to-peak/flat) or by a BAD annotation; kept; and the channels behind
+    amplitude rejections.
+    """
+    out, rows = {}, []
+    for name, table in groups.items():
+        tab = table.copy()
+        if settings.delay_ms:  # the EEG lags the events: cut epochs later
+            tab["onset"] = tab["onset"] + settings.delay_ms / 1000.0
+        n_sel = len(tab)
+        n_blink = 0
+        if settings.drop_blinks and blinks is not None and len(tab):
+            hit = overlaps(tab["onset"].to_numpy(float), settings.tmin, settings.tmax, blinks)
+            n_blink = int(hit.sum())
+            tab = tab[~hit]
+        row = {"group": name, "selected": n_sel, "blink": n_blink,
+               "outside recording": 0, "same sample": 0,
+               "rejected (amplitude)": 0, "rejected (BAD annotation)": 0, "kept": 0,
+               "rejected by": ""}
+        if len(tab):
+            tab = tab.assign(group=name)
+            try:
+                ep = epochs_from_table(raw, tab, settings.tmin, settings.tmax, baseline=None,
+                                         reject_uv=settings.reject_uv)
+            except ValueError as e:
+                ep = None
+                row.update(getattr(e, "counts", {"outside recording": len(tab)}))
+            if ep is not None and settings.flat_uv:
+                ep.drop_bad(flat=dict(eeg=settings.flat_uv * 1e-6), verbose="error")
+            if ep is not None:
+                row.update(ep.selection_counts)
+                why = drop_reasons(ep)
+                row["rejected (amplitude)"] = why["amplitude"] + why["other"]
+                row["rejected (BAD annotation)"] = why["BAD annotation"]
+                row["kept"] = len(ep)
+                causes = rejection_causes(ep)
+                row["rejected by"] = ", ".join(f"{c} ({n})" for c, n in list(causes.items())[:6])
+                if len(ep):
+                    out[name] = ep
+        rows.append(row)
+    summary = pd.DataFrame(rows)
+    if settings.autoreject and out:
+        out, summary = apply_autoreject(out, summary, settings.autoreject_fraction)
+    return out, summary
+
+
+def apply_autoreject(epochs: dict[str, mne.Epochs], summary: pd.DataFrame,
+                     fraction: float = 1.0, seed: int = 42
+                     ) -> tuple[dict[str, mne.Epochs], pd.DataFrame]:
+    """AutoReject (``n_interpolate=[1, 2, 4]``, ``random_state=42``), as in the ERP guide:
+    fitted once on the epochs of every group (all, or a random share), then each
+    group is cleaned — bad channels are interpolated within an epoch and the epochs that
+    cannot be repaired are dropped. Needs electrode positions and ≥ 10 epochs."""
+    import warnings
+
+    summary = summary.copy()
+    summary["rejected (AutoReject)"] = 0
+    summary["interpolated (AutoReject)"] = 0
+    every = list(epochs.values())
+    n = sum(len(e) for e in every)
+    if not has_positions(every[0]):
+        summary.attrs["autoreject"] = "not applied: the EEG channels have no positions"
+        return epochs, summary
+    if n < 10:
+        summary.attrs["autoreject"] = "not applied: fewer than 10 epochs"
+        return epochs, summary
+    from autoreject import AutoReject
+    with warnings.catch_warnings(), mne.utils.use_log_level("error"):
+        warnings.simplefilter("ignore")
+        # fitting needs only the data: one array of every group's epochs (their event
+        # codes may clash, which mne.concatenate_epochs refuses)
+        sizes = [len(e) for e in every]
+        pick = fit_subset(n, fraction, seed)
+        pick = np.arange(n) if isinstance(pick, slice) else pick
+        starts = np.cumsum([0] + sizes)
+        data = np.concatenate([every[k].get_data(item=pick[(pick >= starts[k]) &
+                                                         (pick < starts[k + 1])] - starts[k])
+                               for k in range(len(every))])
+        allep = mne.EpochsArray(data, every[0].info, tmin=every[0].tmin, baseline=None,
+                                verbose="error")
+        ar = AutoReject(n_interpolate=[1, 2, 4], random_state=seed, n_jobs=1,
+                        verbose=False, picks=mne.pick_types(allep.info, eeg=True, eog=False))
+        ar.fit(allep)
+        out = {}
+        for g, ep in epochs.items():
+            ep = ep.copy().load_data()
+            log = ar.get_reject_log(ep)
+            clean = ar.transform(ep)
+            i = summary.index[summary["group"] == g][0]
+            summary.loc[i, "rejected (AutoReject)"] = int(np.sum(log.bad_epochs))
+            summary.loc[i, "interpolated (AutoReject)"] = int(
+                (log.labels[~log.bad_epochs] == 2).sum())
+            summary.loc[i, "kept"] = len(clean)
+            if len(clean):
+                out[g] = clean
+    summary.attrs["autoreject"] = "applied"
+    return out, summary

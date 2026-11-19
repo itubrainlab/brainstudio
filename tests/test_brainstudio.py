@@ -249,7 +249,7 @@ def test_pipeline_bads_ica_groups_bandpower(demo):
                              ica_exclude=sc.loc[sc.suggested, "component"].tolist())
     clean = P.run_preprocessing(raw, params, ica)
     assert clean.info["bads"] == bads and raw.info["bads"] == []  # input untouched
-    before = P.blink_locked_average(P._filtered(raw, 1, 40, None), ev.blinks, ["Fp1", "Fp2"])
+    before = P.blink_locked_average(P.filtered_copy(raw, 1, 40, None), ev.blinks, ["Fp1", "Fp2"])
     after = P.blink_locked_average(clean, ev.blinks, ["Fp1", "Fp2"])
     assert np.ptp(after[1]) < 0.5 * np.ptp(before[1])                            # blinks gone
 
@@ -368,7 +368,7 @@ def test_multicolumn_markers_pair_and_keep_every_column(tmp_path):
     tab2 = EV.build_event_table(load_xdf(tmp_path / "m.xdf", options=opts))
     assert "emotion" in tab2 and "response" not in tab2 and "trials_end" not in set(tab2.name)
     # phase inheritance from events with a duration; "fixation" is not a *_ON phase
-    assert EV._START.match("fixation") is None
+    assert __import__("brainstudio.core").core._START.match("fixation") is None
 
 
 def test_load_many_xdf_with_entities(demo, tmp_path):
