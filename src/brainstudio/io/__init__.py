@@ -156,3 +156,6 @@ def load_xdf(path, screen_size=(1920, 1080), roles=None, options=None) -> Record
 
 def concatenate(recs: list[Recording]) -> Recording:
     return _joined(recs, recs[0])
+
+
+from . import bids, markers, multi, xdf  # noqa: E402,F401  (submodules used as io.bids etc.)

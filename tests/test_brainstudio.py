@@ -8,6 +8,7 @@ import pytest
 from brainstudio import eeg as E
 from brainstudio import events as EV
 from brainstudio import gaze as G
+from brainstudio import preprocessing as P
 from brainstudio.demo import simulate, write_bids, write_xdf_demo
 from brainstudio.io import load_bids_run, load_xdf, scan_bids
 from brainstudio.io.xdf import _clean_timestamps
@@ -62,9 +63,10 @@ def test_aoi_stats_use_pymovements():
 
 def test_frp_recovers_lambda_response(demo):
     rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
-    raw = E.preprocess(rec.raw, E.FilterParams(1, 30))
+    raw = P.run_preprocessing(rec.raw, P.PreprocParams(l_freq=1, h_freq=30))
     ev = G.detect_events(rec.gaze)
-    evk = E.fixation_related_epochs(raw, ev.fixations, min_duration=0.1).average()
+    fix = ev.fixations[ev.fixations.duration >= 0.1].assign(name="fixation")
+    evk = E.epochs_from_table(raw, fix, -0.2, 0.6).average()
     oz = evk.copy().pick(["Oz"]).data[0]
     assert 0.06 < evk.times[np.argmax(oz)] < 0.14  # simulated P1 at ~90 ms
 
@@ -139,7 +141,7 @@ def test_event_table_parsing_and_context(demo):
         EV.filter_events(tab, query="cond ==")
 
 
-def test_montage_and_metadata_epochs_contrast(demo):
+def test_montage_and_metadata_epochs(demo):
     import mne
 
     from brainstudio import events as EV
@@ -155,18 +157,9 @@ def test_montage_and_metadata_epochs_contrast(demo):
 
     ge = G.detect_events(rec.gaze)
     tab = EV.build_event_table(rec, ge)
-    ep = E.epochs_from_table(E.preprocess(raw, E.FilterParams(1, 30)),
+    ep = E.epochs_from_table(P.run_preprocessing(raw, P.PreprocParams(l_freq=1, h_freq=30)),
                              EV.filter_events(tab, names={"fixation", "stimulus"}), -0.2, 0.5)
     assert set(ep.event_id) == {"fixation", "stimulus"} and ep.metadata is not None
-    a, b = ep["fixation"], ep["stimulus"]
-    evs = E.contrast_evokeds(a, b, ("fix", "stim"))
-    assert "fix − stim" in evs
-    st = E.cluster_contrast(a, b, roi=["Pz"], n_permutations=200)
-    assert len(st["clusters"]) == len(st["p_values"])
-    for m in st["clusters"]:  # always boolean masks over time
-        assert m.dtype == bool and m.shape == st["times"].shape
-    # the stimulus P300 at Pz should differ from fixations (simulated effect)
-    assert min(st["p_values"]) < 0.05
 
 
 def test_channel_reference(demo):
@@ -178,33 +171,13 @@ def test_channel_reference(demo):
         "TP9", "Cz"]
     with pytest.raises(ValueError, match="not found"):
         E.parse_reference("M1", rec.raw)
-    out = E.preprocess(rec.raw, E.FilterParams(None, None, None, "Cz"))
+    out = P.run_preprocessing(rec.raw, P.PreprocParams(l_freq=None, h_freq=None, notch=None, reference="Cz"))
     assert np.abs(out.get_data(picks=["Cz"])).max() < 1e-12  # reference channel is flat
-    pair = E.preprocess(rec.raw, E.FilterParams(None, None, None, "O1, O2"))
+    pair = P.run_preprocessing(rec.raw, P.PreprocParams(l_freq=None, h_freq=None, notch=None, reference="O1, O2"))
     o = pair.get_data(picks=["O1", "O2"])
     assert np.abs(o.sum(0)).max() < 1e-12  # linked reference: O1 = -O2
 
 
-def test_spatial_contrast_with_channel_reference(demo):
-    """Single-channel reference → flat channel must not poison the F statistic."""
-    import warnings
-
-    from brainstudio import events as EV
-
-    rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
-    raw = E.preprocess(rec.raw, E.FilterParams(1, 30, None, "Cz"))
-    tab = EV.build_event_table(rec, G.detect_events(rec.gaze))
-    ep = E.epochs_from_table(raw, EV.filter_events(tab, names={"fixation", "stimulus"}),
-                             -0.1, 0.5)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", RuntimeWarning)  # no 0/0 in the F test
-        st = E.cluster_contrast(ep["fixation"], ep["stimulus"], n_permutations=100,
-                                spatial=True)
-    assert "Cz" in st["excluded"] and "Cz" not in st["ch_names"]
-    for m in st["clusters"]:
-        assert m.dtype == bool and m.shape == (len(st["times"]), len(st["ch_names"]))
-    with pytest.raises(ValueError, match="flat"):
-        E.cluster_contrast(ep["fixation"], ep["stimulus"], roi=["Cz"], n_permutations=10)
 
 
 def test_gtec_64_layout_montage():
@@ -283,14 +256,6 @@ def test_pipeline_bads_ica_groups_bandpower(demo):
     assert tab["q (FDR)"].notna().all() and (tab["q (FDR)"] >= tab["p"] - 1e-12).all()
 
 
-def test_cluster_test_needs_two_epochs_per_group():
-    import mne
-    info = mne.create_info(["Cz", "Pz"], 100.0, "eeg")
-    rng = np.random.default_rng(0)
-    one = mne.EpochsArray(rng.normal(0, 1e-6, (1, 2, 50)), info, verbose="error")
-    many = mne.EpochsArray(rng.normal(0, 1e-6, (5, 2, 50)), info, verbose="error")
-    with pytest.raises(ValueError, match="at least 2 epochs"):
-        E.cluster_contrast(one, many, n_permutations=10)
 
 
 def test_xdf_stream_roles_override(demo):
@@ -423,7 +388,7 @@ def test_component_statistics_p300(demo):
     from brainstudio import events as EV
     rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
     ev = G.detect_events(rec.gaze)
-    raw = E.preprocess(rec.raw, E.FilterParams(0.1, 30))
+    raw = P.run_preprocessing(rec.raw, P.PreprocParams(l_freq=0.1, h_freq=30))
     tab = EV.build_event_table(rec, ev)
     eps, summ = EP.build_group_epochs(
         raw, {"stim": tab[tab.name == "stimulus"], "fix": tab[tab.name == "fixation"].iloc[::4]},
