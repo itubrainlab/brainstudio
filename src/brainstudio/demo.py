@@ -15,6 +15,7 @@ from pathlib import Path
 
 import mne
 import numpy as np
+import pandas as pd
 
 from .core import standard_montage
 
@@ -152,10 +153,44 @@ def make_raw(sim: SimData) -> mne.io.RawArray:
     return raw
 
 
-def write_bids(root: str | Path, subjects=("01", "02")) -> Path:
+def write_stimuli(root: Path) -> list[str]:
+    """Pictures and a short video in the dataset's ``stimuli`` folder (BIDS), as shown at
+    the stimulus events: the files, relative to that folder."""
+    from PIL import Image, ImageDraw
+    out = root / "stimuli"
+    (out / "images").mkdir(parents=True, exist_ok=True)
+    (out / "videos").mkdir(parents=True, exist_ok=True)
+    files = []
+    for k, (bg, fg) in enumerate((((40, 60, 90), (240, 200, 80)), ((70, 30, 40), (120, 220, 200)),
+                                  ((30, 70, 50), (250, 120, 90)))):
+        im = Image.new("RGB", (1280, 720), bg)
+        draw = ImageDraw.Draw(im)
+        for j in range(5):  # shapes where the synthetic gaze tends to land
+            x, y = 160 + 230 * j, 200 + 160 * ((j + k) % 3)
+            draw.ellipse((x - 70, y - 70, x + 70, y + 70), fill=fg)
+        draw.text((40, 30), f"scene {k + 1}", fill=(255, 255, 255))
+        im.save(out / "images" / f"scene{k + 1}.png")
+        files.append(f"images/scene{k + 1}.png")
+    import av
+    with av.open(str(out / "videos" / "clip1.mp4"), "w") as c:
+        s = c.add_stream("mpeg4", rate=25)
+        s.width, s.height, s.pix_fmt = 640, 360, "yuv420p"
+        for i in range(75):  # 3 s: a dot moving left to right
+            im = Image.new("RGB", (640, 360), (70, 90, 130))
+            x = 40 + i * 7
+            ImageDraw.Draw(im).ellipse((x - 25, 155, x + 25, 205), fill=(250, 240, 120))
+            for packet in s.encode(av.VideoFrame.from_image(im)):
+                c.mux(packet)
+        for packet in s.encode():
+            c.mux(packet)
+    return files + ["videos/clip1.mp4"]
+
+
+def write_bids(root: str | Path, subjects=("01", "02"), stimuli: bool = True) -> Path:
     from mne_bids import BIDSPath, make_dataset_description, write_raw_bids
 
     root = Path(root)
+    files = write_stimuli(root) if stimuli else []
     for k, sub in enumerate(subjects):
         sim = simulate(seed=k)
         raw = make_raw(sim)
@@ -163,6 +198,13 @@ def write_bids(root: str | Path, subjects=("01", "02")) -> Path:
         write_raw_bids(raw, bp, format="BrainVision", allow_preload=True,
                        event_id={"stimulus": 1, "response": 2}, overwrite=True,
                        verbose="error")
+        if files:  # what each stimulus event showed (events.tsv stim_file)
+            tsv = bp.copy().update(suffix="events", extension=".tsv").fpath
+            ev = pd.read_csv(tsv, sep="\t", dtype=str, keep_default_na=False)
+            k = (ev["trial_type"] == "stimulus").cumsum() - 1
+            ev["stim_file"] = [files[i % len(files)] if t == "stimulus" else "n/a"
+                               for i, t in zip(k, ev["trial_type"])]
+            ev.to_csv(tsv, sep="\t", index=False)
         # eye tracking (BIDS 1.10 physio, eye-tracker clock in ms)
         base = bp.copy().update(suffix=None, extension=None).basename
         d = bp.directory

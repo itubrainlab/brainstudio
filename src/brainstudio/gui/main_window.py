@@ -26,6 +26,7 @@ from .controllers import Controller
 from .pipeline import EEGPipeline
 from .preprocess_tab import PreprocessTab
 from .screenview import ScreenView
+from .stimulus_dialog import StimulusDialog
 from .stream_dialog import StreamDialog
 from .theme import THEME, apply_theme
 from .timeplots import EEGPlot, GazePlot, OverviewBar
@@ -56,6 +57,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ctl = Controller(self.session, self.worker)
         self.display_raw: mne.io.BaseRaw | None = None
         self.pupil_clean = None
+        self.stim_reader = C.StimulusReader()  # stimulus images and video frames
+        self.fixed_stimulus = None             # one image for the whole recording
         self.bids_root: Path | None = None
         self.cursor_t = 0.0
 
@@ -138,8 +141,8 @@ class MainWindow(QtWidgets.QMainWindow):
                   "recording (Ctrl+E)", self.action_attach_gaze),
                  ("Montage", icons.cap(), "Channel names & montage (Ctrl+M)",
                   self.action_montage),
-                 ("Stimulus", icons.image(), "Load a stimulus image for the screen view "
-                  "(Ctrl+I)", self.action_stimulus),
+                 ("Stimulus", icons.image(), "Which image or video each event showed, for "
+                  "the screen view (Ctrl+I)", self.action_stimulus),
                  ("Export", icons.export(), "Export gaze events (CSV)",
                   self.export_gaze_events),
                  ("Snapshot", icons.camera(), "Save the screen view (PNG)", self.export_screen))
@@ -519,7 +522,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("&Open file (XDF / EEG / EyeLink)…", QtGui.QKeySequence.Open, self.action_open_file),
             ("Attach &eye-tracking file…", "Ctrl+E", self.action_attach_gaze),
             ("Channel names && &montage…", "Ctrl+M", self.action_montage),
-            ("Load &stimulus image…", "Ctrl+I", self.action_stimulus),
+            ("&Stimuli: events → images / videos…", "Ctrl+I", self.action_stimulus),
+            ("Load one image for the whole recording…", None, self.action_fixed_stimulus),
             (None, None, None),
             ("Export gaze events (CSV)…", None, self.export_gaze_events),
             ("Save screen view (PNG)…", None, self.export_screen),
@@ -605,14 +609,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     def action_stimulus(self):
-        fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Stimulus image", "",
-                                                      "Images (*.png *.jpg *.jpeg *.bmp)")
+        """Which stimulus each event showed (folder, event column, value → file)."""
+        if self.rec is None:
+            QtWidgets.QMessageBox.information(self, "Stimuli", "Load a recording first.")
+            return
+        dlg = StimulusDialog(self.session, self)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            self.ctl.set_stimuli(*dlg.result_settings())
+
+    def action_fixed_stimulus(self):
+        """One image behind the gaze for the whole recording (e.g. a screenshot)."""
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Stimulus image", "", "Images (" + " ".join(
+                f"*{e}" for e in C.STIMULUS_IMAGES) + ")")
         if fn:
-            import matplotlib.image as mpimg
-            img = mpimg.imread(fn)
-            if img.dtype != np.uint8:
-                img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
-            self.screen.set_stimulus(img)
+            self.fixed_stimulus = C.StimulusReader().frame(fn, "image")
+            self._update_screen()
 
     def open_bids(self, root):
         root = Path(root)
@@ -745,6 +757,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 c.setData([], [])
         self.topo.set_raw(self.display_raw)
         self.gaze_plot.set_gaze(rec.gaze)
+        self.fixed_stimulus = None
+        self.stim_reader.close()
+        self.overview.set_stimuli(self.session.stimuli)
         self._update_gaze_visibility()
         if self.gaze_events is not None:  # detected while loading
             self._show_gaze_events(rebuilt=False)
@@ -1066,6 +1081,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_gaze_events()
         elif what == "channels":
             self._channels_changed()
+        elif what == "stimuli":
+            self._stimuli_changed()
 
     def _channels_changed(self):
         """Channels renamed or retyped (montage, trigger channel): the preprocessing
@@ -1268,7 +1285,8 @@ class MainWindow(QtWidgets.QMainWindow):
         shown only when the recording has gaze data."""
         has = self.rec is not None and self.rec.has_gaze
         self.gaze_plot.setVisible(has)
-        self.screen.setVisible(has)
+        self.screen.setVisible(has or len(self.session.stimuli) > 0
+                               or self.fixed_stimulus is not None)
         self.tabs.setTabVisible(self.tabs.indexOf(self.gaze_tab), has)
         self.gaze_box.setVisible(has)
         for w in (*self.ov_checks.values(), self.cb_scan, self.cb_heat, self.trail):
@@ -1428,7 +1446,31 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.rec is None:
             return
         t0, t1 = self.eeg_plot.window()
+        self._show_stimulus(self.cursor_t)
         self.screen.update_view(self.rec.gaze, self.gaze_events, self.cursor_t, t0, t1)
+
+    def _show_stimulus(self, t: float):
+        """The stimulus on screen at ``t`` (the video frame of that moment)."""
+        if self.fixed_stimulus is not None:
+            self.screen.set_stimulus(self.fixed_stimulus)
+            return
+        s = C.stimulus_at(self.session.stimuli, t)
+        if s is None:
+            self.screen.set_stimulus(None)
+            return
+        try:
+            img = self.stim_reader.frame(s["path"], s["kind"], t - s["onset"])
+        except Exception as e:  # noqa: BLE001  (missing or broken file)
+            self.screen.set_stimulus(None, f"{s['file']}: {e}")
+            return
+        caption = s["file"] + (f"  {t - s['onset']:.2f} s" if s["kind"] == "video" else "")
+        self.screen.set_stimulus(img, caption)
+
+    def _stimuli_changed(self):
+        self.stim_reader.close()
+        self.overview.set_stimuli(self.session.stimuli)
+        self._update_gaze_visibility()
+        self._update_screen()
 
     def _on_tab(self, i):
         if self.tabs.widget(i) is self.gaze_tab:

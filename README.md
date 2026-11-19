@@ -145,7 +145,30 @@ Loading a BIDS run also reads the dataset's own information:
 
 MNE-BIDS reads the files. If it fails on broken sidecars, brAInStudio falls back to a
 plain reader and applies `channels.tsv` itself. When runs are combined, a channel bad in
-any run is bad in the combined recording.
+any run is bad in the combined recording. `events.tsv` is the reference for events:
+messages of an eye-tracking file are added only when they are not the same event (same
+name within 20 ms).
+
+### Stimuli (images and videos)
+
+When the dataset has a `stimuli` folder, the screen view shows what was on screen while
+you move the cursor or play the recording. Each stimulus appears at its event's onset and
+stays for the event's duration (from `events.tsv`), or until the next stimulus when the
+event has no duration. Videos play in step with the timeline. The overview bar marks
+when stimuli were shown, and the screen view names the file. The screen view also
+appears for EEG-only recordings that have stimuli.
+
+**Stimulus** (Ctrl+I) chooses which event column names the stimulus and maps its values
+to files. The default is the BIDS `stim_file` column when the events have one, else the
+column whose values name the most files. Values are matched to files by path, file name
+or name without extension, so an `image_id` of 82 shows `stimuli/82.png`. Each value can
+be mapped to another file, with a preview, and another folder can be chosen.
+
+Images are shown at their own size in the centre of the screen, and scaled down when
+larger than the screen (as most presentation software shows them). *File ▸ Load one
+image for the whole recording* puts one picture, e.g. a screenshot, behind the gaze for
+the whole recording. Images: PNG, JPEG, BMP, GIF, TIFF, WebP. Videos: MP4, MOV, AVI,
+MKV, WebM, MPEG (read with PyAV).
 
 ### Several files
 

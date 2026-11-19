@@ -38,6 +38,12 @@ class ScreenView(pg.PlotWidget):
         self.image = pg.ImageItem()
         self.image.setZValue(-20)
         self.addItem(self.image)
+        self._shown = None
+        self.caption = pg.TextItem("", color=(235, 235, 240), anchor=(0, 0),
+                                   fill=pg.mkBrush(0, 0, 0, 150))
+        self.caption.setZValue(60)
+        self.caption.setPos(8, 8)
+        self.addItem(self.caption)
         self.heat = pg.ImageItem()
         self.heat.setZValue(-10)
         self.heat.setOpacity(0.7)
@@ -76,14 +82,21 @@ class ScreenView(pg.PlotWidget):
         self.plotItem.disableAutoRange()
         self.plotItem.getViewBox().setRange(QtCore.QRectF(0, 0, *self.screen), padding=0.03)
 
-    def set_stimulus(self, img: np.ndarray | None):
+    def set_stimulus(self, img: np.ndarray | None, caption: str = ""):
+        """Show ``img`` (rows, cols, [rgb]) where it was on screen: at its own size in the
+        centre, scaled down to fit when larger (see :func:`core.stimulus_rect`)."""
+        self.caption.setText(caption)
         if img is None:
-            self.image.clear()
+            if self._shown is not None:
+                self.image.clear()
+            self._shown = None
             return
+        if img is self._shown:  # same picture / video frame: nothing to redraw
+            return
+        self._shown = img
         # image arrays are (rows, cols, [rgb]); ImageItem expects (x, y)
-        arr = np.swapaxes(img, 0, 1)
-        self.image.setImage(arr, autoLevels=img.dtype != np.uint8)
-        self.image.setRect(QtCore.QRectF(0, 0, *self.screen))
+        self.image.setImage(np.swapaxes(img, 0, 1), autoLevels=img.dtype != np.uint8)
+        self.image.setRect(QtCore.QRectF(*C.stimulus_rect(img.shape, self.screen)))
 
     def set_heatmap(self, hm: np.ndarray | None):
         if hm is None or not self.show_heatmap or not np.any(hm):

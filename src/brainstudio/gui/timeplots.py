@@ -375,6 +375,23 @@ class OverviewBar(pg.PlotWidget):
             self.addItem(txt)
             self._spans += [reg, txt]
 
+    def set_stimuli(self, stimuli: pd.DataFrame | None):
+        """When stimuli were on screen: a strip of bars along the bottom (images light,
+        videos darker)."""
+        if getattr(self, "_stim_bars", None) is not None:
+            self.removeItem(self._stim_bars)
+        self._stim_bars = None
+        if stimuli is None or not len(stimuli):
+            return
+        video = (stimuli["kind"] == "video").to_numpy()
+        self._stim_bars = pg.BarGraphItem(
+            x0=stimuli["onset"].to_numpy(float), x1=stimuli["end"].to_numpy(float), y0=0.0,
+            height=0.14, pen=None, brushes=[pg.mkBrush(THEME.s(2, 200 if v else 110))
+                                            for v in video])
+        self._stim_bars.setZValue(-5)
+        self._stim_bars.setToolTip(f"{len(stimuli)} stimuli ({video.sum()} videos)")
+        self.addItem(self._stim_bars)
+
     def set_recording(self, duration: float, events: pd.DataFrame, gaze=None):
         self.plotItem.setXRange(0, max(duration, 1e-3), padding=0.01)
         self.plotItem.setYRange(0, 1.05, padding=0)

@@ -57,6 +57,10 @@ class Controller:
     def set_gaze_offset(self, seconds: float) -> bool:
         return self.session.set_gaze_offset(seconds)
 
+    def set_stimuli(self, folder, column, mapping):
+        """Which stimulus file each value of an event column shows."""
+        self.session.set_stimuli(folder, column, mapping)
+
     def set_aois(self, specs: dict):
         self.session.set_aois(specs)
 

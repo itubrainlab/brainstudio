@@ -809,8 +809,17 @@ def read_bids_run(root, run, screen=None):
         messages.append(ev)
         if gaze is None or "eye1" in gp.name:
             gaze = g
-    if messages:
-        events = pd.concat([f for f in messages if len(f)] or [events], ignore_index=True)
+    messages = [m for m in messages if len(m)]
+    if messages:  # events.tsv is the reference: tracker messages add only other events
+        msgs = pd.concat(messages, ignore_index=True).sort_values("onset", ignore_index=True)
+        if len(events):
+            name = lambda d: d.astype(str).str.split("|").str[0].str.strip()  # noqa: E731
+            known = events.assign(name=name(events["description"]), dup=True)[
+                ["onset", "name", "dup"]].sort_values("onset")
+            same = pd.merge_asof(msgs.assign(name=name(msgs["description"])), known,
+                                 on="onset", by="name", tolerance=0.02, direction="nearest")
+            msgs = msgs[same["dup"].isna().to_numpy()]
+        events = pd.concat([events, msgs], ignore_index=True)
     if raw is None and gaze is not None and gaze["t"].iloc[0] != 0:
         t0 = gaze["t"].iloc[0]
         gaze["t"] -= t0
@@ -1302,6 +1311,165 @@ def gaze_summary(ev: GazeEvents, duration: float) -> pd.DataFrame:
         ("Mean peak velocity (px/s)", s["peak_velocity"].mean() if len(s) else np.nan),
         ("Blinks", len(b)), ("Blink rate (/min)", 60 * len(b) / dur)],
         columns=["measure", "value"])
+
+
+# =========================================================================== stimuli
+STIMULUS_IMAGES = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp")
+STIMULUS_VIDEOS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".mpg", ".mpeg")
+
+
+def stimulus_files(folder) -> list[str]:
+    """The images and videos in a folder (and its sub-folders), as paths relative to it."""
+    folder = Path(folder) if folder else None
+    if folder is None or not folder.is_dir():
+        return []
+    return sorted(p.relative_to(folder).as_posix() for p in folder.rglob("*")
+                  if p.is_file() and p.suffix.lower() in STIMULUS_IMAGES + STIMULUS_VIDEOS)
+
+
+def _marker_values(table, column) -> pd.Series:
+    """The values of an event column on the markers ("" where empty)."""
+    if table is None or column not in table:
+        return pd.Series(dtype=str)
+    v = table.loc[table["kind"] == "marker", column]
+    if pd.api.types.is_numeric_dtype(v):  # 82.0 → "82", as in a file name
+        v = v.dropna().map(lambda x: f"{x:g}" if float(x).is_integer() else str(x))
+    v = v.astype(str).str.strip()
+    return v[~v.isin(["", "n/a", "nan", "None", "<NA>"])]
+
+
+def match_stimuli(values, files) -> dict[str, str]:
+    """Each event value → the stimulus file it names: the same path, file name or name
+    without extension (ignoring case); values that match no file are left out."""
+    keys = {}
+    for f in files:
+        for k in (f, Path(f).name, Path(f).stem):
+            keys.setdefault(k.lower(), f)
+    return {v: keys[str(v).strip().lower()] for v in values
+            if str(v).strip().lower() in keys}
+
+
+def guess_stimulus_column(table, files) -> str | None:
+    """The event column that names the stimuli: BIDS ``stim_file`` when the events have
+    it, else the one with the largest share of values that match a file."""
+    if table is not None and len(_marker_values(table, "stim_file")):
+        return "stim_file"
+    if table is None or not files:
+        return None
+    best = (0.0, 0, None)
+    for c in table.columns:
+        if c in ("onset", "duration", "kind", "phase"):
+            continue
+        vals = _marker_values(table, c).unique()
+        n = len(match_stimuli(vals, files))
+        if n and (n / len(vals), n) > best[:2]:
+            best = (n / len(vals), n, c)
+    return best[2]
+
+
+def stimulus_timeline(table, folder, column="stim_file", mapping=None, end=None,
+                      segments=None) -> pd.DataFrame:
+    """The stimuli shown during the recording: the markers whose ``column`` value maps to
+    a file of ``folder`` (``mapping``: value → file; default :func:`match_stimuli`), with
+    the event's onset. A stimulus lasts its event's duration, else until the next one, at
+    most to the end of its run (``segments``) or of the recording (``end``). Returns onset,
+    end, path, kind (image / video), file and value."""
+    cols = ["onset", "end", "path", "kind", "file", "value"]
+    vals = _marker_values(table, column)
+    if not len(vals) or not folder:
+        return pd.DataFrame(columns=cols)
+    mapping = match_stimuli(vals.unique(), stimulus_files(folder)) if mapping is None \
+        else mapping
+    rows = table.loc[vals.index].assign(value=vals)
+    rows = rows[rows["value"].isin([k for k, f in mapping.items() if f])]
+    df = pd.DataFrame({"onset": rows["onset"].to_numpy(float),
+                       "end": np.where(rows["duration"].fillna(0).to_numpy(float) > 0,
+                                       rows["onset"] + rows["duration"].fillna(0), np.nan),
+                       "file": rows["value"].map(mapping).to_numpy(object),
+                       "value": rows["value"].to_numpy(object)})
+    df["path"] = [Path(folder) / f for f in df["file"]]
+    df["kind"] = ["image" if Path(f).suffix.lower() in STIMULUS_IMAGES else "video"
+                  for f in df["file"]]
+    df = df[cols].sort_values("onset", ignore_index=True).drop_duplicates(
+        ["onset", "file"], ignore_index=True)
+    stop = df["onset"].shift(-1).fillna(np.inf if end is None else end).to_numpy(float)
+    if segments:  # not past the end of the run it belongs to
+        starts = np.array([g["start"] for g in segments])
+        k = np.clip(np.searchsorted(starts, df["onset"].to_numpy(), side="right") - 1, 0, None)
+        stop = np.minimum(stop, np.array([segments[i]["end"] for i in k], float))
+    df["end"] = df["end"].fillna(pd.Series(stop)).astype(float)
+    return df
+
+
+def stimulus_at(stimuli: pd.DataFrame, t: float):
+    """The stimulus on screen at time ``t`` (the latest one started), or None."""
+    if stimuli is None or not len(stimuli):
+        return None
+    k = np.searchsorted(stimuli["onset"].to_numpy(), t, side="right") - 1
+    return stimuli.iloc[k] if k >= 0 and t < stimuli["end"].iloc[k] else None
+
+
+def stimulus_rect(shape, screen) -> tuple[float, float, float, float]:
+    """Where an image of ``shape`` (rows, cols) is shown on the screen (left, top, width,
+    height, px): at its own size in the centre, scaled down to fit when it is larger."""
+    h, w = shape[:2]
+    scale = min(1.0, screen[0] / w, screen[1] / h)
+    return ((screen[0] - w * scale) / 2, (screen[1] - h * scale) / 2, w * scale, h * scale)
+
+
+class StimulusReader:
+    """Images and video frames of stimulus files as RGB arrays (rows, cols, 3), with the
+    images kept and each video open at its last frame, so playback decodes forward."""
+
+    def __init__(self):
+        self._images, self._videos = {}, {}
+
+    def frame(self, path, kind: str, t: float = 0.0) -> np.ndarray:
+        """The image, or the video frame shown ``t`` s after the video started."""
+        key = str(path)
+        if kind == "image":
+            if key not in self._images:
+                from PIL import Image
+                with Image.open(key) as im:
+                    self._images[key] = np.asarray(im.convert("RGB"))
+            return self._images[key]
+        if key not in self._videos:
+            self._videos[key] = _Video(key)
+        return self._videos[key].at(t)
+
+    def close(self):
+        for v in self._videos.values():
+            v.container.close()
+        self._images, self._videos = {}, {}
+
+
+class _Video:
+    def __init__(self, path):
+        import av
+        self.container = av.open(path)
+        self.stream = self.container.streams.video[0]
+        self.stream.thread_type = "AUTO"
+        self.tb = float(self.stream.time_base)
+        self.start = float(self.stream.start_time or 0) * self.tb
+        self.step = 1.0 / float(self.stream.average_rate or 25)
+        self.length = float(self.stream.duration * self.tb) if self.stream.duration else \
+            float(self.container.duration or 0) / 1e6
+        self.frames, self.last, self.t, self.image = None, None, None, (None, None)
+
+    def at(self, t: float) -> np.ndarray:
+        """The frame on screen at ``t`` s (the last one after the end)."""
+        t = min(max(t, 0.0), max(self.length - self.step / 2, 0.0))
+        if self.t is None or t < self.t or t > self.t + 2.0:  # backwards or far: seek
+            self.container.seek(int((t + self.start) / self.tb), stream=self.stream)
+            self.frames, self.t = self.container.decode(self.stream), None
+        while self.t is None or t >= self.t + self.step:
+            f = next(self.frames, None)
+            if f is None:
+                break
+            self.last, self.t = f, float(f.pts * self.tb) - self.start
+        if self.image[0] is not self.last:  # converted once per frame
+            self.image = (self.last, self.last.to_ndarray(format="rgb24"))
+        return self.image[1]
 
 
 # =========================================================================== events

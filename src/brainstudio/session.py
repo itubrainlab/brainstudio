@@ -134,6 +134,16 @@ def with_trigger_events(events: pd.DataFrame, ev: pd.DataFrame | None) -> pd.Dat
     return pd.concat(parts, ignore_index=True).sort_values("onset", ignore_index=True)
 
 
+def dataset_root(paths) -> Path | None:
+    """The BIDS dataset folder (with ``dataset_description.json``) the files are in."""
+    for p in paths:
+        if p is not None:
+            for d in Path(p).resolve().parents:
+                if (d / "dataset_description.json").is_file():
+                    return d
+    return None
+
+
 # =========================================================================== the session
 class Session:
     def __init__(self):
@@ -162,6 +172,12 @@ class Session:
         self.gaze_params = None     # detection settings of the current gaze events
         self.gaze_events = None
         self.event_table = C.event_table(None)
+        #: stimuli: the folder with the files, the event column naming them, the mapping
+        #: of its values to files, and the resulting timeline of images / videos shown
+        self.stimulus_folder, self.stimulus_column, self.stimulus_map = None, None, {}
+        self.stimulus_files: list[str] = []
+        self._files_of = None
+        self.stimuli = C.stimulus_timeline(None, None)
         self.reset_stages()
 
     def set_recording(self, rec, step: dict | None = None):
@@ -182,8 +198,30 @@ class Session:
             self.gaze_events, self.gaze_params = rec.gaze_events, rec.detected_with
         self.event_table = C.event_table(rec.all_events(), self.gaze_events,
                                          C.make_aois(self.aois), rec.segments)
+        root = dataset_root(rec.sources or [rec.source])
+        folder = root / "stimuli" if root is not None and (root / "stimuli").is_dir() else None
+        self._files_of, self.stimulus_files = folder, C.stimulus_files(folder)
+        column = C.guess_stimulus_column(self.event_table, self.stimulus_files)
+        self.set_stimuli(folder, column, None, notify=False)
         self.notify("recording")
         self.notify("state")
+
+    def set_stimuli(self, folder, column, mapping=None, notify=True):
+        """Which stimulus files the markers' ``column`` values show (``mapping``: value →
+        file in ``folder``; None: matched by name)."""
+        self.stimulus_folder, self.stimulus_column = folder, column
+        if folder != getattr(self, "_files_of", None):
+            self.stimulus_files, self._files_of = C.stimulus_files(folder), folder
+        values = C._marker_values(self.event_table, column).unique() if column else []
+        self.stimulus_map = dict(mapping) if mapping is not None else \
+            C.match_stimuli(values, self.stimulus_files)
+        rec = self.rec
+        self.stimuli = C.stimulus_timeline(self.event_table, folder, column, self.stimulus_map,
+                                           rec.duration if rec else None,
+                                           rec.segments if rec else None) \
+            if column else C.stimulus_timeline(None, None)
+        if notify:
+            self.notify("stimuli")
 
     def load_recipe(self) -> dict:
         return {"steps": list(self.load_steps),

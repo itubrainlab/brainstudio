@@ -133,6 +133,18 @@ def _analysis_checks(win) -> dict[str, bool]:
     return out
 
 
+def _stimulus_check(win) -> bool:
+    """The demo's stimuli are on the timeline and a video frame decodes (PyAV)."""
+    st = win.session.stimuli
+    try:
+        v = st[st["kind"] == "video"].iloc[0]
+        frame = win.stim_reader.frame(v["path"], "video", 1.0)
+        return set(st["kind"]) == {"image", "video"} and frame.shape[2] == 3
+    except Exception as e:  # noqa: BLE001
+        _say(f"stimuli: {e!r}")
+        return False
+
+
 def _self_test(app, win, timeout: float = 300.0) -> int:
     """Load the synthetic demo and run the default preprocessing: 0 if it worked."""
     import time
@@ -156,6 +168,7 @@ def _self_test(app, win, timeout: float = 300.0) -> int:
             "events": len(win.event_df) > 0,
             "preprocessed": win.pipeline.clean is not None,
             "montage resources": bool(C.layout_montages()),
+            "stimuli (images, video)": _stimulus_check(win),
         }
         checks.update(_analysis_checks(win))
         for k, ok in checks.items():

@@ -10,6 +10,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "autoreject>=0.5.2",
+    "av>=14",
     "matplotlib>=3.11.2",
     "mne>=1.13.2",
     "mne-bids>=0.20.0",

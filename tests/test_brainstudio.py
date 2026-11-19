@@ -29,7 +29,10 @@ def test_bids_scan_and_load(demo):
     assert rec.gaze.sfreq == pytest.approx(500, rel=1e-3)
     ev = rec.all_events()
     # EEG events.tsv and eye-tracker messages are merged without duplicates
-    assert (ev.description == "stimulus").sum() == len(simulate(seed=0).markers) // 2
+    # (events.tsv is the reference: its columns, e.g. stim_file, are kept)
+    name = ev.description.str.split("|").str[0]
+    assert (name == "stimulus").sum() == len(simulate(seed=0).markers) // 2
+    assert ev.description.str.contains("stim_file=").sum() == (name == "stimulus").sum()
 
 
 def test_xdf_load(demo):
@@ -810,3 +813,54 @@ def test_gaze_preset_follows_the_data():
     assert S.suggest_preset(best) == "standard"
     assert C.preset_name(C.PRESETS["gazepoint_fpog"][1]) == "gazepoint_fpog"
     assert C.preset_name(C.DetectionParams(fix_dispersion=55.0)) is None
+
+
+def test_bids_stimuli_follow_the_events(tmp_path):
+    """Stimuli named by the events (BIDS stim_file by default, or any column mapped to the
+    files) are on the timeline from the event's onset; video frames match the time."""
+    from brainstudio.demo import write_bids
+    root = write_bids(tmp_path / "bids", subjects=("01",))
+    rec = load_bids_run(root, scan_bids(root)[0])
+    ses = S.Session()
+    ses.set_recording(rec)
+    tab = ses.event_table
+    # events.tsv kept (its stim_file column); tracker messages of the same events dropped
+    assert (tab.name == "stimulus").sum() == 19 and "stim_file" in tab
+    assert ses.stimulus_column == "stim_file" and len(ses.stimulus_files) == 4
+    st = ses.stimuli
+    assert len(st) == 19 and set(st.kind) == {"image", "video"}
+    first = tab[tab.name == "stimulus"].onset.iloc[0]
+    assert st.onset.iloc[0] == pytest.approx(first)
+    assert (st.end.to_numpy()[:-1] == st.onset.to_numpy()[1:]).all()  # until the next one
+    assert C.stimulus_at(st, first - 0.01) is None
+    v = st[st.kind == "video"].iloc[0]
+    assert C.stimulus_at(st, v.onset + 1.0)["file"] == "videos/clip1.mp4"
+    reader = C.StimulusReader()
+    for t in (1.0, 0.2, 2.0):  # backwards and forwards: the dot moves 7 px per frame
+        img = reader.frame(v.path, "video", t)
+        x = np.flatnonzero(img[180].max(1) > 200).mean()
+        assert x == pytest.approx(40 + int(round(t * 25)) * 7, abs=8)
+    assert C.stimulus_rect((720, 1280), (1920, 1080)) == (320.0, 180.0, 1280.0, 720.0)
+    assert C.stimulus_rect((2160, 3840), (1920, 1080)) == (0.0, 0.0, 1920.0, 1080.0)
+    # the user maps another column: every "response" shows one picture, for 0.5 s
+    ses.set_stimuli(ses.stimulus_folder, "name", {"response": "images/scene2.png"})
+    st = ses.stimuli
+    assert len(st) == (tab.name == "response").sum() and set(st.file) == {"images/scene2.png"}
+
+
+def test_stimulus_column_and_value_matching():
+    """Event values name files by path, file name or name without extension; numbers
+    match too (82 → 82.png), and the column naming the most files is proposed."""
+    files = ["2.png", "82.png", "faces/smile.jpg", "clip.mp4"]
+    assert C.match_stimuli(["82", "smile", "faces/smile.jpg", "CLIP.MP4", "7"], files) == {
+        "82": "82.png", "smile": "faces/smile.jpg", "faces/smile.jpg": "faces/smile.jpg",
+        "CLIP.MP4": "clip.mp4"}
+    tab = pd.DataFrame({"onset": [1.0, 2.0, 3.0], "duration": [0.9, 1.0, 0.0],
+                        "kind": "marker", "name": "x",
+                        "trial_number": [1, 2, 3], "image_id": [82.0, 2.0, 82.0]})
+    assert C.guess_stimulus_column(tab, files) == "image_id"
+    st = C.stimulus_timeline(tab, "/data/stimuli", "image_id",
+                             C.match_stimuli(["82", "2"], files), end=10.0)
+    assert list(st.file) == ["82.png", "2.png", "82.png"]
+    assert list(st.end) == pytest.approx([1.9, 3.0, 10.0])  # duration, else next / end
+    assert C.guess_stimulus_column(tab.assign(stim_file=["a", "b", "c"]), files) == "stim_file"
