@@ -1318,7 +1318,8 @@ _START = re.compile(r"^(.+?)[_\- ](START|BEGIN|ON)$", re.I)
 _END = re.compile(r"^(.+?)[_\- ](END|STOP|OFF)$", re.I)
 
 
-def _safe_key(k: str) -> str:
+def attribute_key(k: str) -> str:
+    """A marker attribute name as an event-table column (lower case, no spaces)."""
     k = re.sub(r"\W+", "_", k.strip()).strip("_").lower() or "attr"
     if k[0].isdigit():
         k = "a_" + k
@@ -1335,7 +1336,7 @@ def parse_description(desc: str) -> tuple[str, dict]:
     for p in parts[1:]:
         if "=" in p:
             k, v = p.split("=", 1)
-            attrs[_safe_key(k)] = v.strip()
+            attrs[attribute_key(k)] = v.strip()
         elif p.strip():
             rest.append(p.strip())
     if rest:

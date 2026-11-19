@@ -323,6 +323,55 @@ def test_multicolumn_markers_pair_and_keep_every_column(tmp_path):
     assert __import__("brainstudio.core").core._START.match("fixation") is None
 
 
+def test_exported_script_reads_multicolumn_markers(tmp_path):
+    """The exported script pairs start/stop rows of a multi-column marker stream like the
+    app, so groups of paired events ('trials') select the same epochs."""
+    import runpy
+    import sys
+
+    from brainstudio import script as SC
+    eeg_t = np.arange(0, 30, 1 / 100)
+    rows = [["start", "trials", "clip1.mp4", "sad", ""], ["stop", "trials", "clip1.mp4", "sad",
+                                                          "angry"],
+            ["start", "trials", "clip2.mp4", "happy", ""], ["end", "trials", "clip2.mp4",
+                                                            "happy", "happy"]]
+    path = tmp_path / "m.xdf"
+    write_xdf(path, [
+        dict(name="EEG", type="EEG", srate=100, format="float32", labels=["Cz", "Pz"],
+             timestamps=eeg_t, data=np.random.default_rng(0).normal(0, 10, (len(eeg_t), 2))),
+        dict(name="exp_stim", type="Markers", srate=0, format="string",
+             labels=["c1", "c2", "c3", "c4", "c5"],
+             timestamps=np.array([2.0, 5.0, 10.0, 12.5]), data=rows)])
+    rec = load_xdf(path)
+    step = {"kind": "load", "path": str(path), "screen_size": (1920, 1080), "roles": None,
+            "options": None}
+    step["recording"] = S.recording_info(rec, step)
+    table = S.event_table(rec)
+    specs = [C.GroupSpec("A", ["trials"]), C.GroupSpec("B", ["trials_end"])]
+    st = C.EpochSettings(autoreject=False)
+    epochs, _ = C.build_group_epochs(rec.raw, {g.label: C.select_events(table, g)
+                                               for g in specs}, st)
+    spec = C.ErpSpec(["A", "B"], C.COMPONENT_PRESETS["P300"], (-0.1, 0.0), "recorded")
+    recipe = {"load": {"steps": [step], "gaze": {"params": None, "aois": {}}},
+              "groups": specs, "settings": st, "pre": None}
+    code = SC.build_script("erp", recipe, spec, {"ch_names": ["Cz", "Pz"], "n_subjects": 1})
+    (tmp_path / "erp.py").write_text(code, encoding="utf-8")
+    saved = {k: v for k, v in sys.modules.items() if k.split(".")[0] == "brainstudio"}
+    for k in saved:  # the script must not need brainstudio
+        sys.modules[k] = None
+    import matplotlib
+    matplotlib.use("Agg")
+    try:
+        g = runpy.run_path(str(tmp_path / "erp.py"), run_name="exported")
+    finally:
+        sys.modules.update(saved)
+    assert {k: len(v) for k, v in g["epochs"].items()} == {"A": 2, "B": 2} \
+        == {k: len(v) for k, v in epochs.items()}
+    ev = g["events"]
+    assert list(ev.loc[ev.name == "trials", "duration"]) == pytest.approx([3.0, 2.5])
+    assert list(ev.loc[ev.name == "trials", "c5"]) == ["angry", "happy"]
+
+
 def test_load_many_xdf_with_entities(demo, tmp_path):
     """Several files → one recording; events carry subject/session/run from file names."""
     import shutil

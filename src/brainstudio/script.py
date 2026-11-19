@@ -123,6 +123,56 @@ def _cell(n: int, title: str, what: str) -> list[str]:
 
 
 # =========================================================================== loading
+def _marker_columns(stream: dict):
+    """(column names, roles, end_events) of a marker stream with several columns, as the
+    app reads it (the user's settings, else the automatic ones); None for one column."""
+    auto = (stream.get("auto_options") or {}).get("markers") or {}
+    user = stream.get("options") or {}
+    if auto.get("single") or not auto.get("columns"):
+        return None
+    names = user.get("names") or auto["names"]
+    return ([C.attribute_key(n) for n in names], list(user.get("columns") or auto["columns"]),
+            bool(user.get("end_events", auto.get("end_events", True))))
+
+
+TABLE_MARKERS = [
+    "def table_markers(times, samples, columns, roles, end_events=True):",
+    '    """Events of a marker stream with several columns, as the app reads them: the',
+    "    'name' columns give the name, 'attribute' columns become columns, and a start row",
+    "    and the next stop row of the same name ('flag' column) are one event with a",
+    "    duration (plus a '<name>_end' event).\"\"\"",
+    "    START = {'start', 'begin', 'onset', 'on', 'open'}",
+    "    STOP = {'stop', 'end', 'offset', 'off', 'close'}",
+    "    out, open_ = [], {}",
+    "    for t, row in zip(times, samples):",
+    "        row = [str(v).strip() if v is not None else '' for v in row]",
+    "        if not any(row):",
+    "            continue",
+    "        name = '_'.join(v for v, r in zip(row, roles) if r == 'name' and v) or 'marker'",
+    "        attrs = {c: v for c, v, r in zip(columns, row, roles) if r == 'attribute' and v}",
+    "        flag = next((v.lower() for v, r in zip(row, roles) if r == 'flag'), '')",
+    "        if flag in START:",
+    "            open_.setdefault(name, []).append((t, attrs))",
+    "        elif flag in STOP and open_.get(name):",
+    "            t0, merged = open_[name].pop(0)",
+    "            merged = dict(merged)",
+    "            for k, v in attrs.items():  # e.g. the response, known at the end",
+    "                if not merged.get(k):",
+    "                    merged[k] = v",
+    "                elif merged[k] != v:",
+    "                    merged[f'{k}_end'] = v",
+    "            out.append({'onset': t0, 'duration': t - t0, 'name': name, **merged})",
+    "            if end_events:",
+    "                out.append({'onset': t, 'duration': 0.0, 'name': f'{name}_end', **merged})",
+    "        else:",
+    "            out.append({'onset': t, 'duration': 0.0,",
+    "                        'name': f'{name}_{flag}' if flag else name, **attrs})",
+    "    return out + [{'onset': t0, 'duration': 0.0, 'name': name, **a}",
+    "                  for name, items in open_.items() for t0, a in items]",
+    "",
+]
+
+
 def _xdf_reader(streams: list[dict], screen) -> tuple[list[str], dict]:
     """``read_xdf(path)`` for files with these streams (names, roles, columns)."""
     by_role = {r: [s for s in streams if s.get("role") == r] for r in ("EEG", "gaze", "markers")}
@@ -133,18 +183,6 @@ def _xdf_reader(streams: list[dict], screen) -> tuple[list[str], dict]:
          '    the first EEG sample."""',
          "    streams = {s['info']['name'][0]: s for s in "
          "pyxdf.load_xdf(path, dejitter_timestamps=False)[0]}"]
-    if eeg is not None:
-        L += ["",
-              f"    eeg = streams[{eeg['name']!r}]",
-              "    # start and rate from a straight line through the (jittered) timestamps",
-              "    step, t0 = np.polyfit(np.arange(len(eeg['time_stamps'])), "
-              "eeg['time_stamps'], 1)",
-              "    sfreq = 1 / step",
-              "    info = mne.create_info(CHANNELS, sfreq, CHANNEL_TYPES)",
-              "    raw = mne.io.RawArray(np.asarray(eeg['time_series'], float).T "
-              "* 1e-6, info)  # µV → V"]
-    else:
-        L += ["    t0, raw = None, None"]
     L += ["",
           "    def lsl_time(s):",
           '        """Timestamps on the EEG clock. Some trackers (e.g. Gazepoint) stamp',
@@ -168,17 +206,40 @@ def _xdf_reader(streams: list[dict], screen) -> tuple[list[str], dict]:
           "mode='nearest')",
           "            ts[own] = np.maximum.accumulate(line + trend) "
           "if np.abs(trend).max() > max(0.01, 2 * slope) else line",
-          "        return ts - t0, own",
-          "",
-          "    rows = []"]
+          "        return ts, own",
+          ""]
+    if eeg is not None:
+        L += [f"    eeg = streams[{eeg['name']!r}]",
+              "    ts, own = lsl_time(eeg)",
+              "    k = np.arange(own.sum())",
+              "    sfreq = 1 / np.polyfit(k, eeg['time_stamps'][own], 1)[0]",
+              "    t0, ts = ts[own][0], ts[own]",
+              "    data = np.asarray(eeg['time_series'], float)[own] * 1e-6  # µV → V",
+              "    grid = t0 + np.arange(round((ts[-1] - t0) * sfreq) + 1) / sfreq",
+              "    if len(grid) != len(ts) or np.abs(ts - grid).max() > 0.5 / sfreq:",
+              "        # the rate drifted: the samples onto a regular grid at their true times",
+              "        data = np.array([np.interp(grid, ts, ch) for ch in data.T]).T",
+              "    raw = mne.io.RawArray(data.T, mne.create_info(CHANNELS, sfreq, CHANNEL_TYPES))"]
+    elif gz is not None:
+        L += [f"    raw, t0 = None, lsl_time(streams[{gz['name']!r}])[0][0]"]
+    else:
+        L += ["    raw, t0 = None, 0.0"]
+    L += ["", "    rows = []"]
     for m in by_role["markers"]:
+        cols = _marker_columns(m)
         L += [f"    ts, own = lsl_time(streams[{m['name']!r}])",
-              f"    for t, v in zip(ts[own], np.asarray(streams[{m['name']!r}]['time_series'],"
-              " dtype=object)[own]):",
-              "        if str(v[0]).strip():",
-              "            name, *attrs = str(v[0]).split('|')  # 'NAME|key=value|…'",
-              "            rows.append({'onset': t, 'name': name.strip(),",
-              "                         **dict(a.split('=', 1) for a in attrs if '=' in a)})"]
+              "    ts = ts - t0",
+              f"    samples = np.asarray(streams[{m['name']!r}]['time_series'], dtype=object)[own]"]
+        if cols is None:  # one value per marker: 'NAME|key=value|…'
+            L += ["    for t, v in zip(ts[own], samples):",
+                  "        if str(v[0]).strip():",
+                  "            name, *attrs = str(v[0]).split('|')",
+                  "            rows.append({'onset': t, 'name': name.strip(),",
+                  "                         **dict(a.split('=', 1) for a in attrs if '=' in a)})"]
+        else:
+            names, roles, end_events = cols
+            L += [f"    rows += table_markers(ts[own], samples, {lit(names)},",
+                  f"                          {lit(roles)}, end_events={end_events})"]
     L += ["    events = pd.DataFrame(rows)", ""]
     gaze_cols = {}
     if gz is not None:
@@ -198,6 +259,7 @@ def _xdf_reader(streams: list[dict], screen) -> tuple[list[str], dict]:
         gaze_cols = pick
         L += [f"    g = streams[{gz['name']!r}]",
               "    ts, own = lsl_time(g)",
+              "    ts = ts - t0",
               "    # string-format streams carry text (e.g. an empty USER field): non-numbers → NaN",
               "    s = pd.DataFrame(np.asarray(g['time_series'])[own], "
               f"columns={labels!r}).apply(pd.to_numeric, errors='coerce')",
@@ -244,7 +306,7 @@ def _loading(recipe: dict) -> tuple[list[str], set]:
         L += [assign("CHANNELS = ", rec_info.get("channels_in", [])),
               assign("CHANNEL_TYPES = ", rec_info.get("types_in", [])), ""]
         reader, _ = _xdf_reader(rec_info.get("streams", []), screen)
-        L += reader + [""]
+        L += (TABLE_MARKERS if "table_markers(" in "\n".join(reader) else []) + reader + [""]
         if k == "load":
             L += [f"raw, events, gaze = read_xdf({lit(first['path'])})"]
         else:
@@ -529,6 +591,8 @@ def _epoching(recipe: dict) -> tuple[list[str], set]:
     L += ["epochs = {}",
           "for label, group in GROUPS.items():",
           "    rows = select(group)",
+          "    if not len(rows):",
+          "        raise ValueError(f'{label}: no events of {group[\"names\"]} in the data')",
           "    samples = np.round(rows['onset'] * data.info['sfreq']).astype(int) "
           "+ data.first_samp",
           "    rows, samples = rows[~samples.duplicated()], samples[~samples.duplicated()]",
