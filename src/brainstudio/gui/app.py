@@ -104,22 +104,24 @@ def _analysis_checks(win) -> dict[str, bool]:
         eps, summ = EP.build_group_epochs(raw, groups, EP.EpochSettings(-0.2, 0.8, None))
         out["epochs"] = set(eps) == {"stim", "fix"}
         out["AutoReject"] = summ.attrs.get("autoreject") == "applied"
-        # an exported script: brAInStudio's own code copied in (needs the .py files)
+        # an exported script: plain standard code, no brAInStudio import
         import ast
 
         from .. import script as SC
         from .. import workflow as W
         spec = W.ErpSpec(["stim", "fix"], E.COMPONENT_PRESETS["P300"], (-0.2, 0.0))
-        recipe = {"load": {"steps": [{"kind": "load", "path": "x.xdf",
-                                      "screen_size": (1920, 1080), "roles": None,
-                                      "options": None}], "gaze": {"params": None,
-                                                                  "aois": {}}},
+        step = {"kind": "load", "path": "x.xdf", "screen_size": (1920, 1080),
+                "roles": None, "options": None,
+                "recording": {"channels_in": list(raw.ch_names),
+                              "types_in": list(raw.get_channel_types()), "streams": []}}
+        recipe = {"load": {"steps": [step], "gaze": {"params": None, "aois": {}}},
                   "pre": None, "groups": [W.GroupSpec("stim", ["stimulus"])],
                   "settings": EP.EpochSettings()}
         code = SC.build_script("erp", recipe, spec, {"ch_names": list(raw.ch_names),
                                                      "n_subjects": 1})
         ast.parse(code)
-        out["script export"] = "def load_xdf(" in code and "import brainstudio" not in code
+        out["script export"] = "def read_xdf(" in code and "brainstudio" not in code.split(
+            '"""', 2)[2]
         erp = {g: e.copy().apply_baseline((-0.2, 0)) for g, e in eps.items()}
         summary, _ = E.component_analysis(erp, E.COMPONENT_PRESETS["P300"])
         out["ERP component statistics"] = "p" in summary

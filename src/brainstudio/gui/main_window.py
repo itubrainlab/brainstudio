@@ -569,6 +569,10 @@ class MainWindow(QtWidgets.QMainWindow):
             shown = on_loaded
 
             def on_loaded(rec):
+                try:  # what an exported script needs to know about the files
+                    step["recording"] = W.recording_info(rec, step)
+                except Exception:  # noqa: BLE001  (export will say it cannot)
+                    step["recording"] = {}
                 self.load_steps = [step]
                 shown(rec)
         # gaze events are detected in the background too (pymovements takes a while on

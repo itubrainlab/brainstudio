@@ -745,10 +745,11 @@ def test_script_literals_are_exact_python():
     assert SC.lit(np.float64(0.1)) == "0.1" and SC.lit(np.int64(3)) == "3"
 
 
-def test_exported_script_reproduces_the_erp(tmp_path):
-    """The script exported for an ERP gives the app's preprocessed data, epochs and
-    tables exactly."""
+def test_exported_script_repeats_the_erp(tmp_path):
+    """The short exported ERP script (standard libraries only, no brAInStudio) builds the
+    same epochs and per-subject ERP values as the app, within 0.3 µV."""
     import runpy
+    import sys
 
     from brainstudio import epoching as EP
     from brainstudio import io as bio
@@ -760,10 +761,12 @@ def test_exported_script_reproduces_the_erp(tmp_path):
     write_bids(root, subjects=("01", "02"))
     runs = bio.scan_bids(root)
     rec = bio.load_bids_runs(root, runs, None)
-    # a layout montage step: the script must give bit-identical electrode positions
+    step = {"kind": "load_bids", "root": str(root), "runs": [list(r.key) for r in runs],
+            "screen_size": None}
+    step["recording"] = W.recording_info(rec, step)
     layout, _ = E.read_channel_layout(E.layout_montages()["gtec_64"])
     names = layout[:len(rec.raw.ch_names)]
-    W.set_montage(rec, "gtec_64", names)
+    W.set_montage(rec, "gtec_64", names)  # a montage step
     det = G.DetectionParams()
     gev = G.detect_events(rec.gaze, det)
     table = EV.build_event_table(rec, gev, None)
@@ -777,31 +780,29 @@ def test_exported_script_reproduces_the_erp(tmp_path):
         clean, {g.label: W.select_events(table, g) for g in specs}, st, gev.blinks)
     spec = W.ErpSpec(["stim", "resp"], E.COMPONENT_PRESETS["P300"], (-0.1, 0.0), "average")
     res = W.run_erp(epochs, spec)
-    load = {"steps": [{"kind": "load_bids", "root": str(root),
-                       "runs": [list(r.key) for r in runs], "screen_size": None},
-                      {"kind": "montage", "source": "gtec_64", "names": names}],
+    load = {"steps": [step, {"kind": "montage", "source": "gtec_64", "names": names}],
             "gaze": {"params": det, "aois": {}}}
     recipe = {"load": load, "groups": specs, "settings": st,
-              "pre": {"load": load, "params": pp,
-                      "ica": {"steps": fit_raw.fit_steps}}}
+              "pre": {"load": load, "params": pp, "ica": {"steps": fit_raw.fit_steps}}}
     path = tmp_path / "erp.py"
-    path.write_text(SC.build_script("erp", recipe, spec,
-                                    {"ch_names": list(epochs["stim"].ch_names),
-                                     "n_subjects": 2}))
-    src = path.read_text()
-    assert "import brainstudio" not in src and "from brainstudio" not in src
-    import sys
+    code = SC.build_script("erp", recipe, spec, {"ch_names": list(epochs["stim"].ch_names),
+                                                 "n_subjects": 2})
+    path.write_text(code, encoding="utf-8")
+    body = code.split('"""', 2)[2]
+    assert "brainstudio" not in body and len(code.splitlines()) < 260
     saved = {k: v for k, v in sys.modules.items() if k.split(".")[0] == "brainstudio"}
     for k in saved:  # the script must not need brainstudio
         sys.modules[k] = None
+    import matplotlib
+    matplotlib.use("Agg")
     try:
         g = runpy.run_path(str(path), run_name="exported")
     finally:
         sys.modules.update(saved)
-    assert np.array_equal(g["clean"].get_data(), clean.get_data())
-    assert np.array_equal(g["epochs"]["stim"].get_data(), epochs["stim"].get_data())
-    pd.testing.assert_frame_equal(g["summary_table"], res["summary"])
-    pd.testing.assert_frame_equal(g["per_subject"], res["group"]["subjects"])
+    assert {k: len(v) for k, v in g["epochs"].items()} == {k: len(v) for k, v in epochs.items()}
+    app = res["group"]["subjects"].pivot(index="subject", columns="group",
+                                         values="window mean µV")
+    assert np.allclose(g["means"].loc[app.index, app.columns], app, atol=0.3)
 
 
 def test_text_files_are_read_and_written_as_utf8():

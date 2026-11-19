@@ -1,28 +1,26 @@
-"""Stand-alone Python scripts that repeat an analysis of the app, from the files on.
+"""Short, readable Python scripts that repeat an analysis of the app from the data files.
 
-A script has four sections (``# %%`` cells): Loading, Preprocessing, Epoching and
-Analysis. Each section explains what it does with the settings used, then holds the
-code it needs, then the steps. It is written from the settings each stage actually
-ran with (the *recipes* the app keeps with its results).
+A script has four cells (``# %%``): Loading, Preprocessing, Epoching and Analysis. It
+uses only standard libraries (MNE, MNE-BIDS, pyxdf, pymovements, AutoReject, scipy,
+pandas) with the settings the results on screen were computed with (the *recipes* the
+app keeps), written in as plain values. Only the steps that apply are written.
 
-Scripts do not need brAInStudio: standard steps are plain MNE / AutoReject / scipy
-code, and the brAInStudio functions a script uses (reading XDF, gaze events, the event
-table, the app's measures) are copied into it unchanged by :mod:`brainstudio.bundle`.
-So a script computes exactly what the app computes.
+The scripts favour brevity over replicating every detail of the app (e.g. the app's
+XDF clock handling is reduced to a few lines), so their numbers are close to the app's
+but not identical.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import datetime as _dt
+import re
+from pathlib import Path
 
 import numpy as np
 
-#: no module prefixes: the classes are copied into the script
-_PREFIX: dict = {}
-
 TITLES = {"erp": "ERP", "bandpower": "Band power", "indices": "Cognitive indices"}
-
+_PREFIX: dict = {}
 
 WIDTH = 92
 
@@ -111,608 +109,644 @@ def check_recipe(recipe: dict | None) -> str | None:
     return None
 
 
-# =========================================================================== helpers
-BAR = "# " + "─" * 88
 
-#: pip name of each library the copied code imports
-PIP = {"mne": "mne", "numpy": "numpy", "pandas": "pandas", "scipy": "scipy",
-       "pyxdf": "pyxdf", "mne_bids": "mne-bids", "autoreject": "autoreject",
-       "pymovements": "pymovements", "polars": "polars", "picard": "python-picard"}
-
-
-def _comment(text: str, width: int = WIDTH) -> list[str]:
-    """``text`` as wrapped ``#`` comment lines (paragraphs: blank lines; bullets: •)."""
+# =========================================================================== text helpers
+def _c(text: str) -> list[str]:
+    """Short ``#`` comment lines."""
     import textwrap
-    out = []
-    for para in text.strip().split("\n"):
-        para = para.rstrip()
-        if not para:
-            out.append("#")
-            continue
-        ind = len(para) - len(para.lstrip())
-        sub = "  " if para.lstrip().startswith("•") else ""
-        out += textwrap.wrap(para.strip(), width - 2 - ind, initial_indent="# " + " " * ind,
-                             subsequent_indent="# " + " " * ind + sub)
-    return out
+    return textwrap.wrap(text, WIDTH - 2, initial_indent="# ", subsequent_indent="# ")
 
 
-def _section(number: int, title: str, explanation: str) -> list[str]:
-    return [f"# %% {number} {title}", BAR, f"# {number}  {title.upper()}", BAR,
-            *_comment(explanation), BAR, ""]
+def _cell(n: int, title: str, what: str) -> list[str]:
+    return ["", "", f"# %% {n} {title}", *_c(what)]
 
 
-class _Code:
-    """Copies the brAInStudio code each section needs, once."""
+# =========================================================================== loading
+def _xdf_reader(streams: list[dict], screen) -> tuple[list[str], dict]:
+    """``read_xdf(path)`` for files with these streams (names, roles, columns)."""
+    by_role = {r: [s for s in streams if s.get("role") == r] for r in ("EEG", "gaze", "markers")}
+    eeg = by_role["EEG"][0] if by_role["EEG"] else None
+    gz = by_role["gaze"][0] if by_role["gaze"] else None
+    L = ["def read_xdf(path):",
+         '    """EEG (MNE Raw), events and gaze (pandas) of one XDF file, in seconds from',
+         '    the first EEG sample."""',
+         "    streams = {s['info']['name'][0]: s for s in "
+         "pyxdf.load_xdf(path, dejitter_timestamps=False)[0]}"]
+    used = {"pyxdf"}
+    if eeg is not None:
+        L += ["",
+              f"    eeg = streams[{eeg['name']!r}]",
+              "    t0 = eeg['time_stamps'][0]",
+              "    sfreq = (len(eeg['time_stamps']) - 1) / (eeg['time_stamps'][-1] - t0)",
+              "    info = mne.create_info(CHANNELS, sfreq, CHANNEL_TYPES)",
+              "    raw = mne.io.RawArray(np.asarray(eeg['time_series'], float).T "
+              "* 1e-6, info)  # µV → V"]
+    else:
+        L += ["    t0, raw = None, None"]
+    L += ["",
+          "    def lsl_time(s):",
+          '        """Timestamps on the EEG clock. Some trackers (e.g. Gazepoint) stamp',
+          "        samples with their own clock and only a few with the LSL clock: the",
+          '        difference between the two gives the offset."""',
+          "        ts = s['time_stamps']",
+          "        own = np.abs(ts - np.median(ts)) < 1e4",
+          "        if (~own).any() and own.any():",
+          "            i = np.flatnonzero(own)",
+          "            ts = ts + np.median(ts[~own] - np.interp(np.flatnonzero(~own), i, ts[i]))",
+          "        return ts - t0, own",
+          "",
+          "    rows = []"]
+    for m in by_role["markers"]:
+        L += [f"    ts, own = lsl_time(streams[{m['name']!r}])",
+              f"    for t, v in zip(ts[own], np.asarray(streams[{m['name']!r}]['time_series'],"
+              " dtype=object)[own]):",
+              "        if str(v[0]).strip():",
+              "            name, *attrs = str(v[0]).split('|')  # 'NAME|key=value|…'",
+              "            rows.append({'onset': t, 'name': name.strip(),",
+              "                         **dict(a.split('=', 1) for a in attrs if '=' in a)})"]
+    L += ["    events = pd.DataFrame(rows)", ""]
+    gaze_cols = {}
+    if gz is not None:
+        cols = (gz.get("options") or {}).get("columns") or \
+            (gz.get("auto_options") or {}).get("gaze", {}).get("columns") or []
+        labels = list(gz.get("labels") or [])
+        if isinstance(labels, str):
+            labels = eval(labels)  # noqa: S307  (stored as a list repr)
+        if not cols:
+            from .io.xdf import gaze_columns
+            m = gaze_columns([lab.lower() for lab in labels], len(labels))
+            cols = ["extra"] * len(labels)
+            for role in ("x", "y", "pupil", "valid"):
+                for k in m.get(role, []):
+                    cols[k] = role
+        pick = {r: [labels[k] for k, c in enumerate(cols) if c == r]
+                for r in ("x", "y", "pupil", "valid")}
+        gaze_cols = pick
+        L += [f"    g = streams[{gz['name']!r}]",
+              "    ts, own = lsl_time(g)",
+              "    s = pd.DataFrame(np.asarray(g['time_series'], float)[own], "
+              f"columns={labels!r})",
+              "    lost = (s[" + repr(pick["x"][0]) + "] == 0) & (s[" + repr(pick["y"][0]) + "] == 0)"]
+        if pick["valid"]:
+            L += [f"    lost |= s[{pick['valid'][0]!r}] != 1"]
+        L += ["    gaze = pd.DataFrame({'t': ts[own],",
+              f"                         'x': s[{pick['x'][0]!r}].where(~lost),",
+              f"                         'y': s[{pick['y'][0]!r}].where(~lost)}})"]
+        if pick["pupil"]:
+            L += [f"    gaze['pupil'] = s[{pick['pupil'][0]!r}].where(~lost & "
+                  f"(s[{pick['pupil'][0]!r}] > 0))"]
+        L += ["    if gaze[['x', 'y']].abs().quantile(0.95).max() <= 1.5:  # 0–1 → px",
+              f"        gaze[['x', 'y']] *= {list(screen)!r}"]
+    else:
+        L += ["    gaze = None"]
+    L += ["    return raw, events, gaze"]
+    return L, gaze_cols
 
-    def __init__(self, sections: list[list[str]]):
-        from .bundle import Bundle
-        self.b = Bundle()
-        allkeys = self.b.closure([r for sec in sections for r in sec], set())
-        self.final = self.b.names(allkeys)
-        self.externals = self.b.externals(allkeys)
-        self.done: set = set()
 
-    def name(self, root: str) -> str:
-        mod, _, n = root.rpartition(".")
-        return self.final[self.b.resolve(mod, n)]
-
-    def helpers(self, roots: list[str], version: str) -> list[str]:
-        keys = self.b.closure(roots, self.done)
-        self.done.update(keys)
-        if not keys:
-            return []
-        names = ", ".join(self.final[k] for k in keys if not self.final[k].startswith("_"))
-        n_lines = sum(len(self.b.source(k, self.final).splitlines()) for k in keys)
-        out = [f"# region brAInStudio {version} code used by this stage ({n_lines} lines; "
-               "fold it in your editor)",
-               *_comment("Copied unchanged from brAInStudio (only the module prefixes "
-                         "are dropped), so this script needs no brAInStudio and computes "
-                         "exactly what the app computes. Defined here: " + names + "."),
-               ""]
-        for k in keys:
-            out += [self.b.source(k, self.final), "", ""]
-        out += ["# endregion", "", "# ── steps " + "─" * 80]
-        return out
-
-
-def _requirements(externals: list[str]) -> str:
-    mods = {"mne", "numpy", "pandas", "scipy"}
-    for line in externals:
-        mods.add(line.split()[1].split(".")[0])
-    return " ".join(sorted({PIP.get(m, m) for m in mods if m not in
-                            ("re", "json", "dataclasses", "pathlib", "math", "warnings",
-                             "itertools", "collections", "typing", "copy", "os", "sys",
-                             "datetime", "functools", "io", "textwrap")}))
-
-
-# =========================================================================== explanations
-def _describe_loading(recipe: dict) -> str:
-    from . import gaze as G
-    parts = ["Reads the recording and builds the event table that the epochs are later "
-             "selected from.", ""]
-    for st in recipe["load"]["steps"]:
-        k = st["kind"]
+def _loading(recipe: dict) -> tuple[list[str], set]:
+    """The Loading cell and the imports it needs."""
+    from . import eeg as E
+    steps = recipe["load"]["steps"]
+    first = steps[0]
+    k = first["kind"]
+    imports = {"mne", "numpy", "pandas"}
+    L = []
+    screen = tuple(first.get("screen_size") or (1920, 1080))
+    rec_info = first.get("recording", {})
+    if k in ("load", "load_many") and str(first.get("path", first.get("paths", [""])[0])) \
+            .lower().endswith((".xdf", ".xdfz")):
+        imports.add("pyxdf")
+        what = ("Reads the XDF file with pyxdf: the EEG stream becomes an MNE Raw, marker "
+                "streams become events and the gaze stream a table in screen pixels, all in "
+                "seconds from the first EEG sample." if k == "load" else
+                "Reads each XDF file (EEG, events, gaze) with pyxdf and joins them end to "
+                "end; each part keeps its subject/session/run/file.")
+        L += _cell(1, "Loading", what)
+        L += [assign("CHANNELS = ", rec_info.get("channels_in", [])),
+              assign("CHANNEL_TYPES = ", rec_info.get("types_in", [])), ""]
+        reader, _ = _xdf_reader(rec_info.get("streams", []), screen)
+        L += reader + [""]
         if k == "load":
-            name = st["path"].rsplit("/", 1)[-1]
-            parts.append(f"• {name}: " + (
-                "an XDF file read with pyxdf. Each stream gets a role (EEG, gaze, markers "
-                "or ignored); the streams are put on the EEG clock using the LSL clock "
-                "offsets, samples stamped on another clock are removed, and timestamp "
-                "jitter is smoothed while following any drift; the EEG becomes an MNE Raw "
-                "on a regular time grid, the gaze is converted to screen pixels, and "
-                "marker streams become events (start/stop rows paired into spans)."
-                if name.lower().endswith((".xdf", ".xdfz")) else
-                "read with MNE (mne.io.read_raw); channel types are set from the "
-                "channel names."))
-        elif k == "load_many":
-            parts.append(f"• {len(st['paths'])} files read one by one (as above) and "
-                         "joined end to end into one recording; each part keeps its "
-                         "subject/session/run/file, and a boundary annotation marks each "
-                         "join so that no epoch or filter crosses it.")
-        elif k == "load_bids":
-            subs = sorted({r[0] for r in st["runs"] if r[0]})
-            parts.append(f"• BIDS dataset {st['root']}: {len(st['runs'])} run(s)"
-                         + (f" of subject(s) {', '.join(subs)}" if subs else "")
-                         + ", read with MNE-BIDS (EEG, events.tsv with all its columns, "
-                         "channels.tsv bad channels, electrode positions) plus the eye-"
-                         "tracking files, then joined in this order with a boundary "
-                         "annotation at each join; each part keeps its subject, session, "
-                         "task and run.")
-        elif k == "attach_gaze":
-            parts.append(f"• Eye-tracking data replaced with {st['path'].rsplit('/', 1)[-1]}.")
-        elif k == "gaze_offset":
-            parts.append(f"• Gaze shifted by {st['seconds'] * 1000:+g} ms relative to the "
-                         "EEG (a manual synchronisation correction).")
-        elif k == "montage":
-            parts.append("• Channels renamed in recording order, typed by name (EOG, ECG, "
-                         "…) and given positions"
-                         + (f" from the {st['source']} montage." if st["source"] else
-                            " (no montage)."))
-        elif k == "trigger_events":
-            codes = ", ".join(f"{c} → {n}" for c, n in st["names"].items())
-            parts.append(f"• Trigger channel {st['channel']} decoded "
-                         f"({'integer codes' if st['mode'] == 'codes' else 'pulses'}"
-                         + (f", mask {st['mask']}" if st["mask"] else "")
-                         + f") into events: {codes}"
-                         + ("; the channel is then treated as a stim channel."
-                            if st["as_stim"] else "."))
-        elif k == "remove_trigger_events":
-            parts.append("• Trigger events removed again.")
-    gz = recipe["load"]["gaze"] or {}
-    p = gz.get("params")
-    if p is not None:
-        parts.append(f"• Gaze events detected with pymovements on the screen-pixel gaze: "
-                     f"fixations with I-DT (dispersion ≤ {p.fix_dispersion:g} px for at least "
-                     f"{p.fix_min_dur * 1000:g} ms); saccades with the Engbert & Kliegl "
-                     f"velocity threshold (λ = {p.sac_threshold_factor:g}, at least "
-                     f"{p.sac_min_dur * 1000:g} ms; velocity from Gaze.pos2vel, "
-                     f"'{p.velocity_method}'); blinks from the pupil signal (lost or abruptly "
-                     f"changing, {p.blink_min_dur * 1000:g}–{p.blink_max_dur * 1000:g} ms)."
-                     + (f" These are the '{G.PRESETS[G.preset_name(p)][0]}' settings: "
-                        f"{G.PRESETS[G.preset_name(p)][2]}" if G.preset_name(p) else ""))
-    if gz.get("aois"):
-        parts.append(f"• Areas of interest ({', '.join(gz['aois'])}, rectangles): each "
-                     "fixation gets the name of the AOI it falls in (column 'aoi', "
-                     "pymovements Events.map_to_aois).")
-    parts.append("• The event table: one row per marker and gaze event, with its onset "
-                 "(s), duration, name, every column the marker carries, and the subject/"
-                 "session/run/file of the part it falls in.")
-    return "\n".join(parts)
+            L += [f"raw, events, gaze = read_xdf({lit(first['path'])})"]
+        else:
+            L += _join_parts(first["paths"], rec_info.get("entities", {}), "read_xdf")
+    elif k == "load_bids":
+        imports |= {"mne_bids", "json", "warnings"}
+        L += _cell(1, "Loading", "Reads the BIDS runs with MNE-BIDS (EEG, events.tsv) "
+                   "plus their eye-tracking files, and joins them end to end; each part "
+                   "keeps its subject, session and run.")
+        L += [f"ROOT = Path({lit(first['root'])})",
+              "RUNS = ["]
+        for r in rec_info.get("runs", []):
+            L += [assign("    ", r, ",")]
+        L += ["]", "",
+              "def read_run(run):",
+              '    """EEG, events and gaze of one BIDS run (seconds from its start)."""',
+              "    path = ROOT / run['eeg']",
+              "    with warnings.catch_warnings():  # MNE-BIDS notes about EOG positions etc.",
+              "        warnings.simplefilter('ignore')",
+              "        raw = read_raw_bids(get_bids_path_from_fname(path), verbose=False)",
+              "    raw.load_data()",
+              "    events = pd.read_csv(str(path).rsplit('_eeg', 1)[0] + '_events.tsv', "
+              "sep='\\t')",
+              "    events['name'] = events['trial_type']",
+              "    gaze = None",
+              "    if run.get('eye'):",
+              "        eye = ROOT / run['eye']",
+              "        meta = json.loads(eye.with_name(eye.name.replace('.tsv.gz', '.json'))"
+              ".read_text(encoding='utf-8'))",
+              "        g = pd.read_csv(eye, sep='\\t', header=None, names=meta['Columns'], "
+              "na_values='n/a')",
+              "        gaze = pd.DataFrame({'t': meta.get('StartTime', 0) + np.arange(len(g)) "
+              "/ meta['SamplingFrequency'],",
+              "                             'x': g[run['x']], 'y': g[run['y']]})",
+              "        if run.get('pupil'):",
+              "            gaze['pupil'] = g[run['pupil']].where(g[run['pupil']] > 0)",
+              "    return raw, events, gaze", ""]
+        L += _join_parts(None, None, "read_run")
+    else:
+        what = "Reads the file with MNE; its annotations become the events."
+        L += _cell(1, "Loading", what)
+        paths = [first["path"]] if k == "load" else first["paths"]
+        L += ["def read_file(path):",
+              "    raw = mne.io.read_raw(path, preload=True)",
+              "    events = pd.DataFrame({'onset': raw.annotations.onset - raw.first_time,",
+              "                           'name': raw.annotations.description})",
+              "    return raw, events, None", ""]
+        if k == "load":
+            L += [f"raw, events, gaze = read_file({lit(paths[0])})"]
+        else:
+            L += _join_parts(paths, rec_info.get("entities", {}), "read_file")
+    # later steps
+    for st in steps[1:]:
+        if st["kind"] == "gaze_offset":
+            L += [f"gaze['t'] += {lit(st['seconds'])}  # gaze offset (sync correction, s)"]
+        elif st["kind"] == "montage":
+            L += [""] + _montage_code(st["source"])
+            L += [assign("names = ", st["names"]),
+                  "raw.rename_channels(dict(zip(raw.ch_names, names)))",
+                  "raw.set_montage(montage, on_missing='ignore')"]
+        elif st["kind"] == "trigger_events":
+            L += ["", f"# trigger channel {st['channel']} → events",
+                  f"found = mne.find_events(raw, stim_channel={lit(st['channel'])}, "
+                  f"mask={lit(st['mask'])}, mask_type='and', shortest_event=1)",
+                  assign("codes = ", st["names"]),
+                  "events = pd.concat([events, pd.DataFrame(",
+                  "    {'onset': (found[:, 0] - raw.first_samp) / raw.info['sfreq'],",
+                  "     'name': [codes.get(c) for c in found[:, 2]]}).dropna()])"]
+            if st["as_stim"]:
+                L += [f"raw.set_channel_types({{{st['channel']!r}: 'stim'}})"]
+        elif st["kind"] == "remove_trigger_events":
+            L += ["# (trigger events were removed again)"]
+        elif st["kind"] == "attach_gaze":
+            raise ValueError("Scripts cannot yet repeat attaching a separate eye-tracking "
+                             "file")
+    L += ["events = events.sort_values('onset', ignore_index=True)",
+          "print(raw)",
+          "print(events['name'].value_counts().head(10))"]
+    return L, imports
 
 
-def _describe_preprocessing(recipe: dict) -> str:
-    pre = recipe.get("pre")
-    if pre is None:
-        return ("No preprocessing: the epochs are cut from the recording as loaded.")
-    p, ica = pre["params"], pre["ica"]
-    hp = (f"high-pass {p.l_freq:g} Hz" + (" (zero-phase 4th-order Butterworth, applied "
-          "separately between boundaries)" if p.l_freq and p.l_freq < 0.5 else
-          " (MNE's zero-phase FIR)")) if p.l_freq else "no high-pass"
-    lp = f"low-pass {p.h_freq:g} Hz (MNE's zero-phase FIR)" if p.h_freq else "no low-pass"
-    out = [f"Cleans the continuous EEG before epoching: {hp}; {lp}; "
-           + (f"notch at {p.notch:g} Hz and its harmonics" if p.notch else "no notch") + "; "
-           + (f"bad channels {', '.join(p.bads)} "
-              + ("interpolated (spherical splines)" if p.interpolate_bads else
-                 "left out of the analyses") if p.bads else "no bad channels") + "."]
-    if p.ica_exclude and ica is not None:
-        s = ica["steps"]
-        out += ["",
-                "Eye blinks are removed with ICA, as in the ERP guide "
-                "(neuraldatascience.io/eeg/erp-artifacts):",
-                f"• The ICA is fitted on a separate copy of {len(s['chans'])} good EEG "
-                f"channels, band-passed {s['l_freq']:g}–{s['h_freq']:g} Hz (ICA works "
-                "best without slow drifts), average-referenced"
-                + (f", from {s['tmin']:g} s (the first event: set-up and calibration "
-                   "before it are left out)" if s["tmin"] else "")
-                + (f", resampled to {s['resample']:g} Hz" if s["resample"] else "") + ".",
-                "• It is cut into 1 s segments; "
-                + ({"autoreject": "AutoReject finds the bad ones (fitted on at most "
-                                  f"{s['autoreject_max']} segments), which are left out "
-                                  "of the fit.",
-                    "threshold": f"segments above {s['reject_uv']:g} µV peak-to-peak are "
-                                 "left out of the fit." if s["reject_uv"] else
-                                 "all of them are used.",
-                    "all": "all of them are used."}[s["segments"]]),
-                f"• ICA ({s['method']}"
-                + (", extended" if s["fit_params"] and s["fit_params"].get("extended")
-                   else "") + "): "
-                + (f"enough components for {s['n_components']:.0%} of the variance"
-                   if s["n_components"] < 1 else f"{s['n_components']} components")
-                + f", every {s['decim']}rd sample, random seed {s['seed']}.",
-                f"• Components {', '.join(map(str, p.ica_exclude))} (chosen in the app) "
-                "are removed from the band-passed data."]
-    return "\n".join(out)
-
-
-def _describe_epoching(recipe: dict) -> str:
-    st = recipe["settings"]
-    out = ["Cuts the data into epochs around the events of each group. A group is a set "
-           "of events from the event table: the event names ticked, the filters and the "
-           "recordings (subjects, sessions, runs, files) kept:"]
-    for g in recipe["groups"]:
-        bits = [", ".join(g.names) or "no names"]
-        if g.conditions:
-            bits.append(" and ".join(" ".join(map(str, c)) for c in g.conditions))
-        if g.text:
-            bits.append(f"text ~ /{g.text}/")
-        if g.query:
-            bits.append(g.query)
-        if g.recordings:
-            bits.append("; ".join(f"{k}: {', '.join(map(str, v))}"
-                                  for k, v in g.recordings.items() if k != "file"))
-        out.append(f"• {g.label}: " + " | ".join(bits))
-    out += ["",
-            f"Each epoch runs from {st.tmin:g} to {st.tmax:g} s around its event, on the "
-            "good EEG channels, without baseline correction (each analysis applies its "
-            "own). Events whose window does not fit in the recording, or that share a "
-            "sample with another event of the group, are skipped"
-            + (f"; groups above {st.max_epochs} events are randomly subsampled (seed 0)"
-               if st.max_epochs else "")
-            + (f"; events are moved by {st.delay_ms:+g} ms (EEG delay)" if st.delay_ms
-               else "")
-            + (f"; epochs above {st.reject_uv:g} µV peak-to-peak are dropped"
-               if st.reject_uv else "")
-            + (f"; epochs flatter than {st.flat_uv:g} µV are dropped" if st.flat_uv else "")
-            + ("; epochs containing an eye-tracker blink are dropped" if st.drop_blinks
-               else "")
-            + "; epochs overlapping a BAD_ span or a file boundary are dropped."
-            + (" Then AutoReject (n_interpolate 1, 2, 4; seed 42), fitted once on the "
-               "epochs of every group, interpolates bad channels within an epoch and "
-               "drops the epochs it cannot repair." if st.autoreject else ""),
-            "",
-            "'summary' counts, per group, the events selected and why each one did or "
-            "did not become an epoch."]
-    return "\n".join(out)
-
-
-def _describe_erp(spec, label: str, n_subjects: int) -> str:
-    c = spec.component
-    bl = f"{spec.baseline[0]:g} … {spec.baseline[1]:g} s" if spec.baseline else "none"
-    return "\n".join([
-        f"ERP component {c.name}: the {'positive' if c.polarity > 0 else 'negative'} "
-        f"deflection {c.tmin * 1000:.0f}–{c.tmax * 1000:.0f} ms after the event, on the "
-        f"mean of {', '.join(c.channels)}. Groups: {', '.join(spec.groups)}.",
-        f"• Reference: {label}. Baseline: {bl} (subtracted from every epoch).",
-        (f"• {n_subjects} subjects, as in neuraldatascience.io/eeg/erp-group-viz: each "
-         "subject's epochs are averaged on their own (one Evoked per subject and group), "
-         "then those Evokeds are averaged with mne.grand_average, so every subject counts "
-         "once whatever its number of epochs. Each subject's mean amplitude in the window "
-         "is compared between the groups with a paired t-test across subjects (the "
-         "subjects are the observations); 'summary_table' adds 95 % CIs, the grand "
-         "average's peaks, Wilcoxon and Cohen's d_z, and 'per_subject' has every "
-         "subject's values."
-         if n_subjects >= 2 else
-         "• One subject: trials are the observations; the epochs' mean amplitudes in the "
-         "window are compared with a Welch t-test; 'summary_table' adds the peaks, "
-         "Mann-Whitney and Hedges' g. (With several subjects, the code below averages "
-         "each subject first, then the subjects.)"),
-        "",
-        "Valid if the window was chosen before looking at the data."])
-
-
-def _describe_bp(spec, tc_band=None) -> str:
-    b = spec.baseline
-    bands = ", ".join(f"{n} {lo:g}–{hi:g} Hz" for n, (lo, hi) in spec.bands.items())
-    return "\n".join([
-        f"Band power of {', '.join(spec.groups)} in {spec.tmin:g} … {spec.tmax:g} s of each "
-        f"epoch: the power spectrum of every epoch (Epochs.compute_psd, {spec.method}) "
-        f"averaged in each band ({bands}), then over the ROI "
-        f"({', '.join(spec.roi) if len(spec.roi) <= 10 else f'{len(spec.roi)} channels'}).",
-        f"• Reference: {spec.reference}.",
-        (f"• Baseline: {b.t0:g} … {b.t1:g} s after each '{b.event}' event"
-         + (f" matching {b.query}" if b.query else "")
-         + f", cut into segments as long as the analysis window; every epoch is expressed "
-         f"in {spec.norm} relative to its own subject's baseline (never one pooled across "
-         "subjects)." if b else "• No baseline: absolute power (V²/Hz)."),
-        "• The groups are compared per band (Welch t-test and Mann-Whitney for two groups, "
-        "ANOVA and Kruskal-Wallis for more; Hedges' g; FDR across bands); trials are the "
-        "observations.",
-        (f"• Time course: power of the {tc_band} band over the epoch (Morlet wavelets) on "
-         "the same ROI, reference and baseline (ERD/ERS)." if tc_band else "")])
-
-
-def _describe_idx(bp_spec, spec) -> str:
-    rois = "; ".join(f"{k}: {', '.join(v)}" for k, v in spec.rois.items())
-    return "\n".join([
-        _describe_bp(bp_spec),
-        "",
-        f"Cognitive indices per epoch from that band power ({', '.join(spec.measures)}), "
-        f"with these channel regions: {rois}. Eye metrics (pupil dilation, blink rate, "
-        "fixation duration) come from the eye tracker in the same window. The groups are "
-        "compared per index as for band power."])
-
-
-# =========================================================================== sections
-def _loading_roots(recipe: dict) -> list[str]:
-    roots = []
-    for st in recipe["load"]["steps"]:
-        roots += {"load": ["io.load"], "load_many": ["io.load_many"],
-                  "load_bids": ["workflow.find_bids_runs", "io.load_bids_runs"],
-                  "attach_gaze": ["io.load_eyetracking_file"],
-                  "montage": ["eeg.apply_montage"],
-                  "trigger_events": ["workflow.add_trigger_events"],
-                  "remove_trigger_events": ["workflow.replace_trigger_events"],
-                  }.get(st["kind"], [])
-    gz = recipe["load"]["gaze"] or {}
-    if gz.get("params") is not None:
-        roots += ["gaze.DetectionParams", "gaze.detect_events"]
-    if gz.get("aois"):
-        roots += ["gaze.make_aois"]
-    return roots + ["events.build_event_table"]
+def _join_parts(paths, entities, reader) -> list[str]:
+    """Read several parts and join them end to end."""
+    if reader == "read_run":
+        L = ["parts = [(r, *read_run(r)) for r in RUNS]"]
+        tag = "**{k: r[k] for k in ('subject', 'session', 'run') if r.get(k)}"
+    else:
+        L = [assign("FILES = ", {p: entities.get(p, {}) for p in paths}),
+             f"parts = [(entities, *{reader}(path)) for path, entities in FILES.items()]"]
+        tag = "**r"
+    return L + [
+        "starts = np.cumsum([0] + [p[1].n_times / p[1].info['sfreq'] for p in parts[:-1]])",
+        "events = pd.concat([ev.assign(onset=ev['onset'] + t, " + tag + ")",
+        "                    for (r, _, ev, _), t in zip(parts, starts)], ignore_index=True)",
+        "gaze = (pd.concat([g.assign(t=g['t'] + t) for (_, _, _, g), t in zip(parts, starts)",
+        "                   if g is not None], ignore_index=True)",
+        "        if any(p[3] is not None for p in parts) else None)",
+        "raw = mne.concatenate_raws([p[1] for p in parts])  # boundaries are annotated"]
 
 
 def _montage_code(source) -> list[str]:
-    """The montage, built with the same standard MNE calls as the app (so the electrode
-    positions are bit-identical)."""
     from . import eeg as E
     if not source:
         return ["montage = None"]
     layouts = E.layout_montages()
     if source in layouts:
         names, template = E.read_channel_layout(layouts[source])
-        if template == "standard_1005" and "colin27_1005" in __import__(
-                "mne").channels.get_builtin_montages():
+        import mne
+        if template == "standard_1005" and "colin27_1005" in mne.channels.get_builtin_montages():
             template = "colin27_1005"
-        return [f"# the {source} layout: these electrodes (amplifier input order) at the "
-                f"{template} template's positions",
+        return [f"# {source}: these electrodes at the {template} template's positions",
                 assign("layout = ", names),
-                f"template = mne.channels.make_standard_montage({lit(template)})"
-                ".get_positions()",
-                'lookup = {k.upper(): v for k, v in template["ch_pos"].items()}',
+                f"pos = mne.channels.make_standard_montage({lit(template)}).get_positions()",
+                "lookup = {k.upper(): v for k, v in pos['ch_pos'].items()}",
                 "montage = mne.channels.make_dig_montage(",
-                "    ch_pos={n: lookup[n.upper()] for n in layout}, nasion=template['nasion'],",
-                "    lpa=template['lpa'], rpa=template['rpa'], "
-                "coord_frame=template['coord_frame'])"]
-    from pathlib import Path
-    p = Path(source)
-    if not p.exists():
+                "    ch_pos={n: lookup[n.upper()] for n in layout}, nasion=pos['nasion'],",
+                "    lpa=pos['lpa'], rpa=pos['rpa'], coord_frame=pos['coord_frame'])"]
+    if not Path(source).exists():
         return [f"montage = mne.channels.make_standard_montage({lit(source)})"]
-    if p.suffix.lower() == ".fif":
-        return [f"montage = mne.channels.read_dig_fif({lit(str(p))})"]
-    if p.name.endswith("_electrodes.tsv"):
-        return [f"# BIDS electrodes file (positions in m, mm or cm)",
-                f"el = pd.read_csv({lit(str(p))}, sep='\\t', na_values=['n/a'])"
-                ".dropna(subset=['x', 'y', 'z'])",
-                "pos = el[['x', 'y', 'z']].to_numpy(float)",
-                "if np.nanmax(np.abs(pos)) > 1.0:  # mm / cm → m",
-                "    pos = pos / (1000.0 if np.nanmax(np.abs(pos)) > 30 else 100.0)",
-                "montage = mne.channels.make_dig_montage(dict(zip(el['name'].astype(str), "
-                "pos)), coord_frame='head')"]
-    return [f"montage = mne.channels.read_custom_montage({lit(str(p))})"]
+    if source.lower().endswith(".fif"):
+        return [f"montage = mne.channels.read_dig_fif({lit(source)})"]
+    return [f"montage = mne.channels.read_custom_montage({lit(source)})"]
 
 
-def _loading(recipe: dict, code: _Code, version: str) -> list[str]:
-    L = _section(1, "Loading", _describe_loading(recipe))
-    std = sorted({x for x in code.externals if x.split()[1].split(".")[0] in
-                  ("re", "json", "dataclasses", "pathlib", "math", "warnings", "itertools",
-                   "collections", "typing", "copy", "os", "sys", "datetime", "functools")})
-    third = sorted({"import mne", "import numpy as np", "import pandas as pd",
-                    "from scipy import stats"} | (set(code.externals) - set(std)))
-    order = (lambda x: (x.startswith("from"), x))  # noqa: E731  imports, then froms
-    L += sorted(std, key=order) + [""] + sorted(third, key=order)
-    L += ["", 'mne.set_log_level("error")', ""]
-    L += code.helpers(_loading_roots(recipe), version)
-    n = code.name
-    for st in recipe["load"]["steps"]:
-        k = st["kind"]
-        if k == "load":
-            L += [f"rec = {n('io.load')}({lit(st['path'])}, screen_size={lit(st['screen_size'])},",
-                  f"           roles={lit(st['roles'])}, options={lit(st['options'])})",
-                  "raw_gaze = rec.gaze"]
-        elif k == "load_many":
-            L += [assign(f"rec = {n('io.load_many')}(", st["paths"], ","),
-                  f"    screen_size={lit(st['screen_size'])},",
-                  f"    roles_by_name={lit(st['roles_by_name'])},",
-                  f"    options_by_name={lit(st['options_by_name'])})",
-                  "raw_gaze = rec.gaze"]
-        elif k == "load_bids":
-            L += [f"bids_root = {lit(st['root'])}",
-                  assign(f"runs = {n('workflow.find_bids_runs')}(bids_root, ", st["runs"], ")"),
-                  f"rec = {n('io.load_bids_runs')}(bids_root, runs, "
-                  f"screen_size={lit(st['screen_size'])})",
-                  "raw_gaze = rec.gaze"]
-        elif k == "attach_gaze":
-            L += [f"rec.gaze = {n('io.load_eyetracking_file')}({lit(st['path'])}, "
-                  f"{lit(st['screen_size'])})",
-                  "raw_gaze = rec.gaze"]
-        elif k == "gaze_offset":
-            L += [f"rec.gaze = raw_gaze.shifted({lit(st['seconds'])})  # gaze offset (s)"]
-        elif k == "montage":
-            L += _montage_code(st["source"])
-            L += [assign("channel_names = ", st["names"]),
-                  f"{n('eeg.apply_montage')}(rec.raw, montage, channel_names)"]
-        elif k == "trigger_events":
-            L += [f"{n('workflow.add_trigger_events')}(rec, {lit(st['channel'])}, "
-                  f"mask={lit(st['mask'])}, mode={lit(st['mode'])},",
-                  f"    names={lit(st['names'])}, as_stim={lit(st['as_stim'])})"]
-        elif k == "remove_trigger_events":
-            L += [f"{n('workflow.replace_trigger_events')}(rec, None)"]
+def _gaze_events(recipe: dict) -> tuple[list[str], set]:
     gz = recipe["load"]["gaze"] or {}
-    L += ["raw = rec.raw  # the EEG (mne.io.Raw)", ""]
-    if gz.get("params") is not None:
-        L += [assign("detection = ", gz["params"]),
-              f"gaze_events = {n('gaze.detect_events')}(rec.gaze, detection) "
-              "if rec.has_gaze else None"]
-    else:
-        L += ["gaze_events = None"]
-    L += [assign(f"aois = {n('gaze.make_aois')}(", gz["aois"], ")") if gz.get("aois")
-          else "aois = None",
-          f"table = {n('events.build_event_table')}(rec, gaze_events, aois)",
-          "print(f'{len(table)} events:', table['name'].value_counts().head(10).to_dict())",
-          ""]
-    return L
+    p = gz.get("params")
+    if p is None:
+        return [], set()
+    from . import gaze as G
+    key = G.preset_name(p)
+    L = ["", "# fixations (I-DT), saccades (Engbert & Kliegl) and blinks with pymovements",
+         *(_c(f"Preset: {G.PRESETS[key][0]}.") if key else []),
+         "sf = 1 / np.median(np.diff(gaze['t']))",
+         "n = lambda seconds, least=1: max(int(round(seconds * sf)), least)  # → samples",
+         "xy = gaze[['x', 'y']].to_numpy().T",
+         "pg = pm.gaze.from_numpy(time=np.arange(len(gaze)), time_unit='ms', pixel=xy, "
+         "position=xy,",
+         "                        experiment=pm.Experiment(sampling_rate=sf))",
+         "pupil = gaze['pupil'] if 'pupil' in gaze else gaze['x'].notna().astype(float)"
+         ".where(gaze['x'].notna())",
+         "pg.samples = pg.samples.with_columns(pl.Series('pupil', pupil.to_numpy(float)))",
+         f"pg.pos2vel(method={lit(p.velocity_method)})",
+         f"pg.detect('idt', dispersion_threshold={lit(p.fix_dispersion)}, "
+         f"minimum_duration=n({lit(p.fix_min_dur)}, 2))",
+         f"pg.detect('microsaccades', threshold_factor={lit(p.sac_threshold_factor)}, "
+         f"minimum_duration=n({lit(p.sac_min_dur)}), name='saccade')",
+         f"pg.detect('blink', minimum_duration=n({lit(p.blink_min_dur)}), "
+         f"maximum_duration=n({lit(p.blink_max_dur)}), minimum_gap=n(0.005))",
+         "pg.compute_event_properties('location', name='fixation')",
+         "gaze_events = pg.events.frame.to_pandas()",
+         "t = gaze['t'].to_numpy()",
+         "gaze_events['duration'] = t[gaze_events['offset']] - t[gaze_events['onset']]",
+         "gaze_events['onset'] = t[gaze_events['onset']]",
+         "loc = gaze_events['location'].dropna()",
+         "gaze_events.loc[loc.index, ['x', 'y']] = np.vstack(loc.to_numpy())"]
+    if gz.get("aois"):
+        L += [assign("AOIS = ", gz["aois"]) + "  # left, top, width, height (px)",
+              "gaze_events['aoi'] = ''",
+              "for aoi, (left, top, w, h) in AOIS.items():",
+              "    inside = gaze_events['x'].between(left, left + w) & "
+              "gaze_events['y'].between(top, top + h)",
+              "    gaze_events.loc[inside & (gaze_events['aoi'] == ''), 'aoi'] = aoi"]
+    L += ["events = pd.concat([events, gaze_events.drop(columns=['offset', 'location'])],",
+          "                   ignore_index=True).sort_values('onset', ignore_index=True)",
+          "print(gaze_events['name'].value_counts())"]
+    return L, {"pymovements", "polars"}
 
 
-def _preprocessing(recipe: dict, code: _Code, version: str) -> list[str]:
+# =========================================================================== preprocessing
+def _preprocessing(recipe: dict) -> tuple[list[str], set]:
     pre = recipe.get("pre")
-    L = _section(2, "Preprocessing", _describe_preprocessing(recipe))
     if pre is None:
-        return L + ["data = raw", ""]
-    L += code.helpers(["preprocessing.filtered_copy"], version)
-    fc = code.name("preprocessing.filtered_copy")
+        return _cell(2, "Preprocessing", "None: the epochs are cut from the data as "
+                     "loaded.") + ["data = raw"], set()
     p, ica = pre["params"], pre["ica"]
     use_ica = bool(p.ica_exclude) and ica is not None
+    hp = f"{p.l_freq:g} Hz high-pass" if p.l_freq else "no high-pass"
+    what = (f"Filters ({hp}, {p.h_freq:g} Hz low-pass"
+            + (f", {p.notch:g} Hz notch" if p.notch else "") + ")"
+            + (f", bad channels {', '.join(p.bads)}" if p.bads else "")
+            + ("; removes eye blinks with ICA, fitted as in the ERP guide "
+               "(neuraldatascience.io/eeg/erp-artifacts) on a 1–30 Hz average-referenced "
+               "copy cut into 1 s segments" + (", the bad ones found by AutoReject"
+                                               if ica["steps"]["segments"] == "autoreject"
+                                               else "") if use_ica else "") + ".")
+    L = _cell(2, "Preprocessing", what)
+    imports = set()
+    if p.bads:
+        L += [assign("raw.info['bads'] = ", list(p.bads))]
+
+    def filters(var, lo, hi, notch):
+        out = []
+        if lo and lo < 0.5:
+            out += [f"{var}.filter({lit(lo)}, None, method='iir', "
+                    "iir_params=dict(order=4, ftype='butter', output='sos'))"]
+            lo = None
+        if lo or hi:
+            out += [f"{var}.filter({lit(lo)}, {lit(hi)})"]
+        if notch:
+            out += [f"{var}.notch_filter(np.arange({lit(notch)}, {var}.info['sfreq'] / 2, "
+                    f"{lit(notch)}))"]
+        return out
+
     if use_ica:
         s = ica["steps"]
-        L += ["# ICA data: band-passed, average-referenced copy of the good EEG channels",
-              f"ica_raw = {fc}(raw, {lit(s['l_freq'])}, {lit(s['h_freq'])}, {lit(s['notch'])},",
-              assign("    picks=", s["chans"], ","),
-              f"    tmin={lit(s['tmin'])})",
-              'ica_raw.info["bads"] = []',
-              'ica_raw.set_eeg_reference("average", projection=False)']
+        imports.add("autoreject") if s["segments"] == "autoreject" else None
+        L += ["", "# ICA on a separate copy"
+              + (f", from {s['tmin']:g} s (the first event)" if s["tmin"] else "")]
+        L += [f"ica_raw = raw.copy().pick({lit(s['chans'])})"
+              if len(lit(s["chans"])) < 60 else assign("ica_raw = raw.copy().pick(",
+                                                         s["chans"], ")")]
+        if s["tmin"]:
+            L += [f"ica_raw.crop(tmin={lit(s['tmin'])})"]
+        L += filters("ica_raw", s["l_freq"], s["h_freq"], s["notch"])
+        L += ["ica_raw.set_eeg_reference('average')"]
         if s["resample"]:
             L += [f"ica_raw.resample({lit(s['resample'])})"]
-        L += ["# 1 s segments",
-              "events = mne.make_fixed_length_events(ica_raw, duration=1.0)",
-              "segments = mne.Epochs(ica_raw, events, tmin=0.0, tmax=1.0, baseline=None,",
-              "                      preload=True, reject_by_annotation=True)"]
+        L += ["events_1s = mne.make_fixed_length_events(ica_raw, duration=1.0)",
+              "segments = mne.Epochs(ica_raw, events_1s, tmin=0, tmax=1.0, baseline=None, "
+              "preload=True)"]
         if s["segments"] == "autoreject":
-            L += ["# bad segments, found by AutoReject",
-                  "from autoreject import AutoReject",
-                  f"ar = AutoReject(n_interpolate=[1, 2, 4], random_state={s['seed']}, "
-                  "n_jobs=1, verbose=False,",
-                  "                picks=mne.pick_types(segments.info, eeg=True, eog=False))",
-                  f"if len(segments) > {s['autoreject_max']}:  # fit on a random subset",
-                  f"    ar.fit(segments[np.sort(np.random.default_rng({s['seed']}).choice(",
-                  f"        len(segments), {s['autoreject_max']}, replace=False))])",
-                  "else:",
-                  "    ar.fit(segments)",
-                  "good = ~np.asarray(ar.get_reject_log(segments).bad_epochs, bool)"]
+            n = s["autoreject_max"]
+            L += [f"ar = AutoReject(n_interpolate=[1, 2, 4], random_state={s['seed']}, "
+                  "verbose=False)",
+                  f"fit_on = np.sort(np.random.default_rng({s['seed']}).choice(len(segments), "
+                  f"{n}, replace=False)) if len(segments) > {n} else slice(None)",
+                  "good = ~ar.fit(segments[fit_on]).get_reject_log(segments).bad_epochs"]
         elif s["segments"] == "threshold" and s["reject_uv"]:
-            L += [f"# bad segments: above {s['reject_uv']:g} µV peak-to-peak",
-                  "kept = segments.copy().drop_bad(reject=dict(eeg="
-                  f"{lit(s['reject_uv'])} * 1e-6))",
-                  "good = np.isin(segments.selection, kept.selection)"]
+            L += [f"segments.drop_bad(reject=dict(eeg={lit(s['reject_uv'])}e-6))",
+                  "good = np.ones(len(segments), bool)"]
         else:
-            L += ["good = np.ones(len(segments), bool)  # every segment"]
-        L += ["print(f'ICA fitted on {good.sum()} of {len(good)} segments')",
-              f"ica = mne.preprocessing.ICA(n_components={lit(s['n_components'])}, "
+            L += ["good = np.ones(len(segments), bool)"]
+        L += [f"ica = mne.preprocessing.ICA(n_components={lit(s['n_components'])}, "
               f"method={lit(s['method'])},",
-              f"                            fit_params={lit(s['fit_params'])},",
-              f"                            max_iter={lit(s['max_iter'])}, rng={lit(s['seed'])})",
-              f"ica.fit(segments[np.flatnonzero(good)], decim={lit(s['decim'])})",
-              assign("ica.exclude = ", list(p.ica_exclude), "  # removed in the app"),
-              ""]
-    L += ["# the data for epoching",
-          f"clean = {fc}(raw, {lit(p.l_freq)}, {lit(p.h_freq)}, {lit(p.notch)})",
-          assign("bads = ", list(p.bads)),
-          'clean.info["bads"] = [b for b in bads if b in clean.ch_names]']
+              f"                            fit_params={lit(s['fit_params'])}, "
+              f"max_iter={s['max_iter']}, rng={s['seed']})",
+              f"ica.fit(segments[good], decim={s['decim']})",
+              f"ica.exclude = {lit(list(p.ica_exclude))}  # chosen in the app (blinks)"]
+    L += ["", "data = raw.copy()"] + filters("data", p.l_freq, p.h_freq, p.notch)
     if use_ica:
-        L += ["ica.apply(clean)"]
-    if p.interpolate_bads:
-        L += ['if clean.info["bads"]:', "    clean.interpolate_bads(reset_bads=True)"]
-    if p.reference:
-        ref = "average" if p.reference in ("average", "avg", "car") else p.reference
-        L += [f"clean.set_eeg_reference({lit(ref)}, projection=False)"]
-    return L + ["data = clean", ""]
+        L += ["ica.apply(data)"]
+    if p.interpolate_bads and p.bads:
+        L += ["data.interpolate_bads()"]
+    return L, imports
 
 
-def _epoching(recipe: dict, code: _Code, version: str) -> list[str]:
-    L = _section(3, "Epoching", _describe_epoching(recipe))
-    L += code.helpers(["workflow.GroupSpec", "workflow.select_events", "epoching.EpochSettings",
-                       "epoching.build_group_epochs"], version)
-    n = code.name
-    L += ["group_specs = ["]
-    for g in recipe["groups"]:
-        L += [assign("    ", g, ",")]
-    L += ["]",
-          f"groups = {{g.label: {n('workflow.select_events')}(table, g) for g in group_specs}}",
-          assign("settings = ", recipe["settings"]),
-          "blinks = gaze_events.blinks if gaze_events is not None else None",
-          f"epochs, summary = {n('epoching.build_group_epochs')}(data, groups, settings, blinks)",
-          "print(summary.to_string(index=False))",
-          ""]
-    return L
+# =========================================================================== epoching
+def _epoching(recipe: dict) -> tuple[list[str], set]:
+    st = recipe["settings"]
+    groups = recipe["groups"]
+    what = (f"Cuts {st.tmin:g} … {st.tmax:g} s around the events of each group, without "
+            "baseline correction"
+            + (f"; drops epochs above {st.reject_uv:g} µV peak-to-peak" if st.reject_uv else "")
+            + ("; AutoReject interpolates bad channels per epoch and drops the epochs it "
+               "cannot repair" if st.autoreject else "") + ".")
+    L = _cell(3, "Epoching", what)
+    L += ["GROUPS = {"]
+    for g in groups:
+        sel = {"names": list(g.names)}
+        if g.query.strip():
+            sel["query"] = g.query
+        rec = {k: v for k, v in g.recordings.items() if k in ("subject", "session", "run")}
+        if rec:
+            sel["keep"] = rec
+        L += [assign(f"    {g.label!r}: ", sel, ",")]
+    L += ["}", "",
+          "def select(group):",
+          "    rows = events[events['name'].isin(group['names'])]",
+          "    if group.get('query'):",
+          "        rows = rows.query(group['query'])",
+          "    for column, values in group.get('keep', {}).items():  # recordings kept",
+          "        if column in rows:",
+          "            rows = rows[rows[column].astype(str).isin(values)]",
+          "    return rows.reset_index(drop=True)", ""]
+    if st.delay_ms:
+        L += [f"events['onset'] += {lit(st.delay_ms / 1000)}  # EEG delay"]
+    limits = "".join([f", reject=dict(eeg={lit(st.reject_uv)}e-6)" if st.reject_uv else "",
+                      f", flat=dict(eeg={lit(st.flat_uv)}e-6)" if st.flat_uv else ""])
+    L += ["epochs = {}",
+          "for label, group in GROUPS.items():",
+          "    rows = select(group)",
+          "    samples = np.round(rows['onset'] * data.info['sfreq']).astype(int) "
+          "+ data.first_samp",
+          "    rows, samples = rows[~samples.duplicated()], samples[~samples.duplicated()]",
+          *([f"    if len(rows) > {st.max_epochs}:  # at most {st.max_epochs} per group "
+             "(random, reproducible)",
+             f"        keep = np.sort(np.random.default_rng(0).choice(len(rows), "
+             f"{st.max_epochs}, replace=False))",
+             "        rows, samples = rows.iloc[keep], samples.iloc[keep]"]
+            if st.max_epochs else []),
+          "    epochs[label] = mne.Epochs(data, np.c_[samples, np.zeros_like(samples), "
+          "np.ones_like(samples)],",
+          f"                               tmin={lit(st.tmin)}, tmax={lit(st.tmax)}, "
+          "baseline=None, picks='eeg',",
+          f"                               metadata=rows, preload=True{limits})"]
+    imports = set()
+    if st.autoreject:
+        imports.add("autoreject")
+        L += ["", "ar = AutoReject(n_interpolate=[1, 2, 4], random_state=42, verbose=False)",
+              "ar.fit(mne.concatenate_epochs(list(epochs.values())))",
+              "epochs = {label: ar.transform(ep) for label, ep in epochs.items()}"]
+    L += ["for label, ep in epochs.items():",
+          "    print(f'{label}: {len(ep)} epochs')"]
+    return L, imports
 
 
-def _erp(spec, extra: dict, code: _Code, version: str) -> list[str]:
+# =========================================================================== analyses
+def _erp(spec, extra) -> tuple[list[str], set]:
     from . import eeg as E
     ref, label = E.resolve_erp_reference(spec.reference, extra["ch_names"])
-    L = _section(4, "Analysis: ERP", _describe_erp(spec, label, extra["n_subjects"]))
-    L += code.helpers(["eeg.Component", "eeg.subjects_in", "eeg.epoch_subjects",
-                       "eeg.group_component_analysis", "eeg.component_analysis"], version)
-    n = code.name
     c = spec.component
-    L += [assign("component = ", c),
-          assign("analysed = ", list(spec.groups)),
-          f"# reference: {label}",
-          f"reference = {lit(ref)}",
-          f"baseline = {lit(spec.baseline)}",
-          "erp_epochs = {}",
-          "for g in analysed:",
-          "    ep = epochs[g]",
-          "    if reference is not None:",
-          "        ep = ep.copy().set_eeg_reference(reference, projection=False)",
-          "    if baseline:",
-          "        ep = ep.copy().apply_baseline(baseline)",
-          "    erp_epochs[g] = ep",
-          "roi = [ch for ch in component.channels if ch in erp_epochs[analysed[0]].ch_names]",
-          f"subjects = {n('eeg.subjects_in')}(erp_epochs)",
-          "",
-          "if len(subjects) >= 2:",
-          "    # one Evoked per subject and group, then the grand average of those",
-          "    evokeds = {}",
-          "    for g, ep in erp_epochs.items():",
-          f"        who = {n('eeg.epoch_subjects')}(ep)",
-          "        evokeds[g] = {s: ep[np.flatnonzero(who == s)].average()",
-          "                      for s in subjects if (who == s).any()}",
-          "    grand = {g: mne.grand_average(list(v.values()), interpolate_bads=False,",
-          "                                  drop_bads=False) if len(v) > 1",
-          "             else next(iter(v.values())).copy() for g, v in evokeds.items()}",
-          "",
-          "    # each subject's mean amplitude in the window, on the ROI",
-          "    def window_mean(ev):",
-          "        m = (ev.times >= component.tmin) & (ev.times <= component.tmax)",
-          "        return ev.get_data(picks=roi).mean(0)[m].mean() * 1e6",
-          "    means = pd.DataFrame({g: {s: window_mean(ev) for s, ev in v.items()}",
-          "                          for g, v in evokeds.items()})",
-          "    print(means)",
-          "    if len(analysed) == 2:  # subjects are the observations",
-          "        both = means.dropna()",
-          "        print(stats.ttest_rel(both[analysed[0]], both[analysed[1]]))",
-          "",
-          "    # the app's tables",
-          f"    result = {n('eeg.group_component_analysis')}(erp_epochs, component)",
-          "    summary_table = result['summary']",
-          "    per_subject = result['subjects']",
-          "else:",
-          "    grand = {g: ep.average() for g, ep in erp_epochs.items()}",
-          "    if len(analysed) == 2:  # trials are the observations",
-          "        m = (erp_epochs[analysed[0]].times >= component.tmin) & \\",
-          "            (erp_epochs[analysed[0]].times <= component.tmax)",
-          "        a, b = (erp_epochs[g].get_data(picks=roi).mean(1)[:, m].mean(1) * 1e6",
-          "                for g in analysed)",
-          "        print(stats.ttest_ind(a, b, equal_var=False))",
-          f"    summary_table, per_epoch = {n('eeg.component_analysis')}(erp_epochs, component)",
-          "print(summary_table.T.to_string())",
-          "",
-          "if __name__ == '__main__':",
-          "    mne.viz.plot_compare_evokeds(",
-          "        {g: list(v.values()) for g, v in evokeds.items()} if len(subjects) >= 2",
-          "        else grand, picks=roi, combine='mean' if len(roi) > 1 else None)",
-          ""]
+    groups = list(spec.groups)
+    multi = extra.get("n_subjects", 0) >= 2
+    bl = f"{spec.baseline[0]:g} … {spec.baseline[1]:g} s" if spec.baseline else "no"
+    what = (f"ERP {c.name}: mean amplitude {c.tmin * 1000:.0f}–{c.tmax * 1000:.0f} ms on "
+            f"{', '.join(c.channels)} ({label}, {bl} baseline)."
+            + (" Each subject's epochs are averaged first, then the subjects (grand "
+               "average); subjects are compared with a paired t-test "
+               "(neuraldatascience.io/eeg/erp-group-stats)." if multi else
+               " Trials are the observations (Welch t-test)."))
+    L = _cell(4, "Analysis: ERP", what)
+    L += [assign("ROI = ", list(c.channels)),
+          f"ROI = [ch for ch in ROI if ch in epochs[{groups[0]!r}].ch_names]  # good channels",
+          f"WINDOW = ({lit(c.tmin)}, {lit(c.tmax)})",
+          "erp = {}",
+          f"for label in {lit(groups)}:",
+          "    ep = epochs[label].copy()"]
+    if ref is not None:
+        L += [f"    ep.set_eeg_reference({lit(ref)})"]
+    if spec.baseline:
+        L += [f"    ep.apply_baseline({lit(spec.baseline)})"]
+    L += ["    erp[label] = ep", ""]
+    a, b = (groups + [None])[:2]
+    if multi:
+        L += ["# one Evoked per subject and group, then the grand average",
+              "evokeds = {label: {s: ep[ep.metadata['subject'] == s].average()",
+              "                   for s in sorted(ep.metadata['subject'].unique())}",
+              "           for label, ep in erp.items()}",
+              "grand = {label: mne.grand_average(list(v.values())) for label, v in "
+              "evokeds.items()}",
+              "",
+              "# each subject's mean amplitude in the window (µV)",
+              "means = pd.DataFrame({label: {s: ev.copy().pick(ROI).crop(*WINDOW).data.mean() "
+              "* 1e6",
+              "                              for s, ev in v.items()} for label, v in "
+              "evokeds.items()})",
+              "print(means)"]
+        if b:
+            L += [f"print(stats.ttest_rel(means[{a!r}], means[{b!r}], nan_policy='omit'))"]
+        L += ["", "mne.viz.plot_compare_evokeds({label: list(v.values()) for label, v in "
+              "evokeds.items()},",
+              "                             picks=ROI, combine='mean')"]
+    else:
+        L += ["grand = {label: ep.average() for label, ep in erp.items()}",
+              "trials = {label: ep.copy().pick(ROI).crop(*WINDOW).get_data().mean(axis=(1, 2)) "
+              "* 1e6",
+              "          for label, ep in erp.items()}",
+              "print({label: round(v.mean(), 2) for label, v in trials.items()})"]
+        if b:
+            L += [f"print(stats.ttest_ind(trials[{a!r}], trials[{b!r}], equal_var=False))"]
+        L += ["", "mne.viz.plot_compare_evokeds(grand, picks=ROI, combine='mean')"]
+    return L, {"scipy"}
+
+
+def _bandpower_core(spec) -> list[str]:
+    from . import bandpower as BP  # noqa: F401
+    b = spec.baseline
+    groups = list(spec.groups)
+    L = [assign("BANDS = ", {k: list(v) for k, v in spec.bands.items()}),
+         assign("ROI = ", list(spec.roi)) if spec.roi else "ROI = None  # every channel",
+         f"WINDOW = ({lit(spec.tmin)}, {lit(spec.tmax)})",
+         "",
+         "def band_power(ep, window=WINDOW):",
+         '    """Mean band power on the ROI per epoch (µV²): Welch PSD (segments of up to 2 s,',
+         '    50 % overlap) summed over each band."""',
+         "    seg = min(int(round((window[1] - window[0]) * ep.info['sfreq'])) + 1, "
+         "int(2 * ep.info['sfreq']))",
+         f"    psd = ep.compute_psd(method={lit(spec.method)}, fmin=min(lo for lo, _ in "
+         "BANDS.values()),",
+         "                         fmax=min(max(hi for _, hi in BANDS.values()), "
+         "ep.info['sfreq'] / 2),",
+         "                         tmin=window[0], tmax=window[1], picks='eeg', exclude=(),",
+         "                         n_fft=seg, n_per_seg=seg, n_overlap=seg // 2)",
+         "    p, f = psd.get_data(picks=ROI, return_freqs=True)",
+         "    return pd.DataFrame({b: p[:, :, (f >= lo) & (f < hi)].sum(-1).mean(-1) "
+         "* np.diff(f).mean() * 1e12",
+         "                         for b, (lo, hi) in BANDS.items()})",
+         ""]
+    ref = spec.reference if spec.reference not in ("recorded", "as recorded") else None
+    L += [f"bp = {{label: band_power(epochs[label]"
+          + (f".copy().set_eeg_reference({lit(ref)})" if ref else "") + ")",
+          f"      for label in {lit(groups)}}}"]
+    if b is not None:
+        L += ["",
+              f"# baseline: {b.t0:g}–{b.t1:g} s after each '{b.event}', cut into "
+              "windows as long as the analysis window",
+              f"starts = events[events['name'] == {b.event!r}]"
+              + (f".query({b.query!r})" if b.query else ""),
+              "seg = WINDOW[1] - WINDOW[0]",
+              f"rows = pd.DataFrame([dict(r, onset=r['onset'] + t) for r in "
+              "starts.to_dict('records')",
+              f"                     for t in np.arange({lit(b.t0)}, {lit(b.t1)} - seg + 1e-9, "
+              "seg)])",
+              "samples = np.round(rows['onset'] * data.info['sfreq']).astype(int) + "
+              "data.first_samp",
+              "base_ep = mne.Epochs(data, np.c_[samples, 0 * samples, 1 + 0 * samples], tmin=0,",
+              "                     tmax=seg - 1 / data.info['sfreq'], baseline=None, "
+              "picks='eeg', metadata=rows, preload=True)"
+              + (f"\nbase_ep.set_eeg_reference({lit(ref)})" if ref else ""),
+              "base = band_power(base_ep, (base_ep.tmin, base_ep.tmax))",
+              "if 'subject' in rows:  # each subject against its own baseline",
+              "    base = base.groupby(base_ep.metadata['subject'].to_numpy()).mean()",
+              "    level = {label: base.loc[epochs[label].metadata['subject']].to_numpy() "
+              "for label in bp}",
+              "else:",
+              "    level = {label: base.mean().to_numpy() for label in bp}"]
+        norm = {"dB": "10 * np.log10(v / level[label])",
+                "% change": "100 * (v - level[label]) / level[label]",
+                "ratio": "v / level[label]"}.get(spec.norm, "10 * np.log10(v / level[label])")
+        L += [f"bp = {{label: {norm} for label, v in bp.items()}}  # {spec.norm}"]
     return L
 
 
-def _bandpower(spec, tc_band, code: _Code, version: str, number=True) -> list[str]:
-    roots = ["workflow.BandPowerSpec", "workflow.BaselineSpec", "workflow.run_bandpower"]
+def _bandpower(spec, tc_band) -> tuple[list[str], set]:
+    b = spec.baseline
+    what = (f"Band power in {spec.tmin:g} … {spec.tmax:g} s of each epoch (Welch PSD), "
+            + (f"in {spec.norm} relative to each subject's baseline after '{b.event}'"
+               if b else "absolute") + "; groups compared per band (Welch t-test).")
+    L = _cell(4, "Analysis: band power", what) + _bandpower_core(spec)
+    groups = list(spec.groups)
+    L += ["", "for label, v in bp.items():",
+          "    print(label, v.mean().round(3).to_dict())"]
+    if len(groups) == 2:
+        L += ["for band in BANDS:",
+              f"    print(band, stats.ttest_ind(bp[{groups[0]!r}][band], "
+              f"bp[{groups[1]!r}][band], equal_var=False, nan_policy='omit'))"]
     if tc_band:
-        roots.append("workflow.run_timecourse")
-    L = _section(4, "Analysis: band power", _describe_bp(spec, tc_band)) if number else []
-    L += code.helpers(roots, version)
-    n = code.name
-    L += [assign("bp_spec = ", spec),
-          f"bp = {n('workflow.run_bandpower')}(epochs, data, table, bp_spec)",
-          "print(bp['table'].to_string(index=False))"]
-    if tc_band:
-        L += [f"tc = {n('workflow.run_timecourse')}(bp, epochs, data, {lit(tc_band)})"]
-    return L + [""]
+        L += ["", f"# {tc_band} power over the epoch (Morlet wavelets), dB vs the "
+              "epoch's mean",
+              f"lo, hi = BANDS[{tc_band!r}]",
+              "freqs = np.arange(lo, hi + 1e-9, max((hi - lo) / 6, 0.5))",
+              "for label, ep in epochs.items():",
+              "    tfr = ep.compute_tfr('morlet', freqs, n_cycles=np.maximum(freqs / 2, 3), "
+              "picks=ROI, average=True)",
+              "    tfr.plot(combine='mean', baseline=(None, None), mode='logratio', "
+              "title=label)"]
+    return L, {"scipy"}
 
 
-def _indices(bp_spec, spec, code: _Code, version: str) -> list[str]:
-    L = _section(4, "Analysis: cognitive indices", _describe_idx(bp_spec, spec))
-    L += _bandpower(bp_spec, None, code, version, number=False)
-    L += code.helpers(["workflow.IndicesSpec", "workflow.run_indices"], version)
-    n = code.name
-    return L + [assign("idx_spec = ", spec),
-                f"idx = {n('workflow.run_indices')}(bp, epochs, rec.gaze, gaze_events, idx_spec)",
-                "print(idx['table'].to_string(index=False))", ""]
+def _indices(bp_spec, spec) -> tuple[list[str], set]:
+    from . import bandpower as BP
+    rois = {k: list(v) for k, v in {**BP.DEFAULT_ROIS, **spec.rois}.items()}
+    what = (f"Cognitive indices per epoch in {bp_spec.tmin:g} … {bp_spec.tmax:g} s, from "
+            "absolute band power (Welch PSD) averaged over channel regions: engagement "
+            "β/(α+θ), workload frontal-midline θ / parietal α, θ/α, frontal θ/β and frontal "
+            "alpha asymmetry.")
+    L = _cell(4, "Analysis: cognitive indices", what)
+    groups = list(bp_spec.groups)
+    ref = bp_spec.reference if bp_spec.reference not in ("recorded", "as recorded") else None
+    L += [assign("BANDS = ", {k: list(v) for k, v in bp_spec.bands.items()}),
+          f"WINDOW = ({lit(bp_spec.tmin)}, {lit(bp_spec.tmax)})",
+          assign("REGIONS = ", rois),
+          "",
+          "def power(ep, channels=None):",
+          '    """Band power per epoch (µV²), averaged over ``channels`` (all if None):',
+          '    Welch PSD (segments of up to 2 s, 50 % overlap) summed over each band."""',
+          "    seg = min(int(round((WINDOW[1] - WINDOW[0]) * ep.info['sfreq'])) + 1, "
+          "int(2 * ep.info['sfreq']))",
+          f"    psd = ep.compute_psd(method={lit(bp_spec.method)}, "
+          "fmin=min(lo for lo, _ in BANDS.values()),",
+          "                         fmax=min(max(hi for _, hi in BANDS.values()), "
+          "ep.info['sfreq'] / 2),",
+          "                         tmin=WINDOW[0], tmax=WINDOW[1], picks='eeg', exclude=(),",
+          "                         n_fft=seg, n_per_seg=seg, n_overlap=seg // 2)",
+          "    picks = [c for c in channels if c in ep.ch_names] if channels else None",
+          "    p, f = psd.get_data(picks=picks, return_freqs=True)",
+          "    return {b: p[:, :, (f >= lo) & (f < hi)].sum(-1).mean(-1) * np.diff(f).mean() "
+          "* 1e12",
+          "            for b, (lo, hi) in BANDS.items()}",
+          "",
+          "indices = {}",
+          f"for label in {lit(groups)}:",
+          "    ep = epochs[label]" + (f".copy().set_eeg_reference({lit(ref)})  # as for band power"
+                                     if ref else ""),
+          "    eng, fm, par = power(ep, REGIONS['engagement']), "
+          "power(ep, REGIONS['frontal midline']), power(ep, REGIONS['parietal'])",
+          "    left, right, every = power(ep, REGIONS['left frontal']), "
+          "power(ep, REGIONS['right frontal']), power(ep)",
+          "    frontal = power(ep, REGIONS['frontal midline'] + REGIONS['left frontal'] + "
+          "REGIONS['right frontal'])",
+          "    indices[label] = pd.DataFrame({",
+          "        'engagement β/(α+θ)': eng['beta'] / (eng['alpha'] + eng['theta']),",
+          "        'workload FMθ/Pα': fm['theta'] / par['alpha'],",
+          "        'θ/α': every['theta'] / every['alpha'],",
+          "        'θ/β frontal': frontal['theta'] / frontal['beta'],",
+          "        'FAA ln α(F4)−ln α(F3)': np.log(right['alpha']) - np.log(left['alpha'])})",
+          "    print(label, indices[label].mean().round(3).to_dict())"]
+    if len(groups) == 2:
+        L += ["for index in indices[" + repr(groups[0]) + "]:",
+              f"    print(index, stats.ttest_ind(indices[{groups[0]!r}][index], "
+              f"indices[{groups[1]!r}][index], equal_var=False, nan_policy='omit'))"]
+    return L, {"scipy"}
 
 
-ANALYSIS_ROOTS = {
-    "erp": ["eeg.Component", "eeg.subjects_in", "eeg.epoch_subjects",
-            "eeg.group_component_analysis", "eeg.component_analysis"],
-    "bandpower": ["workflow.BandPowerSpec", "workflow.BaselineSpec", "workflow.run_bandpower",
-                  "workflow.run_timecourse"],
-    "indices": ["workflow.BandPowerSpec", "workflow.BaselineSpec", "workflow.run_bandpower",
-                "workflow.IndicesSpec", "workflow.run_indices"]}
+# =========================================================================== script
+_IMPORT = {"mne": "import mne", "numpy": "import numpy as np", "pandas": "import pandas as pd",
+           "pyxdf": "import pyxdf", "json": "import json", "warnings": "import warnings",
+           "mne_bids": "from mne_bids import get_bids_path_from_fname, read_raw_bids",
+           "pymovements": "import pymovements as pm", "polars": "import polars as pl",
+           "autoreject": "from autoreject import AutoReject", "scipy": "from scipy import stats"}
+_PIP = {"mne": "mne", "numpy": "numpy", "pandas": "pandas", "pyxdf": "pyxdf",
+        "mne_bids": "mne-bids", "pymovements": "pymovements", "polars": "polars",
+        "autoreject": "autoreject", "scipy": "scipy"}
 
 
 def build_script(kind: str, recipe: dict, spec, extra=None, version: str = "") -> str:
-    """The stand-alone script for an analysis ``kind`` ("erp", "bandpower", "indices").
+    """The script for an analysis ``kind`` ("erp", "bandpower" or "indices").
 
     ``spec``: the analysis settings (ErpSpec / BandPowerSpec / (BandPowerSpec,
-    IndicesSpec)); ``extra``: the epochs' channel names (ERP) or the time-course band."""
+    IndicesSpec)); ``extra``: {"ch_names", "n_subjects"} (ERP) or the time-course band."""
     why = check_recipe(recipe)
     if why:
         raise ValueError(why)
@@ -720,38 +754,37 @@ def build_script(kind: str, recipe: dict, spec, extra=None, version: str = "") -
         raise ValueError(f"Unknown analysis {kind!r}")
     if not version:
         from . import __version__ as version
-    sections = [_loading_roots(recipe), ["preprocessing.filtered_copy"],
-                ["workflow.GroupSpec", "workflow.select_events", "epoching.EpochSettings",
-                 "epoching.build_group_epochs"], ANALYSIS_ROOTS[kind]]
-    code = _Code(sections)
-    body = _loading(recipe, code, version) + _preprocessing(recipe, code, version) + \
-        _epoching(recipe, code, version)
+    load, imp = _loading(recipe)
+    gev, imp2 = _gaze_events(recipe)
+    pre, imp3 = _preprocessing(recipe)
+    epo, imp4 = _epoching(recipe)
     if kind == "erp":
-        body += _erp(spec, extra, code, version)
+        ana, imp5 = _erp(spec, extra)
     elif kind == "bandpower":
-        body += _bandpower(spec, extra, code, version)
+        ana, imp5 = _bandpower(spec, extra)
     else:
-        body += _indices(*spec, code, version)
-    text = "\n".join(body)
-    externals = code.externals + (["import autoreject"] if "AutoReject" in text else []) \
-        + (["import picard"] if "method='picard'" in text else [])
+        ana, imp5 = _indices(*spec)
+    imports = imp | imp2 | imp3 | imp4 | imp5
+    if any("ica" in x and "picard" in x for x in pre):
+        pip_extra = ["python-picard"]
+    else:
+        pip_extra = []
+    order = ["json", "warnings", "mne", "numpy", "pandas", "polars", "pymovements", "pyxdf", "autoreject",
+             "mne_bids", "scipy"]
+    std = [_IMPORT[m] for m in order if m in imports and m in ("json", "warnings")]
+    third = [_IMPORT[m] for m in order if m in imports and m not in ("json", "warnings")]
+    pip = " ".join(sorted({_PIP[m] for m in imports if m in _PIP} | set(pip_extra)))
     head = [f'"""{TITLES[kind]} — exported from brAInStudio {version} on '
             f'{_dt.date.today().isoformat()}.',
             "",
-            "Repeats the app's analysis, with the settings it ran with, from the data files",
-            "to the result, in four sections (cells marked '# %%'):",
+            "The app's analysis with the same settings, from the data files to the result,",
+            "in plain MNE code. Run it cell by cell (# %%) or as a whole. Results are close",
+            "to the app's; the app's loading handles some more edge cases.",
             "",
-            "  1 Loading        read the recording and build the event table",
-            "  2 Preprocessing  filters, bad channels and ICA blink removal",
-            "  3 Epoching       epochs around the events of each group",
-            f"  4 Analysis       {TITLES[kind]}",
-            "",
-            "Each section explains what it does, then defines the brAInStudio code it",
-            "uses (copied unchanged, so brAInStudio itself is not needed and the numbers",
-            "are the app's), then runs its steps.",
-            "",
-            f"Needs Python ≥ 3.12 and: pip install {_requirements(externals)}",
-            '"""',
-            "from __future__ import annotations",
-            ""]
-    return "\n".join(head + body) + "\n"
+            f"Needs: pip install {pip}",
+            '"""']
+    if any("Path(" in x for x in load):
+        std.append("from pathlib import Path")
+    body = head + [""] + std + ([""] if std else []) + third + ["", "mne.set_log_level('error')"]
+    body += load + gev + pre + epo + ana
+    return "\n".join(body) + "\n"

@@ -32,6 +32,45 @@ def find_bids_runs(root, keys: list[tuple]) -> list:
     return [runs[tuple(k)] for k in keys]
 
 
+def recording_info(rec, step: dict) -> dict:
+    """What an exported script needs to know about a recording as it was loaded:
+    channel names and types, the XDF stream table, the entities of each file, and the
+    files and gaze columns of BIDS runs."""
+    from pathlib import Path
+
+    from .io.multi import entities_from_path
+    out = {"channels_in": list(rec.raw.ch_names) if rec.raw is not None else [],
+           "types_in": list(rec.raw.get_channel_types()) if rec.raw is not None else [],
+           "streams": [dict(s) for s in (rec.streams or [])]}
+    if step["kind"] == "load_many":
+        out["entities"] = {p: {k: v for k, v in entities_from_path(p).items() if v}
+                           for p in step["paths"]}
+    if step["kind"] == "load_bids":
+        from .io.xdf import gaze_columns
+        root = Path(step["root"])
+        runs = []
+        for r in find_bids_runs(root, step["runs"]):
+            item = {k: v for k, v in (("subject", r.entities.get("subject")),
+                                      ("session", r.entities.get("session")),
+                                      ("run", r.entities.get("run"))) if v}
+            item["eeg"] = str(Path(r.eeg).relative_to(root))
+            if r.gaze:
+                import json
+                eye = Path(r.gaze[0])
+                meta = json.loads(eye.with_name(eye.name.replace(".tsv.gz", ".json")
+                                                .replace(".tsv", ".json"))
+                                  .read_text(encoding="utf-8"))
+                cols = meta.get("Columns", [])
+                m = gaze_columns([c.lower() for c in cols], len(cols))
+                item["eye"] = str(eye.relative_to(root))
+                for role in ("x", "y", "pupil"):
+                    if m.get(role):
+                        item[role] = cols[m[role][0]]
+            runs.append(item)
+        out["runs"] = runs
+    return out
+
+
 def set_montage(rec, source: str | None, names: list[str] | None = None) -> dict:
     """Rename the channels (in recording order), set their types and apply a montage:
     a built-in layout (``gtec_64``), an MNE montage name or a file."""
