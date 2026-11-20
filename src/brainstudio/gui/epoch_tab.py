@@ -60,7 +60,8 @@ class EpochTab(QtWidgets.QWidget):
         bv.addLayout(row)
         bv.addWidget(hint("Each group is one condition: tick its event types and narrow them "
                           "with “+ Filter by column” (e.g. label = human, answering_time < 2). "
-                          "The label is used in all plots and tables."))
+                          "Groups are named after their events and filters; type a name "
+                          "to choose your own. The label is used in all plots and tables."))
         lv.addWidget(box)
         self.stack = QtWidgets.QStackedWidget()
         lv.addWidget(self.stack, 1)
@@ -175,9 +176,25 @@ class EpochTab(QtWidgets.QWidget):
 
     # ================================================================== groups
     def add_group(self, _=False, default=(), label=None):
+        """A new group; without ``label`` it is named after its events and filters
+        (:func:`brainstudio.core.group_label`) until the user types a name."""
         i = len(self._selectors)
         sel = EventSelector(label or f"Group {chr(65 + i) if i < 26 else i + 1}",
                             color_index=i, default_names=default)
+        sel.auto_label = label is None
+        sel.label_edit.setToolTip("Label used in plots and exports. Named automatically "
+                                  "from the events and filters until you type a name; "
+                                  "clear it to name it automatically again.")
+        sel.auto_action = sel.label_edit.addAction(
+            self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload),
+            QtWidgets.QLineEdit.TrailingPosition)
+        sel.auto_action.setToolTip("Name this group automatically from its events and filters")
+        sel.auto_action.triggered.connect(lambda _=False, s=sel: self.set_auto_label(s, True))
+        sel.auto_action.setVisible(not sel.auto_label)
+        sel.label_edit.textEdited.connect(lambda _t, s=sel: self.set_auto_label(s, False))
+        # an emptied name goes back to automatic naming
+        sel.label_edit.editingFinished.connect(
+            lambda s=sel: s.label_edit.text().strip() or self.set_auto_label(s, True))
         sel.set_table(self.pl.event_table)
         sel.changed.connect(lambda s=sel: self._group_changed(s))
         self._selectors.append(sel)
@@ -191,7 +208,8 @@ class EpochTab(QtWidgets.QWidget):
         cur = self.current()
         if cur is None:
             return
-        sel = self.add_group(default=cur.checked_names(), label=cur.label() + " copy")
+        sel = self.add_group(default=cur.checked_names(),
+                             label=None if cur.auto_label else cur.label() + " copy")
         sel.text.setText(cur.text.text())
         sel.query.setText(cur.query.text())
         sel.set_conditions(cur.conditions())
@@ -207,6 +225,9 @@ class EpochTab(QtWidgets.QWidget):
         for k, s in enumerate(self._selectors):  # keep colours in list order
             s.color_index = k
             s.restyle()
+        self._sigs.pop(id(sel), None)
+        for s in self._autoname():  # a freed name: "stimulus (2)" may become "stimulus"
+            self._sync(s)
         self.pl.mark_stale("epoching")
 
     def current(self) -> EventSelector | None:
@@ -242,9 +263,38 @@ class EpochTab(QtWidgets.QWidget):
                                + (" (first 3000 shown)" if n > 3000 else "")
                                + " — the columns are what the filters can use")
 
+    def set_auto_label(self, sel: EventSelector, auto: bool):
+        """Name ``sel`` automatically (``auto``) or keep the name typed for it."""
+        if sel not in self._selectors:
+            return
+        sel.auto_label = auto
+        sel.auto_action.setVisible(not auto)
+        if auto:
+            self._group_changed(sel)
+
+    def _autoname(self) -> list[EventSelector]:
+        """Rename the automatically named groups from their events and filters
+        (unique across groups); returns the groups whose label changed."""
+        specs = [self.group_spec(s) for s in self._selectors]
+        labels = C.auto_group_labels(specs, [s.auto_label for s in self._selectors])
+        changed = []
+        for s, lab in zip(self._selectors, labels):
+            if s.auto_label and s.label_edit.text() != lab:
+                s.label_edit.setText(lab)  # setText: no textEdited, stays automatic
+                s.label_edit.setCursorPosition(0)
+                changed.append(s)
+        return changed
+
     def _group_changed(self, sel: EventSelector):
         if sel not in self._selectors:
             return
+        for s in self._autoname():  # uniqueness can rename other groups too
+            if s is not sel:
+                self._sync(s)
+        self._sync(sel)
+
+    def _sync(self, sel: EventSelector):
+        """The group's list entry and rows; out-of-date epochs if it really changed."""
         i = self._selectors.index(sel)
         try:
             n = len(self.rows_for(sel))

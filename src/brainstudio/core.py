@@ -15,9 +15,10 @@ Data are an MNE ``Raw`` (EEG) and two pandas tables:
 
 from __future__ import annotations
 
+import gc
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import mne
@@ -228,8 +229,8 @@ def eeg_from_stream(s: dict, ts, idx, srate: float, t0: float, opts=None) -> mne
             name += "_"
         labels.append(name)
     scale = [UNIT_SCALE.get(str(chans[k].get("unit", "")).lower(), 1e-6) for k in sel]
-    raw = mne.io.RawArray(data * np.asarray(scale)[:, None],
-                          mne.create_info(labels, srate, [types[k] for k in sel]))
+    raw = raw_array(data * np.asarray(scale)[:, None],
+                    mne.create_info(labels, srate, [types[k] for k in sel]))
     standard_montage(raw)
     return raw
 
@@ -261,6 +262,15 @@ def gaze_columns(labels: list[str], n_cols: int | None = None) -> dict[str, list
     return {"x": ix, "y": iy, "pupil": ip, "valid": iv[:1]}
 
 
+def raw_array(data, info, **kwargs) -> mne.io.RawArray:
+    """``mne.io.RawArray``, without the second reference to ``data`` it keeps in
+    ``_init_kwargs`` (unused by MNE): otherwise every pick, crop or resample of the
+    recording keeps the whole original array alive."""
+    raw = mne.io.RawArray(data, info, **kwargs)
+    raw._init_kwargs.pop("data", None)
+    return raw
+
+
 def numeric_samples(series, idx) -> np.ndarray:
     """Rows idx of a stream's samples as floats; text that is not a number (a string-format
     stream's empty USER field, say) becomes NaN."""
@@ -274,7 +284,8 @@ def gaze_table(times, data, labels, screen=(1920, 1080), label="gaze", sfreq=Non
                mapping=None) -> pd.DataFrame:
     """Gaze samples as a table in screen pixels: x/y averaged over eyes, lost samples
     (NaN, 0/0, validity flag ≠ 1) and glitches far off screen set to NaN, 0–1
-    coordinates scaled to the screen. The tracker's channels are kept (lower-case)."""
+    coordinates scaled to the screen. The tracker's own fixation channels are kept
+    (``ch_`` + lower-case name, :data:`TRACKER_FIXATION_COLUMNS`)."""
     data = np.asarray(data, float)
     labels = [lab.lower() for lab in labels]
     m = mapping or gaze_columns(labels, data.shape[1])
@@ -304,11 +315,86 @@ def gaze_table(times, data, labels, screen=(1920, 1080), label="gaze", sfreq=Non
     if pupil is not None:
         pupil[(pupil <= 0) | lost] = np.nan
         g["pupil"] = pupil
-    for k, lab in enumerate(labels):
-        g["ch_" + lab] = data[:, k]
-    g.attrs.update(sfreq=sfreq or (1 / np.median(np.diff(times)) if len(times) > 1 else None),
-                   screen=tuple(screen), label=label)
+    keep = [i for i, lab in enumerate(labels) if "ch_" + lab in TRACKER_FIXATION_COLUMNS]
+    g = pd.concat([g, pd.DataFrame(data[:, keep], columns=["ch_" + labels[i] for i in keep])],
+                  axis=1)
+    g.attrs.update(sfreq=checked_rate(sfreq, times), screen=tuple(screen), label=label)
     return g
+
+
+def checked_rate(sfreq, times) -> float | None:
+    """The stated sampling rate, unless the timestamps say otherwise (more than 10 % off,
+    e.g. a sample period written as the rate): then the measured one."""
+    measured = 1 / np.median(np.diff(times)) if len(times) > 1 else None
+    if not sfreq or sfreq <= 0 or (measured and abs(sfreq / measured - 1) > 0.1):
+        return measured
+    return float(sfreq)
+
+
+def resample_gaze(gaze, sfreq):
+    """Gaze on a regular grid at ``sfreq`` Hz. x, y and pupil: linear between the two
+    samples around each new one; lost when the nearer of them is lost (so a loss, e.g. a
+    blink, keeps its edges within half a sample interval), the other one's value when
+    only that is lost, and lost across gaps of more than 3 sample intervals. The
+    tracker's channels come from the sample before, its fixation channels (Gazepoint
+    FPOG…) from the nearest one: valid between two valid samples of the same fixation
+    and within half a new interval of a valid sample, with the duration so far (FPOGD)
+    interpolated, or carried on in time at the edges, so each fixation keeps its start
+    and ends at the new sample nearest to its end."""
+    t = gaze["t"].to_numpy(float)
+    grid = t[0] + np.arange(int(np.floor((t[-1] - t[0]) * sfreq + 1e-6)) + 1) / sfreq
+    i = np.clip(np.searchsorted(t, grid, side="right") - 1, 0, len(t) - 1)
+    j = np.minimum(i + 1, len(t) - 1)
+    span = t[j] - t[i]
+    w = np.divide(grid - t[i], span, out=np.zeros(len(grid)), where=span > 0)
+    on_sample, gap = w < 1e-9, span > 3 * np.median(np.diff(t))
+    near, far = np.where(w <= 0.5, i, j), np.where(w <= 0.5, j, i)
+    col = lambda c: pd.to_numeric(gaze[c], errors="coerce").to_numpy(float)  # noqa: E731
+    if {"ch_fpogid", "ch_fpogv"} <= set(gaze.columns):
+        fid, valid = col("ch_fpogid"), col("ch_fpogv")
+        within = (valid[i] == 1) & (valid[j] == 1) & (fid[i] == fid[j])
+        fixating = (valid[near] == 1) & (within | (np.abs(grid - t[near]) <= 0.5 / sfreq + 1e-9))
+    out = {"t": grid}
+    for c in gaze.columns.drop("t"):
+        v = col(c)
+        with np.errstate(invalid="ignore"):
+            between = v[i] + w * (v[j] - v[i])
+        if c in ("x", "y", "pupil"):
+            between = np.where(np.isnan(v[far]), v[near], between)
+            out[c] = np.where(on_sample, v[i], np.where(gap, np.nan, between))
+        elif c == "ch_fpogv" and "ch_fpogid" in gaze:
+            out[c] = fixating.astype(float)
+        elif c == "ch_fpogd" and "ch_fpogv" in gaze:
+            out[c] = np.where(within, between, v[near] + grid - t[near])
+        elif c.startswith("ch_fpog"):
+            out[c] = v[near]
+        else:
+            out[c] = v[i]
+    out = pd.DataFrame(out)
+    out.attrs.update(gaze.attrs, sfreq=float(sfreq))
+    return out
+
+
+#: the Gazepoint columns of its own fixations (ID, duration so far, position, valid)
+TRACKER_FIXATION_COLUMNS = ("ch_fpogid", "ch_fpogd", "ch_fpogx", "ch_fpogy", "ch_fpogv")
+
+
+def tracker_fixations(gaze, screen) -> pd.DataFrame | None:
+    """The eye tracker's own fixations (Gazepoint FPOG…), else None: one per fixation ID
+    (a new part starts new ones), ending at its last valid sample, beginning its duration
+    (FPOGD there) earlier, at the position it reports there (0–1 → px)."""
+    if not all(c in gaze for c in TRACKER_FIXATION_COLUMNS):
+        return None
+    g = gaze[(gaze["ch_fpogv"] == 1) & gaze["ch_fpogid"].notna()]
+    new = (g["ch_fpogid"].diff() != 0) | (g["t"].diff() > 1.0)
+    last = g.groupby(new.cumsum().to_numpy()).tail(1)
+    xy = last[["ch_fpogx", "ch_fpogy"]].to_numpy(float)
+    if len(xy) and np.nanpercentile(np.abs(xy), 95) <= 1.5:  # 0–1 → px
+        xy = xy * np.asarray(screen, float)[:2]
+    off, dur = last["t"].to_numpy(float), last["ch_fpogd"].to_numpy(float)
+    fix = pd.DataFrame({"onset": off - dur, "offset": off, "duration": dur,
+                        "x": xy[:, 0], "y": xy[:, 1]})
+    return fix[fix["duration"] > 0].reset_index(drop=True)
 
 
 # ---- marker streams with several columns ('start', 'trials', 'sad', …)
@@ -643,12 +729,18 @@ def sidecar(path) -> dict:
 
 
 def bids_file(eeg, suffix) -> Path | None:
-    """A sidecar of an EEG file (same entities, another suffix, inherited up)."""
+    """A sidecar of an EEG file (same entities, another suffix, inherited up: fewer
+    entities, then the subject / session / dataset folders)."""
     parts = Path(eeg).name.rsplit("_", 1)[0].split("_")
-    for k in range(len(parts), 0, -1):
-        c = Path(eeg).with_name("_".join(parts[:k]) + f"_{suffix}")
-        if c.exists():
-            return c
+    folder = Path(eeg).parent
+    for _ in range(4):
+        for k in range(len(parts), 0, -1):
+            c = folder / ("_".join(parts[:k]) + f"_{suffix}")
+            if c.exists():
+                return c
+        if (folder / "dataset_description.json").exists():
+            break
+        folder = folder.parent
     return None
 
 
@@ -707,12 +799,13 @@ def read_bids_eyetrack(path, eeg_meta=None, screen=None):
         None, "n/a") else None
     start = float(meta.get("StartTime", 0.0) or 0.0)
     labels = [str(c) for c in df.columns]
-    tcol = next((c for c in labels if c.lower() in ("timestamp", "time", "eye_timestamp")), None)
+    tcol = next((c for name in ("onset", "timestamp", "time", "eye_timestamp")
+                 for c in labels if c.lower() == name), None)
     ts = df[tcol].to_numpy(float) if tcol else None
     scale = 1.0
     if ts is not None:
-        units = str((meta.get(tcol) or {}).get("Units", "") if isinstance(meta.get(tcol), dict)
-                    else "").lower()
+        about = meta.get(tcol) if isinstance(meta.get(tcol), dict) else {}
+        units = str(about.get("Units", about.get("units", ""))).lower()
         known = {"s": 1.0, "ms": 1e-3, "us": 1e-6, "µs": 1e-6, "ns": 1e-9}
         if units in known:
             scale = known[units]
@@ -720,12 +813,17 @@ def read_bids_eyetrack(path, eeg_meta=None, screen=None):
             scale = 10.0 ** round(np.log10((1.0 / sfreq) / np.median(np.diff(ts))))
         times = (ts - ts[0]) * scale + start
     elif sfreq:
+        if sfreq < 1:  # a sample period (s) written as the rate
+            sfreq = 1 / sfreq
         times = start + np.arange(len(df)) / sfreq
     else:
         raise ValueError(f"{path.name}: no timestamp column and no SamplingFrequency")
     data_cols = [c for c in labels if c != tcol]
-    size = tuple(int(v) for v in (screen or meta.get("ScreenResolution")
-                                  or meta.get("ScreenResolutionPx") or (1920, 1080)))[:2]
+    size = screen or meta.get("ScreenResolution") or meta.get("ScreenResolutionPx") \
+        or meta.get("display_resolution") or (1920, 1080)
+    if isinstance(size, str):  # "1280x1024"
+        size = re.findall(r"\d+", size)
+    size = tuple(int(v) for v in size)[:2]
     gaze = gaze_table(times, df[data_cols].to_numpy(float), data_cols, size,
                       path.name.split("_physio")[0], sfreq)
     events = pd.DataFrame(columns=["onset", "duration", "description"])
@@ -939,12 +1037,15 @@ def join(parts: list[tuple]) -> tuple:
     """Join recordings ``(raw, events, gaze, entities)`` end to end.
 
     EEG: the channels all parts share, the first part's rate (rates < 0.1 % apart are
-    taken as equal, others resampled), bad channels from every part, ``BAD boundary``
-    annotations at the joins (MNE). Gaze and events are shifted onto the joined time
+    taken as equal, others resampled, polyphase), bad channels from every part,
+    ``BAD boundary`` annotations at the joins (as ``mne.concatenate_raws``). The parts'
+    EEG is moved, not copied: their raws are left empty, so only about one copy of the
+    data is held at a time. Gaze and events are shifted onto the joined time
     base; each part becomes a segment with its entities. Returns
     ``(raw, events, gaze, segments, notes)``."""
     notes, starts, t = [], [], 0.0
     raws = [p[0] for p in parts]
+    durations = [part_duration(p) for p in parts]
     if any(r is not None for r in raws) and not all(r is not None for r in raws):
         raise ValueError("Cannot combine files with and without EEG")
     raw = None
@@ -956,19 +1057,15 @@ def join(parts: list[tuple]) -> tuple:
         if dropped:
             notes.append(f"channels not in every file left out: {', '.join(dropped[:12])}"
                          f"{' …' if len(dropped) > 12 else ''}")
-        sf, types = raws[0].info["sfreq"], dict(zip(raws[0].ch_names,
-                                                    raws[0].get_channel_types()))
+        sf = raws[0].info["sfreq"]
         bads = sorted({b for r in raws for b in r.info["bads"] if b in common}, key=common.index)
         if any(set(r.info["bads"]) & set(common) != set(bads) for r in raws):
             notes.append(f"bad channels combined from all files: {', '.join(bads)}")
-        ready = []
-        for r in raws:
-            r = r.copy().load_data().pick(common)
-            r.info["bads"] = list(bads)
-            ann = annotations_table(r)
-            r.set_annotations(None)
-            r.set_meas_date(None)
-            r.set_annotations(mne.Annotations(ann.onset, ann.duration, ann.description))
+        anns = []
+        for k, r in enumerate(raws):  # in place: the parts' EEG moves into the joined one
+            r.load_data()
+            if r.ch_names != common:
+                r.pick(common)
             d = abs(r.info["sfreq"] - sf)
             if d and d / sf < 1e-3:  # the same amplifier's effective rates differ by ppm
                 with r.info._unlock():
@@ -977,36 +1074,62 @@ def join(parts: list[tuple]) -> tuple:
                     notes.append(f"rates aligned to {sf:.4f} Hz (< 0.1 % apart)")
             elif d:
                 notes.append(f"resampled {r.info['sfreq']:g} → {sf:g} Hz")
-                r.resample(sf)
-            r.set_channel_types({c: types[c] for c, k in zip(r.ch_names, r.get_channel_types())
-                                 if types[c] != k})
+                r.resample(sf, method="polyphase")
+            ann = annotations_table(r)
+            if k:  # where the previous part ends, as mne.concatenate_raws marks it
+                ann = pd.concat([pd.DataFrame({"onset": [0.0, 0.0], "duration": [0.0, 0.0],
+                                               "description": ["BAD boundary",
+                                                               "EDGE boundary"]}), ann])
+            anns.append(ann.assign(onset=ann["onset"] + t))
             starts.append(t)
             t += r.n_times / sf
-            ready.append(r)
-        raw = mne.concatenate_raws(ready)
+        info = raws[0].info.copy()
+        info["bads"] = list(bads)
+        with info._unlock():
+            info["meas_date"] = None
+        data = np.empty((len(common), sum(r.n_times for r in raws)))  # pages fill on copy
+        i = 0
+        for r in raws:  # each part freed once copied: about one copy of the EEG at a time
+            data[:, i:i + r.n_times] = r._data
+            i += r.n_times
+            r._data = np.empty((len(common), 0))  # a fresh array: a view would keep it alive
+        raw = raw_array(data, info, copy=None, verbose="error")
+        ann = pd.concat(anns, ignore_index=True)
+        raw.set_annotations(mne.Annotations(ann["onset"], ann["duration"], ann["description"]))
         if raws[0].get_montage() is not None:
             raw.set_montage(raws[0].get_montage(), on_missing="ignore")
     else:
-        for p in parts:
+        for d in durations:
             starts.append(t)
-            t += part_duration(p) + 1.0
+            t += d + 1.0
     gazes = [(g, s) for (_, _, g, _), s in zip(parts, starts) if g is not None and len(g)]
     gaze = None
+    rates = [1 / np.median(np.diff(g["t"])) for g, _ in gazes if len(g) > 1]
+    if len(rates) == len(gazes) and rates and max(rates) / min(rates) > 1.01:
+        top = max(rates)  # different rates: every part upsampled to the highest
+        gazes = [(resample_gaze(g, top) if top / r > 1.01 else g, s)
+                 for (g, s), r in zip(gazes, rates)]
+        notes.append(f"gaze upsampled to {top:.1f} Hz (linear; rates {min(rates):.1f}–"
+                     f"{top:.1f} Hz)")
     if gazes:
         cols = set.intersection(*[set(g.columns) for g, _ in gazes])
         gaze = pd.concat([g[[c for c in g.columns if c in cols]].assign(t=g["t"] + s)
                           for g, s in gazes], ignore_index=True)
         gaze.attrs.update(gazes[0][0].attrs)
+        if rates and max(rates) / min(rates) > 1.01:
+            gaze.attrs["sfreq"] = float(max(rates))
         if len(gazes) != len(parts):
             notes.append(f"gaze in {len(gazes)} of {len(parts)} files")
     events = pd.concat([pd.DataFrame(columns=["onset", "duration", "description"])]
                        + [ev.assign(onset=ev["onset"] + s) for (_, ev, _, _), s
                           in zip(parts, starts) if len(ev)], ignore_index=True)
     segments = []
-    for p, s in zip(parts, starts):
-        for seg in p[3].get("segments") or [{"start": 0.0, "end": part_duration(p),
+    for p, s, d in zip(parts, starts, durations):
+        own = {"bads": [b for b in p[0].info["bads"] if b in raw.ch_names]} \
+            if p[0] is not None and raw is not None else {}  # each file's own bad channels
+        for seg in p[3].get("segments") or [{"start": 0.0, "end": d,
                                              **p[3].get("entities", {})}]:
-            segments.append({**seg, "start": seg["start"] + s, "end": seg["end"] + s})
+            segments.append({**own, **seg, "start": seg["start"] + s, "end": seg["end"] + s})
     return raw, events, gaze, segments, notes
 
 
@@ -1037,6 +1160,97 @@ def segment_label(seg: dict, with_subject: bool = True) -> str:
                                               ("run", "run-"))
              if seg.get(k) not in (None, "") and (with_subject or k != "subject")]
     return " · ".join(parts) or str(seg.get("file", ""))
+
+
+#: tests a filter condition can make; the negated ones are true where no column matches
+FILTER_OPS = ("contains", "does not contain", "is", "is not", "starts with",
+              ">", "≥", "<", "≤", "is empty", "is not empty")
+_NEGATED = {"does not contain": "contains", "is not": "is", "is not empty": "is empty"}
+
+
+def filter_rows(df: pd.DataFrame, conditions, match: str = "all",
+                columns=None) -> pd.DataFrame:
+    """Rows of ``df`` meeting all (``match`` "all") or any ("any") of ``conditions``:
+    ``(column, test, value)`` with a test of :data:`FILTER_OPS` and ``column`` None for
+    any of ``columns`` (default: every column). Text is compared ignoring case ("contains": every word of the value, part
+    of a cell is enough); >, ≥, <, ≤ compare numbers. A condition without a value is
+    left out, except "is empty" / "is not empty"."""
+    active = [(c, op, str(v or "").strip()) for c, op, v in conditions
+              if op in ("is empty", "is not empty") or str(v or "").strip()]
+    if not active or not len(df):
+        return df
+    masks = []
+    for col, op, val in active:
+        test = _NEGATED.get(op, op)
+        cols = [col] if col in df.columns else [c for c in (columns or df.columns)
+                                                 if c in df.columns]
+        hit = np.ones(len(df), bool)
+        for part in (val.split() if test == "contains" else [val]):  # each word anywhere
+            hit &= np.logical_or.reduce([_cell_test(df[c], test, part) for c in cols]
+                                        or [np.zeros(len(df), bool)])
+        masks.append(~hit if op in _NEGATED else hit)
+    keep = np.logical_and.reduce(masks) if match == "all" else np.logical_or.reduce(masks)
+    return df[keep]
+
+
+#: event-table columns only the app has: exported scripts cannot filter on them, and
+#: "any column" leaves them out
+APP_ONLY_EVENT_COLUMNS = ("phase", "bids_task", "acq", "file")
+
+
+def marker_columns(table: pd.DataFrame) -> list[str]:
+    """The columns of the markers worth showing: onset, name, duration, phase and every
+    column they carry."""
+    m = table[table["kind"] == "marker"] if len(table) else table
+    cols = ["onset", "name", "duration", "phase"] + [
+        c for c in m.columns if c not in BASE_COLUMNS + ["phase", "x", "y", "amplitude",
+                                                          "peak_velocity"]
+        and m[c].notna().any() and (m[c].astype(str) != "").any()]
+    return [c for c in cols if c in m.columns]
+
+
+def event_filter(conditions, match: str, table: pd.DataFrame) -> dict | None:
+    """The filter applied to the markers of ``table`` (None: nothing to filter): the
+    conditions with a value, how they combine and the columns "any column" searches."""
+    conds = [tuple(c) for c in conditions if c[1] in ("is empty", "is not empty")
+             or str(c[2] or "").strip()]
+    if not conds:
+        return None
+    return {"conditions": conds, "match": match,
+            "columns": [c for c in (marker_columns(table) if table is not None else [])
+                        if c not in APP_ONLY_EVENT_COLUMNS]}
+
+
+def apply_event_filter(table: pd.DataFrame, flt: dict | None) -> pd.DataFrame:
+    """``table`` without the markers that do not pass ``flt`` (gaze events stay)."""
+    if not flt or not len(table):
+        return table
+    markers = table[table["kind"] == "marker"]
+    kept = filter_rows(markers, flt["conditions"], flt["match"], flt["columns"]).index
+    out = table[(table["kind"] != "marker").to_numpy() | table.index.isin(kept)]
+    return out.reset_index(drop=True)
+
+
+def _cell_test(values: pd.Series, test: str, val: str) -> np.ndarray:
+    text = values.where(values.notna(), "").astype(str).str.strip().str.lower()
+    v = val.lower()
+    try:
+        x = float(val)
+    except ValueError:
+        x = None
+    num = pd.to_numeric(values, errors="coerce").to_numpy(float)
+    if test == "contains":
+        return text.str.contains(v, regex=False).to_numpy()
+    if test == "is":
+        return (text == v).to_numpy() | (num == x if x is not None else False)
+    if test == "starts with":
+        return text.str.startswith(v).to_numpy()
+    if test == "is empty":
+        return (text == "").to_numpy()
+    if x is None:  # >, ≥, <, ≤ need a number
+        return np.zeros(len(values), bool)
+    with np.errstate(invalid="ignore"):
+        return {">": num > x, "≥": num >= x, "<": num < x, "≤": num <= x}[test]
 
 
 def subject_spans(segments) -> list[dict]:
@@ -1072,6 +1286,12 @@ class BidsRun:
         return " ".join(parts) + f"  [{'+'.join(mods)}]"
 
 
+def bids_signals(runs) -> list[str]:
+    """The signals ("EEG", "gaze") any of these runs has."""
+    return [m for m, has in (("EEG", any(r.eeg for r in runs)),
+                             ("gaze", any(r.gaze for r in runs))) if has]
+
+
 def scan_bids(root) -> list[BidsRun]:
     """Every EEG / eye-tracking run of a BIDS dataset."""
     from mne_bids import get_entities_from_fname
@@ -1085,9 +1305,14 @@ def scan_bids(root) -> list[BidsRun]:
         if not p.name.endswith(("_physio.tsv.gz", "_physio.tsv")):
             return False
         meta = sidecar(p)
+        kind = str(meta.get("PhysioType") or meta.get("Type") or "").lower()
+        if kind:  # eyetrack (BEP020), gaze (an LSL stream's type), videostream, ...
+            return kind in ("eyetrack", "eyetracking", "eye", "gaze")
+        rec = p.name.split("_recording-")[-1].split("_")[0].lower() if "_recording-" in \
+            p.name else ""
         cols = [str(c).lower() for c in meta.get("Columns", [])]
-        return meta.get("PhysioType") == "eyetrack" or "eye" in p.name.split(
-            "_recording-")[-1][:8] or any("coordinate" in c or "gaze" in c for c in cols)
+        return any(w in rec for w in ("eye", "gaze")) or any(
+            "coordinate" in c or "gaze" in c or c.endswith("pogx") for c in cols)
     runs: dict = {}
     for p in sorted(root.rglob("sub-*")):
         rel = p.relative_to(root).parts[:-1]
@@ -1126,6 +1351,8 @@ class DetectionParams:
     blink_max_dur: float = 0.5          # s
     velocity_method: str = "smooth"     # Gaze.pos2vel: smooth (Savitzky-Golay),
     #                                     neighbors or preceding
+    tracker_fixations: bool = True      # the eye tracker's own fixations when the data
+    #                                     has them (Gazepoint FPOG…), instead of I-DT
 
 
 #: detection settings for common kinds of gaze data: (label, parameters, explanation)
@@ -1175,19 +1402,38 @@ class GazeEvents:
 
 
 def gaze_rate(gaze) -> float:
-    return float(gaze.attrs.get("sfreq") or 1.0 / float(np.median(np.diff(gaze["t"]))))
+    return checked_rate(gaze.attrs.get("sfreq"), gaze["t"].to_numpy(float))
 
 
-def detect_gaze_events(gaze, p: DetectionParams = DetectionParams()) -> GazeEvents:
-    """Fixations (I-DT), saccades (Engbert & Kliegl) and blinks (from the pupil, or from
-    tracking loss) with pymovements, on the screen-pixel gaze. pymovements gets the
-    sample number as time axis (durations in samples), so any sampling rate works;
-    onsets are mapped back to the sample times."""
+def detect_gaze_events(gaze, p: DetectionParams = DetectionParams(),
+                       starts=None, progress=None) -> GazeEvents:
+    """Fixations (I-DT, or the eye tracker's own), saccades (Engbert & Kliegl) and blinks
+    (from the pupil, or from tracking loss) with pymovements, on the screen-pixel gaze.
+    pymovements gets the sample number as time axis (durations in samples), so any
+    sampling rate works; onsets are mapped back to the sample times. ``starts``: the
+    start times of joined parts (participants, runs), each detected on its own, so the
+    adaptive saccade threshold is each part's (``progress(k, n)`` hears each one)."""
+    if starts is not None and len(starts) > 1:
+        cut = np.searchsorted(gaze["t"].to_numpy(float), starts[1:])
+        found = []
+        for k, (a, b) in enumerate(zip([0, *cut], [*cut, len(gaze)])):
+            if progress is not None:
+                progress(k, len(starts))
+            if b - a > 10:
+                found.append(detect_gaze_events(gaze.iloc[a:b], p))
+        if not found:
+            return GazeEvents.empty()
+        out = GazeEvents(*(pd.concat([getattr(f, k) for f in found], ignore_index=True)
+                           for k in ("fixations", "saccades", "blinks")))
+        out.fixations.attrs["source"] = found[0].fixations.attrs.get("source")
+        return out
     import warnings
 
     import polars as pl
     import pymovements as pm
     sf, t = gaze_rate(gaze), gaze["t"].to_numpy()
+    own = tracker_fixations(gaze, gaze.attrs.get("screen", (1920, 1080))) \
+        if p.tracker_fixations else None
     n = lambda seconds, least=1: max(int(round(seconds * sf)), least)  # noqa: E731  → samples
     xy = gaze[["x", "y"]].to_numpy().T
     pupil = gaze["pupil"].to_numpy(float) if "pupil" in gaze else \
@@ -1198,8 +1444,9 @@ def detect_gaze_events(gaze, p: DetectionParams = DetectionParams()) -> GazeEven
                                 pixel=xy, position=xy, experiment=pm.Experiment(sampling_rate=sf))
         pg.samples = pg.samples.with_columns(pl.Series("pupil", pupil))
         pg.pos2vel(method=p.velocity_method)
-        pg.detect("idt", dispersion_threshold=p.fix_dispersion,
-                  minimum_duration=n(p.fix_min_dur, 2))
+        if own is None:
+            pg.detect("idt", dispersion_threshold=p.fix_dispersion,
+                      minimum_duration=n(p.fix_min_dur, 2))
         pg.detect("microsaccades", threshold_factor=p.sac_threshold_factor,
                   minimum_duration=n(p.sac_min_dur), name="saccade")
         pg.detect("blink", minimum_duration=n(p.blink_min_dur),
@@ -1221,6 +1468,9 @@ def detect_gaze_events(gaze, p: DetectionParams = DetectionParams()) -> GazeEven
     fix, loc = table("fixation"), ev.filter(pl.col("name") == "fixation")
     fix[["x", "y"]] = np.array(loc["location"].to_list(), float).reshape(-1, 2) \
         if len(loc) and "location" in loc.columns else np.empty((0, 2))
+    if own is not None:
+        fix = own
+    fix.attrs["source"] = "eye tracker" if own is not None else "I-DT"
     return GazeEvents(fix, table("saccade", ("amplitude", "peak_velocity")), table("blink"))
 
 
@@ -1703,8 +1953,9 @@ def first_event_time(table: pd.DataFrame) -> float | None:
 
 # =========================================================================== EEG basics
 def has_positions(inst) -> bool:
-    """True if at least 4 EEG channels of an MNE object have sensor locations."""
-    locs = np.array([ch["loc"][:3] for ch in inst.info["chs"]
+    """True if at least 4 EEG channels of an MNE object (or info) have sensor locations."""
+    info = inst if isinstance(inst, mne.Info) else inst.info
+    locs = np.array([ch["loc"][:3] for ch in info["chs"]
                      if ch["kind"] == mne.io.constants.FIFF.FIFFV_EEG_CH])
     return len(locs) > 0 and int((np.isfinite(locs).all(1) &
                                   (np.abs(locs).sum(1) > 0)).sum()) >= 4
@@ -1847,12 +2098,131 @@ def filter_raw(raw, l_freq, h_freq, notch):
 
 def filtered_copy(raw, l_freq, h_freq, notch, picks=None, tmin=None):
     """A filtered copy of ``raw`` (``picks`` only, from ``tmin`` s)."""
-    out = raw.copy().load_data()
+    return filter_raw(part_copy(raw, picks, start_time(raw, tmin)), l_freq, h_freq, notch)
+
+
+def part_copy(raw, picks=None, tmin=None, tmax=None):
+    """``raw.copy().pick(picks).crop(tmin, tmax)``, copying only the data that is kept."""
+    if not raw.preload:
+        out = raw.copy().load_data()
+        if picks is not None:
+            out.pick(picks)
+        return out.crop(tmin=tmin or 0.0, tmax=tmax, include_tmax=True) \
+            if tmin or tmax is not None else out
+    data = raw._data
+    raw._data = data[:, :0]  # copy everything but the data
+    try:
+        out = raw.copy()
+    finally:
+        raw._data = data
     if picks is not None:
         out.pick(picks)
-    if start_time(raw, tmin):
-        out.crop(tmin=start_time(raw, tmin), include_tmax=True)
-    return filter_raw(out, l_freq, h_freq, notch)
+    if tmin or tmax is not None:
+        out.crop(tmin=tmin or 0.0, tmax=tmax, include_tmax=True)
+    idx = [raw.ch_names.index(c) for c in out.ch_names]
+    start = out.first_samp - raw.first_samp
+    out._data = data[idx, start:start + out.n_times]
+    return out
+
+
+# =========================================================================== per subject
+def subject_parts(raw, segments) -> list[dict]:
+    """The stretches of a recording preprocessed on their own: one per subject (ICA, bad
+    channels and interpolation differ between heads), or the whole recording when it
+    has fewer than two subjects. ``start`` / ``stop`` are samples; ``bads`` the
+    channels the dataset marks bad in that subject's files."""
+    n, sf = raw.n_times, raw.info["sfreq"]
+    spans = []
+    for sp in subject_spans(segments):  # consecutive files of a subject are one stretch
+        if spans and spans[-1]["subject"] == sp["subject"]:
+            spans[-1]["end"] = sp["end"]
+        else:
+            spans.append(dict(sp))
+    if len({sp["subject"] for sp in spans}) < 2:
+        return [{"key": "", "label": "recording", "start": 0, "stop": n,
+                 "bads": [b for b in raw.info["bads"]]}]
+    out, seen = [], {}
+    for k, sp in enumerate(spans):
+        a = min(n, int(round(sp["start"] * sf)))
+        b = min(n, int(round(spans[k + 1]["start"] * sf))) if k + 1 < len(spans) else n
+        seen[sp["subject"]] = seen.get(sp["subject"], 0) + 1
+        again = seen[sp["subject"]] > 1  # the same subject again, later on
+        bads = sorted({c for seg in segments or [] if seg.get("subject") == sp["subject"]
+                       and sp["start"] - 1e-6 <= seg["start"] < sp["end"] - 1e-6
+                       for c in seg.get("bads", [])}, key=raw.ch_names.index)
+        out.append({"key": sp["subject"] + (f"#{seen[sp['subject']]}" if again else ""),
+                    "label": sp["label"] + (f" ({seen[sp['subject']]})" if again else ""),
+                    "start": a, "stop": b, "bads": bads})
+    out[0]["start"] = 0
+    return out
+
+
+def part_raw(raw, part, picks=None):
+    """The data of one subject (``subject_parts``), on its own time base from 0 s."""
+    sf = raw.info["sfreq"]
+    if part["start"] == 0 and part["stop"] >= raw.n_times:
+        return part_copy(raw, picks)
+    return part_copy(raw, picks, part["start"] / sf, (part["stop"] - 1) / sf)
+
+
+def part_events(df, part, sf):
+    """The rows of an onset table (blinks, events) inside a subject's data, with onsets
+    on its time base."""
+    if df is None:
+        return None
+    t0, t1 = part["start"] / sf, part["stop"] / sf
+    on = df["onset"].astype(float)
+    return df[(on >= t0) & (on < t1)].assign(onset=on[(on >= t0) & (on < t1)] - t0)
+
+
+def preprocess_subjects(raw, parts, p, subjects: dict, progress=None):
+    """``run_preprocessing`` for each subject on its own, with its bad channels and ICA:
+    ``subjects`` maps a part's key to {"bads", "ica", "exclude"}. The subjects are done
+    one after another, straight into one recording (one subject's data in memory at a
+    time). Channels left bad in any subject (not interpolated) are bad in the result.
+    ``progress(k, n, label)`` hears each subject as it starts."""
+    def one(part):
+        s = subjects.get(part["key"], {})
+        q = replace(p, bads=list(s.get("bads", [])), ica_exclude=list(s.get("exclude", [])))
+        return run_preprocessing(part_raw(raw, part) if len(parts) > 1 else raw, q,
+                                 s.get("ica") if q.ica_exclude else None)
+    if len(parts) == 1:
+        return one(parts[0])
+    data = raw._data
+    raw._data = data[:, :0]
+    try:
+        out = raw.copy()
+    finally:
+        raw._data = data
+    out._data = np.empty_like(data)  # pages are filled subject by subject
+    bads = set()
+    for k, part in enumerate(parts):
+        if progress is not None:
+            progress(k, len(parts), part["label"])
+        sub = one(part)
+        out._data[:, part["start"]:part["stop"]] = sub._data
+        bads |= set(sub.info["bads"])
+        info = sub.info
+        del sub
+    with out.info._unlock():
+        for k in ("highpass", "lowpass", "custom_ref_applied"):
+            out.info[k] = info[k]
+    out.info["bads"] = [c for c in out.ch_names if c in bads]
+    return out
+
+
+def set_reference(raw, ref, minutes: float = 1.0):
+    """``raw.set_eeg_reference(ref, projection=False)`` (MNE's own), a minute of data at a
+    time: the same numbers, without a copy of every channel at once."""
+    data = raw._data
+    step = max(1, int(minutes * 60 * raw.info["sfreq"]))
+    try:
+        for a in range(0, data.shape[1], step):
+            raw._data = data[:, a:a + step]
+            raw.set_eeg_reference(ref, projection=False, verbose="error")
+    finally:
+        raw._data = data
+    return raw
 
 
 # =========================================================================== ICA
@@ -1900,7 +2270,8 @@ def autoreject(epochs, seed: int = 42, fraction: float = 1.0):
                     picks=mne.pick_types(epochs.info, eeg=True, eog=False))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return ar.fit(epochs[fit_subset(len(epochs), fraction, seed)])
+        subset = fit_subset(len(epochs), fraction, seed)
+        return ar.fit(epochs if isinstance(subset, slice) else epochs[subset])  # no copy
 
 
 def fit_times(fit_raw) -> np.ndarray:
@@ -1925,7 +2296,7 @@ def fit_ica(raw, bads=(), h_freq=None, notch=None, p: ICAParams | None = None, t
         raise ValueError("ICA needs at least 3 good EEG channels")
     ica_raw = filtered_copy(raw, max(p.l_freq, 0.1), h, notch, picks=chans, tmin=t0)
     ica_raw.info["bads"] = []  # the channels kept by the user, whatever the file says
-    ica_raw.set_eeg_reference("average", projection=False)  # as ICLabel expects
+    set_reference(ica_raw, "average")  # as ICLabel expects
     ica_raw.recording_t0 = t0
     decim = max(1, int(ica_raw.info["sfreq"] // p.target_sfreq))
     if decim > 1:
@@ -1937,6 +2308,7 @@ def fit_ica(raw, bads=(), h_freq=None, notch=None, p: ICAParams | None = None, t
         try:
             ar = autoreject(segments, p.seed, p.autoreject_fraction)
             good, how = ~np.asarray(ar.get_reject_log(segments).bad_epochs, bool), "autoreject"
+            del ar
             notes.append(f"AutoReject left out {(~good).sum()} of {len(good)} 1 s segments")
         except Exception as e:  # noqa: BLE001
             notes.append(f"AutoReject failed ({type(e).__name__}), threshold used")
@@ -1969,6 +2341,8 @@ def fit_ica(raw, bads=(), h_freq=None, notch=None, p: ICAParams | None = None, t
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ica.fit(fit_on, decim=every)
+    del segments, fit_on  # before ICLabel's own copy of the data
+    gc.collect()  # MNE objects hold reference cycles: free their data now
     if getattr(ica, "n_iter_", 0) >= p.max_iter:
         notes.append(f"stopped after {p.max_iter} iterations without converging — fewer "
                      "components or more bad channels may help")
@@ -1994,12 +2368,12 @@ def iclabel(raw, ica, chans, notch=None, tmin=None) -> tuple[list[str], np.ndarr
     import warnings
 
     from mne_icalabel import label_components
-    if not has_positions(raw.copy().pick(chans)):
+    if not has_positions(mne.pick_info(raw.info, mne.pick_channels(raw.ch_names, chans))):
         raise ValueError("the EEG channels have no electrode positions (load a montage)")
     lab_raw = filtered_copy(raw, 1.0, min(100.0, raw.info["sfreq"] / 2 - 1), notch,
                             picks=chans, tmin=tmin)
     lab_raw.info["bads"] = []
-    lab_raw.set_eeg_reference("average", projection=False)
+    set_reference(lab_raw, "average")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         out = label_components(lab_raw, ica, method="iclabel")
@@ -2078,16 +2452,28 @@ class PreprocParams:
     reference: str | list[str] | None = None
     ica_exclude: list[int] = field(default_factory=list)
     interpolate_bads: bool = False
+    #: preprocessed per subject: key → {"bads", "exclude"} (``bads`` / ``ica_exclude``
+    #: above then apply to none; see ``preprocess_subjects``)
+    per_subject: dict = field(default_factory=dict)
 
     def describe(self) -> str:
         band = f"{self.l_freq or 0:g}–{self.h_freq:g} Hz" if self.h_freq else \
             (f"high-pass {self.l_freq:g} Hz" if self.l_freq else "no band-pass")
-        return " · ".join(
-            [f"{len(self.bads)} bad channel(s)"
-             + (" interpolated" if self.bads and self.interpolate_bads else ""), band]
-            + ([f"notch {self.notch:g} Hz"] if self.notch else [])
-            + ([f"ICA −{len(self.ica_exclude)} comp."] if self.ica_exclude else [])
-            + [f"ref: {self.reference or 'as recorded'}"])
+        if len(self.per_subject) > 1:
+            nb = [len(s["bads"]) for s in self.per_subject.values()]
+            ne = [len(s["exclude"]) for s in self.per_subject.values()]
+            span = lambda v: f"{min(v)}" if min(v) == max(v) else f"{min(v)}–{max(v)}"  # noqa: E731
+            head = [f"{len(nb)} subjects, each on its own: {span(nb)} bad channel(s)"
+                    + (" interpolated" if any(nb) and self.interpolate_bads else "")]
+            ica = [f"ICA −{span(ne)} comp."] if any(ne) else []
+        else:
+            one = next(iter(self.per_subject.values()), {"bads": self.bads,
+                                                         "exclude": self.ica_exclude})
+            head = [f"{len(one['bads'])} bad channel(s)"
+                    + (" interpolated" if one["bads"] and self.interpolate_bads else "")]
+            ica = [f"ICA −{len(one['exclude'])} comp."] if one["exclude"] else []
+        return " · ".join(head + [band] + ([f"notch {self.notch:g} Hz"] if self.notch else [])
+                          + ica + [f"ref: {self.reference or 'as recorded'}"])
 
 
 def run_preprocessing(raw, p: PreprocParams, ica=None):
@@ -2106,7 +2492,7 @@ def run_preprocessing(raw, p: PreprocParams, ica=None):
         data.interpolate_bads(reset_bads=True)
     ref = parse_reference(p.reference, data)
     if ref:
-        data.set_eeg_reference(ref, projection=False)
+        set_reference(data, ref)
     return data
 
 
@@ -2143,11 +2529,43 @@ def blink_check(raw, clean, p: PreprocParams, blinks) -> tuple:
     return blink_locked_average(before, blinks, fp), blink_locked_average(clean, blinks, fp)
 
 
+def psd_check_subjects(raw, clean, parts, progress=None) -> tuple:
+    """``psd_check`` subject by subject (less memory), averaged over the subjects weighted
+    by their length, on the channels good in every subject. ``progress(k, n, label)``
+    hears each subject."""
+    if len(parts) == 1:
+        return psd_check(raw, clean)
+    good = [c for c in clean.ch_names if c not in clean.info["bads"]
+            and c not in raw.info["bads"] and c in eeg_names(clean)]
+    if not good:
+        return None, None
+    out, total = [None, None], 0
+    for k, part in enumerate(parts):
+        if progress is not None:
+            progress(k, len(parts), part["label"])
+        n = part["stop"] - part["start"]
+        pair = (compute_psd(part_raw(raw, part, good), 60.0, picks=good),
+                compute_psd(part_raw(clean, part, good), 60.0, picks=good))
+        for i, spec in enumerate(pair):
+            if out[i] is None:
+                out[i] = spec
+                out[i]._data = spec._data * n
+            else:
+                out[i]._data += spec._data * n
+        total += n
+    for spec in out:
+        spec._data /= total
+    return tuple(out)
+
+
 def psd_check(raw, clean) -> tuple:
     """Power spectra of the good EEG channels before and after preprocessing."""
     eeg = [clean.ch_names[i] for i in mne.pick_types(clean.info, eeg=True)]
     good = [c for c in clean.ch_names if c not in clean.info["bads"] and c in eeg]
-    return compute_psd(raw.copy().pick(good) if good else raw, 60.0), compute_psd(clean, 60.0)
+    names = [c for c in good if c not in raw.info["bads"]]
+    before = (compute_psd(raw, 60.0, picks=names) if names else
+              compute_psd(raw.copy().pick(good) if good else raw, 60.0))
+    return before, compute_psd(clean, 60.0)
 
 
 # =========================================================================== epoching
@@ -2317,7 +2735,10 @@ def apply_autoreject(epochs: dict, summary, fraction=1.0, seed=42):
 
 
 # =========================================================================== EEG: montages, triggers, ERP
-def compute_psd(raw, fmax: float = 60.0, tmin=None, tmax=None):
+def compute_psd(raw, fmax: float = 60.0, tmin=None, tmax=None, picks=None):
+    if picks is not None:  # these channels, bad or not
+        return raw.compute_psd(fmax=min(fmax, raw.info["sfreq"] / 2), tmin=tmin, tmax=tmax,
+                               picks=picks, exclude=())
     picks = mne.pick_types(raw.info, eeg=True, exclude="bads")
     return raw.compute_psd(fmax=min(fmax, raw.info["sfreq"] / 2), tmin=tmin, tmax=tmax,
                            picks=picks if len(picks) else eeg_picks(raw))
@@ -3137,6 +3558,55 @@ def select_events(table, spec: GroupSpec) -> pd.DataFrame:
         if col in df:
             df = df[df[col].fillna("").astype(str).isin(keep)]
     return df
+
+
+#: how a column filter reads in a group's automatic label
+_LABEL_OPS = {"=": "=", "≠": "≠", "<": "<", "≤": "≤", ">": ">", "≥": "≥", "contains": "~"}
+GROUP_LABEL_MAX = 60
+
+
+def group_label(spec: GroupSpec, max_names: int = 3) -> str:
+    """A short readable label from a group's events and filters (``spec.label`` and
+    the recordings, which every group shares, are ignored), e.g. ``stimulus``,
+    ``stimulus · emotion=happy`` or ``response/stimulus``."""
+    names = sorted(str(n) for n in spec.names)
+    head = "/".join(names[:max_names]) + (f" +{len(names) - max_names}"
+                                          if len(names) > max_names else "")
+    parts = [head or "no events"]
+    for col, op, value in spec.conditions or ():
+        value = str(value).strip()
+        if not col or (value == "" and op != "≠"):
+            continue  # not applied by apply_conditions either
+        if op == "one of":
+            vals = [v.strip() for v in value.split(",") if v.strip()]
+            parts.append(f"{col}∈{{{','.join(vals)}}}")
+        else:
+            parts.append(f"{col}{_LABEL_OPS.get(op, f' {op} ')}{value}")
+    if spec.text.strip():
+        parts.append(f"/{spec.text.strip()}/")
+    if spec.query.strip():
+        parts.append(" ".join(spec.query.split()))
+    label = " · ".join(parts)
+    return label if len(label) <= GROUP_LABEL_MAX else label[:GROUP_LABEL_MAX - 1] + "…"
+
+
+def auto_group_labels(specs: list[GroupSpec], auto: list[bool]) -> list[str]:
+    """Labels of the groups, in order: a group with ``auto`` gets :func:`group_label`,
+    the others keep the label typed for them. Automatic labels never repeat another
+    group's label (a number is added: ``stimulus (2)``); typed ones are left as typed."""
+    taken = {s.label for s, a in zip(specs, auto) if not a}
+    out = []
+    for s, a in zip(specs, auto):
+        if not a:
+            out.append(s.label)
+            continue
+        base = label = group_label(s)
+        k = 2
+        while label in taken:
+            label, k = f"{base} ({k})", k + 1
+        taken.add(label)
+        out.append(label)
+    return out
 
 
 @dataclass

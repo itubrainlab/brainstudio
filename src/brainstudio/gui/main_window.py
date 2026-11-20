@@ -18,6 +18,7 @@ from ..core import subject_spans
 from ..model import Recording
 from . import icons, style
 from .eeg_analysis import AnalysisTab
+from .event_filter import EventFilter
 from .epoch_tab import EpochTab
 from .gaze_tab import GazeTab
 from .montage_dialog import MontageDialog
@@ -33,6 +34,9 @@ from .timeplots import EEGPlot, GazePlot, OverviewBar
 from .topoview import TopoView
 from .widgets import _spin, fill_table
 from .worker import Worker
+
+#: tree data role: the signals a BIDS run lacks (the dataset's other runs have them)
+MISSING = QtCore.Qt.UserRole + 1
 
 pg.setConfigOptions(antialias=False, useOpenGL=False)
 
@@ -289,7 +293,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tree.setHeaderLabels(["Recording"])
         self.tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.tree.itemActivated.connect(self._tree_activated)
-        self.tree.itemSelectionChanged.connect(self._tree_selection)
+        self._syncing_tree = False
+        self.tree.selectionModel().selectionChanged.connect(self._tree_selection_changed)
         lay.addWidget(self.tree, 2)
         self.btn_runs = QtWidgets.QPushButton("Load selected runs together")
         self.btn_runs.setToolTip("Select several BIDS runs (⌘/Ctrl- or Shift-click) and load "
@@ -339,8 +344,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.info.setReadOnly(True)
         self.info.setMaximumHeight(150)
         lay.addWidget(self.info)
-        lay.addWidget(QtWidgets.QLabel("Events (double-click to jump)"))
+        head = QtWidgets.QHBoxLayout()
+        head.addWidget(QtWidgets.QLabel("Events"), 1)
+        self.event_count = QtWidgets.QLabel("")
+        self.event_count.setStyleSheet("color: #9a9a9a")
+        head.addWidget(self.event_count)
+        lay.addLayout(head)
+        self.event_filter = EventFilter()
+        self.event_filter.changed.connect(self._fill_event_list)
+        self.event_filter.apply_requested.connect(
+            lambda: self.ctl.set_event_filter(self.event_filter.conditions(),
+                                              self.event_filter.match()))
+        lay.addWidget(self.event_filter)
         self.event_table = QtWidgets.QTableWidget()
+        self.event_table.setToolTip("Double-click an event to jump to it")
         self.event_table.cellDoubleClicked.connect(self._event_jump)
         lay.addWidget(self.event_table, 2)
         self.left_panel = self._side_panel("Dataset", w, 330)
@@ -372,7 +389,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.subj_next.setText("▶")
         self.subj_next.setToolTip("Next subject")
         self.subj_box = QtWidgets.QComboBox()
-        self.subj_box.setToolTip("Jump to the start of a subject's recording")
+        self.subj_box.setToolTip("The subject shown (one at a time, in every view)")
         self.subj_box.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.subj_box.setMinimumContentsLength(6)
         self.subj_box.activated.connect(self._jump_subject)
@@ -470,8 +487,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.p_velocity.addItem(label, key)
         self.p_velocity.setToolTip("How pymovements computes gaze velocity (Gaze.pos2vel) for "
                                    "saccade detection")
+        self.p_tracker_fix = QtWidgets.QCheckBox("Eye tracker's own fixations when available")
+        self.p_tracker_fix.setChecked(p.tracker_fixations)
+        self.p_tracker_fix.setToolTip("Use the fixations the eye tracker computed (Gazepoint "
+                                      "FPOGID / FPOGD / FPOGX / FPOGY) instead of I-DT, so "
+                                      "they do not depend on the sampling rate; saccades and "
+                                      "blinks are still detected with pymovements")
         f.addRow("Preset", self.p_preset)
         f.addRow(self.p_preset_note)
+        f.addRow(self.p_tracker_fix)
         f.addRow("Fixation dispersion", self.p_fix_disp)
         f.addRow("Min fixation", self.p_fix_dur)
         f.addRow("Saccade threshold", self.p_sac_lambda)
@@ -484,6 +508,7 @@ class MainWindow(QtWidgets.QMainWindow):
                      self.p_blink_min, self.p_blink_max):
             spin.valueChanged.connect(lambda *_: self._params_edited())
         self.p_velocity.currentIndexChanged.connect(lambda *_: self._params_edited())
+        self.p_tracker_fix.toggled.connect(lambda *_: self._params_edited())
         self.cb_pupil_clean = QtWidgets.QCheckBox("Interpolate pupil over blinks")
         self.cb_pupil_clean.setChecked(True)
         f.addRow(self.cb_pupil_clean)
@@ -636,6 +661,8 @@ class MainWindow(QtWidgets.QMainWindow):
         top = QtWidgets.QTreeWidgetItem([desc.get("Name", root.name)])
         self.tree.addTopLevelItem(top)
         nodes = {}
+        need = C.bids_signals(runs)
+        incomplete = []
         for run in runs:
             sub = run.entities.get("subject") or "?"
             ses = run.entities.get("session")
@@ -651,10 +678,29 @@ class MainWindow(QtWidgets.QMainWindow):
             item = QtWidgets.QTreeWidgetItem(parent, [run.label])
             item.setData(0, QtCore.Qt.UserRole, run)
             item.setToolTip(0, "\n".join(str(p) for p in [run.eeg, *run.gaze] if p))
+            missing = [m for m in need if m not in C.bids_signals([run])]
+            if missing:  # left out of the runs loaded together
+                incomplete.append(f"{run.entities.get('subject') or '?'} {run.label}: "
+                                  f"no {' or '.join(missing)}")
+                item.setData(0, MISSING, missing)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemIsSelectable)
+                item.setForeground(0, QtGui.QBrush(QtGui.QColor("#9a9a9a")))
+                item.setToolTip(0, f"Excluded: no {' or '.join(missing)} recording\n"
+                                   + item.toolTip(0))
         self.tree.expandAll()
         self._tree_selection()
-        self.statusBar().showMessage(f"{len(runs)} runs found in {root}. Double-click a run to "
-                                     "load it, or select several and load them together.")
+        self.statusBar().showMessage(
+            f"{len(runs)} runs found in {root}"
+            + (f", {len(incomplete)} excluded (missing signals)" if incomplete else "")
+            + ". Double-click a run to load it, or select several and load them together.")
+        if incomplete:
+            box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Warning, "Incomplete runs",
+                                        f"{len(incomplete)} of {len(runs)} runs lack a signal "
+                                        f"the other runs have ({' + '.join(need)}). They are "
+                                        "greyed out and left out when subjects, sessions or "
+                                        "runs are loaded together.", parent=self)
+            box.setDetailedText("\n".join(incomplete))
+            box.exec()
         if len(runs) == 1:
             self.load_run(runs[0])
 
@@ -670,10 +716,49 @@ class MainWindow(QtWidgets.QMainWindow):
             while stack:  # a subject/session node selects all its runs
                 node = stack.pop()
                 run = node.data(0, QtCore.Qt.UserRole)
-                if run is not None and run not in runs:
+                if run is not None and run not in runs and not node.data(0, MISSING):
                     runs.append(run)
                 stack.extend(node.child(i) for i in range(node.childCount()))
         return runs
+
+    def _tree_selection_changed(self, selected, deselected):
+        """A selected subject / session selects all its runs; deselecting one of them
+        (or a session) deselects the subject (and session) above it, so the subject no
+        longer brings that run back."""
+        if self._syncing_tree:
+            return
+        self._syncing_tree = True
+        try:
+            def below(node):
+                for i in range(node.childCount()):
+                    yield node.child(i)
+                    yield from below(node.child(i))
+            keep = []  # what was just selected, with every usable run below it
+            cur = self.tree.currentItem()  # a click on a selected subject keeps its runs
+            for node in [self.tree.itemFromIndex(i) for i in selected.indexes()] + (
+                    [cur] if cur is not None and cur.isSelected() else []):
+                keep +=[node, *(c for c in below(node) if not c.data(0, MISSING))]
+            ids = {self._tree_key(n) for n in keep}
+            for idx in deselected.indexes():
+                node = self.tree.itemFromIndex(idx)
+                if node is None:
+                    continue
+                for child in below(node):
+                    if self._tree_key(child) not in ids:
+                        child.setSelected(False)
+                up = node.parent()
+                while up is not None:
+                    if self._tree_key(up) not in ids:
+                        up.setSelected(False)
+                    up = up.parent()
+            for node in keep:
+                node.setSelected(True)
+        finally:
+            self._syncing_tree = False
+        self._tree_selection()
+
+    def _tree_key(self, node):
+        return QtCore.QPersistentModelIndex(self.tree.indexFromItem(node))
 
     def _tree_selection(self):
         n = len(self._selected_runs()) if self.bids_root is not None else 0
@@ -807,16 +892,28 @@ class MainWindow(QtWidgets.QMainWindow):
                               fnirs=True, exclude=[])
 
     def _load_eeg_plot(self):
+        """The EEG scope: the current subject only, with the channels good in that subject
+        (its bad channels, from the dataset, detection or the table, are left out)."""
         raw = self.display_raw
         picks = self._eeg_picks(raw)
-        if raw is self.pipeline.clean and raw is not None:
-            # preprocessed view: only the channels kept in ① Preprocessing
-            drop = set(self.pipeline.params.bads) | set(raw.info["bads"])
-            picks = [i for i in picks if raw.ch_names[i] not in drop] or picks
-        data = raw.get_data(picks=picks).astype(np.float32)  # display only
+        subs = list(self.session.subjects or [])
+        if len(subs) > 1:
+            sub = self.session.subject
+            a, b = sub.part["start"], sub.part["stop"]
+            drop = set(sub.bads)
+        else:
+            a, b = 0, raw.n_times
+            drop = set(raw.info["bads"]) | (set(subs[0].bads) if subs else set())
+            if raw is self.pipeline.clean:  # only the channels kept in ① Preprocessing
+                drop |= set(self.pipeline.params.bads)
+        picks = [i for i in picks if raw.ch_names[i] not in drop] or picks
+        data = np.empty((len(picks), b - a), np.float32)  # display only
+        for k, i in enumerate(picks):  # a channel at a time: no float64 copy of it all
+            data[k] = raw._data[i, a:b] if raw.preload else \
+                raw.get_data(picks=[i], start=a, stop=b)[0]
         names = [raw.ch_names[i] for i in picks]
         types = raw.get_channel_types(picks=picks)
-        self.eeg_plot.set_data(data, raw.times, names, types, raw.info["bads"])
+        self.eeg_plot.set_data(data, raw.times[a:b], names, types, ())
         self.n_chan.setMaximum(max(len(names), 1))
         self.eeg_plot.set_visible_channels(min(self.n_chan.value(), len(names)))
 
@@ -1075,6 +1172,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_display()
         elif what == "events":
             self._fill_event_list()
+            self._refresh_events()
         elif what == "gaze":
             self._after_gaze_change()
         elif what == "gaze_events":
@@ -1083,6 +1181,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._channels_changed()
         elif what == "stimuli":
             self._stimuli_changed()
+        elif what == "subject":  # another subject chosen (here or in ① Preprocessing)
+            self._show_view_subject()
+        elif what == "bads" and self.display_raw is not None:
+            self._load_eeg_plot()  # the subject's good channels changed
 
     def _channels_changed(self):
         """Channels renamed or retyped (montage, trigger channel): the preprocessing
@@ -1158,7 +1260,8 @@ class MainWindow(QtWidgets.QMainWindow):
             blink_min_dur=self.p_blink_min.value(), blink_max_dur=self.p_blink_max.value(),
             fix_dispersion=self.p_fix_disp.value(), fix_min_dur=self.p_fix_dur.value(),
             sac_threshold_factor=self.p_sac_lambda.value(), sac_min_dur=self.p_sac_dur.value(),
-            velocity_method=self.p_velocity.currentData())
+            velocity_method=self.p_velocity.currentData(),
+            tracker_fixations=self.p_tracker_fix.isChecked())
 
     def _show_params(self, p):
         """Show ``p`` in the controls without making the preset Custom."""
@@ -1171,6 +1274,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.p_blink_min.setValue(p.blink_min_dur)
             self.p_blink_max.setValue(p.blink_max_dur)
             self.p_velocity.setCurrentIndex(max(self.p_velocity.findData(p.velocity_method), 0))
+            self.p_tracker_fix.setChecked(p.tracker_fixations)
         finally:
             self._showing_params = False
         key = C.preset_name(p)
@@ -1209,6 +1313,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gaze_plot.gaze_events = ev
         self._overlay_toggled()
         self._heat_toggled()
+        self.statusBar().showMessage(
+            f"{len(ev.fixations)} fixations ({ev.fixations.attrs.get('source', 'I-DT')}), "
+            f"{len(ev.saccades)} saccades, {len(ev.blinks)} blinks", 8000)
         if rebuilt:
             self.gaze_tab.update_gaze_stats()
             self.pre_tab.gaze_events_changed()  # ICA scores and blink check use the blinks
@@ -1219,19 +1326,26 @@ class MainWindow(QtWidgets.QMainWindow):
     # ================================================================== events / montage
 
     def _fill_event_list(self):
-        """Dataset panel: the markers with every column they carry."""
-        df = self.event_df
+        """Dataset panel: every marker with the columns it carries, as the conditions
+        typed would filter them (Apply makes them the markers used everywhere)."""
+        ses = self.session
+        df = ses.event_table_all
         m = df[df["kind"] == "marker"] if len(df) else df
-        cols = ["onset", "name", "duration", "phase"] + [
-            c for c in m.columns if c not in C.BASE_COLUMNS + ["phase", "x", "y",
-                                                                "amplitude", "peak_velocity"]
-            and m[c].notna().any() and (m[c].astype(str) != "").any()]
-        cols = [c for c in cols if c in m.columns]
+        cols = C.marker_columns(df)
         view = m[cols].copy()
         for c in view.columns:  # empty cells instead of nan/None
             if view[c].dtype == object:
                 view[c] = view[c].fillna("")
-        fill_table(self.event_table, view.iloc[:5000], fmt="{:.3f}")
+        self.event_filter.set_columns(cols)
+        shown = C.filter_rows(view, self.event_filter.conditions(), self.event_filter.match(),
+                              [c for c in cols if c not in C.APP_ONLY_EVENT_COLUMNS])
+        used = ses.event_table
+        self.event_filter.show_state(ses.event_filter, int((used["kind"] == "marker").sum())
+                                     if len(used) else 0, len(view))
+        fill_table(self.event_table, shown.iloc[:5000], fmt="{:.3f}")
+        self.event_count.setText(
+            (f"{len(shown):,} of {len(view):,}" if len(shown) != len(view) else f"{len(view):,}")
+            + (" (first 5,000 shown)" if len(shown) > 5000 else ""))
 
     def _aois_changed(self):
         self.gaze_tab.update_aoi_stats()
@@ -1299,6 +1413,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.screen.set_screen(g.screen_size)
         self.detect_gaze_events()
         self.overview.set_recording(self.rec.duration, self.rec.all_events(), g)
+        self.overview.set_span(*getattr(self, "_span", (0.0, self.rec.duration)))
         self.info.setPlainText(self.rec.summary())
 
     def _offset_changed(self):
@@ -1316,70 +1431,125 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_events(self):
         if self.rec is None:
             return
-        ev = self.rec.all_events()
-        show = ev if self.cb_events.isChecked() else None
-        if show is not None and len(show) > 500:
-            show = show.iloc[:500]
+        ev = self.session.shown_events()  # the markers the event filter keeps
+        self.overview.set_recording(self.rec.duration, ev, self.rec.gaze)
+        self._show_segments()  # … and the event lines of the subject shown
+
+    def _draw_event_lines(self):
+        """Marker lines of the subject shown (the first 500)."""
+        show = None
+        if self.rec is not None and self.cb_events.isChecked():
+            ev = self.session.shown_events()
+            t0, t1 = getattr(self, "_span", (0.0, float(self.rec.duration)))
+            show = ev[(ev["onset"] >= t0) & (ev["onset"] < t1)] if len(ev) else ev
+            if len(show) > 500:
+                show = show.iloc[:500]
         self.eeg_plot._set_event_lines(self.eeg_plot.plotItem, show)
         self.gaze_plot._set_event_lines(self.gaze_plot.pos_plot, show, labels=False)
-        self.overview.set_recording(self.rec.duration, ev, self.rec.gaze)
-        self._show_segments()
 
     def _show_segments(self):
-        """Where each subject's (and run's) recording starts, and the subject jump list."""
+        """Run boundaries, and the subjects the views show one at a time."""
         segs = self.rec.segments if self.rec is not None else []
         self.eeg_plot._set_segment_lines(self.eeg_plot.plotItem, segs)
         self.gaze_plot._set_segment_lines(self.gaze_plot.pos_plot, segs, labels=False)
-        spans = subject_spans(segs)
-        self._subject_spans = spans
-        self.overview.set_subjects(spans)
+        subs = self._subjects()
+        self.overview.set_segments(segs)  # the subject's runs / sessions
         self.subj_box.blockSignals(True)
         self.subj_box.clear()
-        for sp in spans:
-            self.subj_box.addItem(sp["label"])
-            self.subj_box.setItemData(self.subj_box.count() - 1,
-                                      f"{sp['start']:.1f}–{sp['end']:.1f} s",
+        for lab, t0, t1 in subs:
+            self.subj_box.addItem(lab)
+            self.subj_box.setItemData(self.subj_box.count() - 1, f"{t0:.1f}–{t1:.1f} s",
                                       QtCore.Qt.ToolTipRole)
         self.subj_box.blockSignals(False)
-        many = len(spans) >= 2
+        many = len(subs) >= 2
         self.subj_label.setVisible(many)
         self.subj_row.setVisible(many)
-        self._sync_subject()
+        self._show_view_subject(keep_window=True)
+
+    def _subjects(self) -> list[tuple]:
+        """(label, start s, end s) of each subject: the session's (one preprocessing each)
+        or, without EEG, the subjects of the joined files; [] for a single one."""
+        if self.rec is None:
+            return []
+        subs = self.session.subjects or []
+        if self.rec.raw is not None and len(subs) > 1:
+            sf = self.rec.raw.info["sfreq"]
+            return [(s.label, s.part["start"] / sf, s.part["stop"] / sf) for s in subs]
+        spans = subject_spans(self.rec.segments)
+        return [(sp["label"], sp["start"], sp["end"]) for sp in spans] if len(spans) > 1 \
+            else []
+
+    def _view_subject(self) -> int:
+        if self.rec is not None and self.rec.raw is not None and self.session.subjects:
+            return self.session.current
+        return min(getattr(self, "_gaze_subject", 0), max(len(self._subjects()) - 1, 0))
 
     def _subject_at(self, t: float) -> int:
-        for k, sp in enumerate(self._subject_spans):
-            if sp["start"] <= t < sp["end"]:
+        subs = self._subjects()
+        for k, (_, t0, t1) in enumerate(subs):
+            if t0 <= t < t1:
                 return k
-        return len(self._subject_spans) - 1 if self._subject_spans else -1
+        return len(subs) - 1 if subs else -1
 
-    def _jump_subject(self, k: int):
-        if not 0 <= k < len(self._subject_spans):
+    def _jump_subject(self, k: int, at: float | None = None):
+        """Show subject ``k`` (from its start, or around ``at``)."""
+        subs = self._subjects()
+        if not 0 <= k < len(subs):
             return
-        sp = self._subject_spans[k]
-        t0, t1 = self.eeg_plot.window()
-        w = t1 - t0
-        self.eeg_plot.set_window(sp["start"], sp["start"] + w)
-        self.set_cursor(sp["start"])
-        self.statusBar().showMessage(f"{sp['label']}: {sp['start']:.1f}–{sp['end']:.1f} s", 4000)
+        self._pending_t = at
+        if self.rec.raw is not None and self.session.subjects:
+            if k != self.session.current:
+                self.session.select_subject(k)  # every view follows ("subject")
+                return
+        else:
+            self._gaze_subject = k
+        self._show_view_subject()
 
     def _step_subject(self, step: int):
-        if not self._subject_spans:
-            return
-        t0, _ = self.eeg_plot.window()
-        k = self._subject_at(t0 + 1e-6)
-        self._jump_subject(int(np.clip(k + step, 0, len(self._subject_spans) - 1)))
+        subs = self._subjects()
+        if subs:
+            self._jump_subject(int(np.clip(self._view_subject() + step, 0, len(subs) - 1)))
 
-    def _sync_subject(self):
-        if not self._subject_spans:
+    def _show_view_subject(self, keep_window: bool = False):
+        """Limit the EEG, gaze and overview to the current subject and show it."""
+        subs = self._subjects()
+        if self.rec is None:
             return
-        t0, t1 = self.eeg_plot.window()
-        k = self._subject_at((t0 + t1) / 2)
-        if k != self.subj_box.currentIndex():
+        t0, t1 = self.eeg_plot.window()  # before the new subject's data resets the view
+        if self.rec.raw is not None and self.display_raw is not None:
+            self._load_eeg_plot()
+        if not subs:
+            span = (0.0, float(self.rec.duration))
+        else:
+            k = self._view_subject()
+            span = subs[k][1:]
             self.subj_box.blockSignals(True)
             self.subj_box.setCurrentIndex(k)
             self.subj_box.blockSignals(False)
-        self.subj_prev.setEnabled(k > 0 or t0 > self._subject_spans[0]["start"] + 1e-6)
-        self.subj_next.setEnabled(k < len(self._subject_spans) - 1)
+            self.subj_prev.setEnabled(k > 0)
+            self.subj_next.setEnabled(k < len(subs) - 1)
+        self._span = span
+        self.gaze_plot.set_span(*span)
+        self.overview.set_span(*span)
+        self._draw_event_lines()
+        w = min(max(t1 - t0, 0.05), span[1] - span[0])
+        at = getattr(self, "_pending_t", None)
+        self._pending_t = None
+        if at is not None:
+            start = at - w / 4
+        elif keep_window and span[0] <= t0 and t0 + w <= span[1]:
+            start = t0
+        else:
+            start = span[0]
+        start = float(np.clip(start, span[0], span[1] - w))
+        self.eeg_plot.set_window(start, start + w)
+        self.set_cursor(at if at is not None else start + 0.1 * w)
+        if subs:
+            self.statusBar().showMessage(f"{subs[self._view_subject()][0]}: "
+                                         f"{span[0]:.1f}–{span[1]:.1f} s", 4000)
+
+    def _sync_subject(self):
+        pass  # the views show one subject: nothing to follow while scrolling
 
     def _overlay_toggled(self, *_):
         kinds = {k: cb.isChecked() for k, cb in self.ov_checks.items()}
@@ -1481,6 +1651,10 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             t = float(self.event_table.item(row, 0).text())
         except (AttributeError, ValueError):
+            return
+        k = self._subject_at(t)
+        if k >= 0 and k != self._view_subject():  # the event is another subject's
+            self._jump_subject(k, at=t)
             return
         t0, t1 = self.eeg_plot.window()
         w = t1 - t0

@@ -36,6 +36,33 @@ class PreprocessTab(QtWidgets.QWidget):
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         split.addWidget(scroll)
 
+        # ---------------------------------------------------------------- subject
+        self.subject_row = QtWidgets.QWidget()
+        sr = QtWidgets.QHBoxLayout(self.subject_row)
+        sr.setContentsMargins(0, 0, 0, 0)
+        sr.addWidget(QtWidgets.QLabel("Subject"))
+        self.subject_box = QtWidgets.QComboBox()
+        self.subject_box.setToolTip(
+            "Each subject is preprocessed on its own: its bad channels, its ICA (heads and "
+            "electrode placements differ) and the components removed. The tables below "
+            "show the subject chosen here; the filters apply to all.")
+        self.subject_box.currentIndexChanged.connect(self._subject_chosen)
+        self.subject_box.setMinimumContentsLength(14)
+        self.subject_box.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        sr.addWidget(self.subject_box)
+        for text, step in (("◀", -1), ("▶", 1)):
+            b = QtWidgets.QToolButton()
+            b.setText(text)
+            b.setToolTip("Previous subject" if step < 0 else "Next subject")
+            b.clicked.connect(lambda _=False, d=step: self.subject_box.setCurrentIndex(
+                max(0, min(self.subject_box.count() - 1, self.subject_box.currentIndex() + d))))
+            sr.addWidget(b)
+        self.subject_count = QtWidgets.QLabel("")
+        sr.addWidget(self.subject_count)
+        sr.addStretch(1)
+        self.subject_row.setVisible(False)
+        lay.addWidget(self.subject_row)
+
         # ---------------------------------------------------------------- channels
         self.from_event = QtWidgets.QCheckBox("Ignore the data before the first event")
         self.from_event.setChecked(True)
@@ -86,10 +113,14 @@ class PreprocessTab(QtWidgets.QWidget):
         v.addWidget(self.ch_table)
         self.interp = QtWidgets.QCheckBox("Interpolate bad channels (spherical spline, needs "
                                           "positions)")
+        self.interp.setToolTip("Each subject's bad channels from its good neighbours. On by "
+                               "default when several subjects are joined: otherwise a channel "
+                               "bad in any subject is left out for all.")
         v.addWidget(self.interp)
-        v.addWidget(hint("Untick a channel to mark it bad. Bad channels are excluded from ICA, "
-                         "the average reference, epochs and statistics. Measured on the "
-                         "band-passed/notched signal below."))
+        v.addWidget(hint("Untick a channel to mark it bad (for the subject shown). Bad "
+                         "channels are excluded from that subject's ICA and, unless "
+                         "interpolated, from the average reference, epochs and statistics. "
+                         "Measured on the band-passed/notched signal below."))
         lay.addWidget(box)
 
         # ---------------------------------------------------------------- filters
@@ -230,21 +261,57 @@ class PreprocessTab(QtWidgets.QWidget):
         self.ica_table.itemChanged.connect(self._ica_item_changed)
 
     # ================================================================== pipeline
-    def first_event(self) -> float | None:
-        """Start of the data used for bad channels and ICA (None = whole recording)."""
-        if not self.from_event.isChecked():
-            return None
-        return C.first_event_time(self.pl.event_table)
-
     def _update_first_event_label(self):
-        t = C.first_event_time(self.pl.event_table)
+        pl = self.pl
+        many = len(pl.subjects) > 1
+        t = (pl.subject_first_event(pl.subject) if pl.subject is not None
+             else C.first_event_time(pl.event_table))
         self.from_event.setText("Ignore the data before the first event"
-                                + (f" ({t:.1f} s)" if t is not None else " (no events)"))
-        self.from_event.setEnabled(t is not None and t > 0)
+                                + (" of each subject" if many else "")
+                                + (f" ({t:.1f} s{' here' if many else ''})" if t is not None
+                                   else " (no events)"))
+        self.from_event.setEnabled(t is not None and (t > 0 or many))
+
+    # ================================================================== subjects
+    def refresh_subjects(self):
+        subs = self.pl.subjects
+        self.subject_box.blockSignals(True)
+        self.subject_box.clear()
+        for sub in subs:
+            self.subject_box.addItem(sub.label)
+        self.subject_box.setCurrentIndex(self.pl.current if subs else -1)
+        self.subject_box.blockSignals(False)
+        self.subject_count.setText(f"{len(subs)} subjects, each preprocessed on its own")
+        self.subject_row.setVisible(len(subs) > 1)
+
+    def _subject_chosen(self, k: int):
+        self.pl.select_subject(k)
+
+    def _show_subject(self):
+        """The chosen subject's channels and ICA."""
+        if self.subject_box.currentIndex() != self.pl.current:
+            self.subject_box.blockSignals(True)
+            self.subject_box.setCurrentIndex(self.pl.current)
+            self.subject_box.blockSignals(False)
+        self._update_first_event_label()
+        self.refresh_channels()
+        self._plot_ptp()
+        self._fill_ica_table()
+        if self.ica_table.rowCount():
+            self.ica_table.selectRow(0)
+            self.show_component(0)
 
     def _on_pipeline(self, what):
+        if what == "recording":
+            self.refresh_subjects()
+            if len(self.pl.subjects) > 1:  # joined subjects keep no channel bad for all
+                self.interp.blockSignals(True)
+                self.interp.setChecked(True)
+                self.interp.blockSignals(False)
         if what in ("events", "recording"):
             self._update_first_event_label()
+        if what == "subject":
+            self._show_subject()
         if what == "recording" and self.pl.raw is not None:
             lf = self.pl.raw.info.get("line_freq")
             if lf in (50.0, 60.0):  # the dataset's power-line frequency
@@ -275,27 +342,38 @@ class PreprocessTab(QtWidgets.QWidget):
 
     def params(self) -> C.PreprocParams:
         notch = {"off": None, "50 Hz": 50.0, "60 Hz": 60.0}[self.notch.currentText()]
-        exclude = self.ica_excluded() if self.ica_on.isChecked() else []
-        return C.PreprocParams(bads=self.bads(), l_freq=self.hp.value() or None,
+        # bad channels and ICA components are each subject's (session.subjects)
+        return C.PreprocParams(l_freq=self.hp.value() or None,
                                h_freq=self.lp.value() or None, notch=notch,
-                               reference=None, ica_exclude=exclude,
-                               interpolate_bads=self.interp.isChecked())
+                               reference=None, interpolate_bads=self.interp.isChecked())
 
     def run(self, then=None) -> bool:
         raw = self.pl.raw
         if raw is None:
             return False
         p = self.params()
-        if p.interpolate_bads and p.bads and not has_positions(raw):
+        subs = self.pl.subjects
+        if p.interpolate_bads and any(s.bads for s in subs) and not has_positions(raw):
             QtWidgets.QMessageBox.information(self, "Interpolation", NO_POS)
             p.interpolate_bads = False
-        ica = self.pl.ica if p.ica_exclude else None
-        if ica is not None and set(ica.ch_names) & set(p.bads):
+        lost = sorted({b for s in subs for b in s.bads}) if len(subs) > 1 and \
+            not p.interpolate_bads else []
+        if lost and QtWidgets.QMessageBox.question(
+                self, "Bad channels", f"Without interpolation, a channel bad in any subject is "
+                f"bad in the joined result: {len(lost)} of {len(C.eeg_names(raw))} EEG "
+                "channels would be left out for every subject. Preprocess anyway?"
+                ) != QtWidgets.QMessageBox.Yes:
+            return False
+        use_ica = self.ica_on.isChecked()
+        stale = [s.label for s in subs if use_ica and s.ica is not None and s.exclude
+                 and set(s.ica.ch_names) & set(s.bads)]
+        if stale:
             QtWidgets.QMessageBox.information(
-                self, "ICA", "Some channels used to fit the ICA are now marked bad: refit "
-                             "ICA for the best result. Applying the current ICA anyway.")
+                self, "ICA", "Some channels used to fit the ICA are now marked bad ("
+                + ", ".join(stale[:8]) + (" …" if len(stale) > 8 else "") + "): refit ICA for "
+                "the best result. Applying the current ICA anyway.")
         self.header.set_state("running")
-        return self.ctl.preprocess(p, ica, then, failed=lambda m: (
+        return self.ctl.preprocess(p, use_ica, then, failed=lambda m: (
             self._on_state(), QtWidgets.QMessageBox.warning(self, "Preprocessing", m)))
 
 
@@ -315,7 +393,7 @@ class PreprocessTab(QtWidgets.QWidget):
         self.ch_table.setHorizontalHeaderLabels(cols)
         self.ch_table.setRowCount(len(names))
         st = self.pl.bad_stats.set_index("channel") if self.pl.bad_stats is not None else None
-        bads = set(self.pl.params.bads)
+        bads = set(self.pl.bads or [])
         dataset_bad = self.dataset_bads()
         for i, n in enumerate(names):
             use = QtWidgets.QTableWidgetItem("")
@@ -341,9 +419,14 @@ class PreprocessTab(QtWidgets.QWidget):
         self._update_bad_count()
 
     def dataset_bads(self) -> dict[str, str]:
-        """Channels the dataset marks bad (BIDS channels.tsv), with the reason given."""
-        rec = self.pl.rec
-        return dict(rec.metadata.get("bad_channels", {})) if rec is not None else {}
+        """Channels the dataset marks bad for the shown subject (BIDS channels.tsv), with
+        the reason given."""
+        rec, sub = self.pl.rec, self.pl.subject
+        if rec is None:
+            return {}
+        why = dict(rec.metadata.get("bad_channels", {}))
+        own = sub.part.get("bads", []) if sub is not None else list(why)
+        return {c: why.get(c, "status bad in channels.tsv") for c in own}
 
     def bads(self) -> list[str]:
         out = []
@@ -355,7 +438,8 @@ class PreprocessTab(QtWidgets.QWidget):
 
     def _ch_item_changed(self, item):
         if item.column() == 0:
-            self.pl.params.bads = self.bads()  # the table is what the user decided
+            self.pl.bads = self.bads()  # the table is what the user decided
+            self.pl.notify("bads")
             self._update_bad_count()
             self._plot_ptp()
             self.pl.mark_stale("preprocessing")
@@ -397,9 +481,8 @@ class PreprocessTab(QtWidgets.QWidget):
             self._plot_ptp()
             self.right.setCurrentIndex(1)
 
-        # detection adds to the channels the dataset already marks bad
-        keep = [b for b in self.bads() if b in self.dataset_bads()]
-        self.ctl.detect_bad_channels(p, self.first_event(), keep, done)
+        # detection, per subject, adds to the channels the dataset already marks bad
+        self.ctl.detect_bad_channels(p, self.from_event.isChecked(), done)
 
 
     # ================================================================== reference
@@ -420,11 +503,11 @@ class PreprocessTab(QtWidgets.QWidget):
                          iclabel=self.ica_iclabel.isChecked())
 
         def done():
-            self._fill_ica_table(use_suggested=True)
+            self._fill_ica_table()  # each subject's suggested components are ticked
             if self.ica_table.rowCount():
                 self.ica_table.selectRow(0)
                 self.show_component(0)
-        self.ctl.fit_ica(self.bads(), notch, ip, self.first_event(), done)
+        self.ctl.fit_ica(notch, ip, self.from_event.isChecked(), done)
 
 
     def gaze_events_changed(self):
@@ -463,6 +546,17 @@ class PreprocessTab(QtWidgets.QWidget):
 
 
     def _fill_ica_table(self, use_suggested=False, keep=None):
+        """The shown subject's components; filling changes no choice."""
+        was, self._refilling = self._refilling, True
+        try:
+            self._fill_ica_rows(use_suggested, keep)
+        finally:
+            self._refilling = was
+        if use_suggested:
+            self.pl.ica_exclude = self.ica_excluded()
+            self.pl.mark_stale("preprocessing")
+
+    def _fill_ica_rows(self, use_suggested=False, keep=None):
         sc = self.pl.ica_scores
         self.ica_table.blockSignals(True)
         self.ica_table.clear()
@@ -477,8 +571,7 @@ class PreprocessTab(QtWidgets.QWidget):
         self.ica_table.setColumnCount(len(cols))
         self.ica_table.setHorizontalHeaderLabels(cols)
         self.ica_table.setRowCount(len(sc))
-        prev = set(keep) if keep is not None else (
-            set(self.pl.ica.exclude or []) if self.pl.ica is not None else set())
+        prev = set(keep) if keep is not None else set(self.pl.ica_exclude or [])
         for i, r in enumerate(sc.itertuples()):
             ex = QtWidgets.QTableWidgetItem("")
             ex.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
@@ -500,8 +593,11 @@ class PreprocessTab(QtWidgets.QWidget):
         proxy = sc.attrs.get("proxy")
         eog = ", ".join(sc.attrs.get("eog_channels") or []) or "none"
         note = getattr(self.pl.ica_fit_raw, "fit_note", "")
+        errors = getattr(self.pl, "ica_errors", None) or []
+        who = f"{self.pl.subject.label}: " if len(self.pl.subjects) > 1 else ""
         self.ica_info.setText(
-            (f"⚠ {note}. " if note else "") +
+            (f"⚠ no ICA for {'; '.join(errors)}. " if errors else "") +
+            (f"⚠ {note}. " if note else "") + who +
             f"{len(sc)} components on {len(self.pl.ica.ch_names)} channels. "
             f"{n_sug} suggested as blink components "
             f"({'frontal proxies' if proxy else 'EOG'}: {eog}; eye-tracker blinks: "
@@ -520,7 +616,7 @@ class PreprocessTab(QtWidgets.QWidget):
             return
         it = self.ica_table.item(row, 0)
         k = int(it.data(QtCore.Qt.UserRole))
-        blinks = pl.gaze_events.blinks if pl.gaze_events is not None else None
+        blinks = pl.subject_blinks()
         try:
             self.ica_view.show_component(pl.ica, pl.ica_fit_raw, pl.ica_sources, k, blinks,
                                          pl.ica_scores, it.checkState() == CHECKED)
@@ -529,6 +625,8 @@ class PreprocessTab(QtWidgets.QWidget):
         self.right.setCurrentWidget(self.ica_view)
 
     def _ica_item_changed(self, item):
+        if item.column() == 0 and not self._refilling:
+            self.pl.ica_exclude = self.ica_excluded()  # the shown subject's choice
         if item.column() == 0 and item.row() == self.ica_table.currentRow():
             self.show_component(item.row())  # recolour when (un)ticked
 

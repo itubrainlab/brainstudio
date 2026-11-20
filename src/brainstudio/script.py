@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as _dt
+import inspect
 from pathlib import Path
 
 import numpy as np
@@ -105,8 +106,16 @@ def check_recipe(recipe: dict | None) -> str | None:
         if eeg_steps != pre_steps:
             return "The recording changed (montage or trigger channel) after the " \
                    "preprocessing these epochs use: run preprocessing and epoching again."
-        if pre["params"].ica_exclude and pre["ica"] is None:
+        if any(s["exclude"] and s["ica"] is None for s in pre_subjects(pre)):
             return "The ICA these results use is no longer known: fit ICA again."
+    flt = recipe["load"].get("event_filter")
+    if flt:  # columns the script's own event table does not have
+        single = recipe["load"]["steps"][0]["kind"] == "load"
+        bad = sorted({c for c, _, _ in flt["conditions"] if c in C.APP_ONLY_EVENT_COLUMNS
+                      or (single and c in ("subject", "session", "run"))})
+        if bad:
+            return (f"Scripts cannot repeat the event filter on {', '.join(bad)}: filter on "
+                    "other columns, or export without that condition.")
     return None
 
 
@@ -272,6 +281,11 @@ def _xdf_reader(streams: list[dict], screen) -> tuple[list[str], dict]:
         if pick["pupil"]:
             L += [f"    gaze['pupil'] = s[{pick['pupil'][0]!r}].where(~lost & "
                   f"(s[{pick['pupil'][0]!r}] > 0))"]
+        own = {"ch_" + lab.lower(): lab for lab in labels}
+        if all(c in own for c in C.TRACKER_FIXATION_COLUMNS):
+            L += ["    # the tracker's own fixations (ID, duration so far, position, valid)",
+                  f"    gaze[{list(C.TRACKER_FIXATION_COLUMNS)!r}] = "
+                  f"s[{[own[c] for c in C.TRACKER_FIXATION_COLUMNS]!r}].to_numpy()"]
         w, h = screen
         L += ["    if gaze[['x', 'y']].abs().quantile(0.95).max() <= 1.5:  # 0–1 → px",
               f"        gaze[['x', 'y']] *= {list(screen)!r}",
@@ -310,7 +324,7 @@ def _loading(recipe: dict) -> tuple[list[str], set]:
         if k == "load":
             L += [f"raw, events, gaze = read_xdf({lit(first['path'])})"]
         else:
-            L += _join_parts(first["paths"], rec_info.get("entities", {}), "read_xdf")
+            L += _join_parts(first["paths"], rec_info.get("entities", {}), "read_xdf", rec_info)
     elif k == "load_bids":
         imports |= {"mne_bids", "json", "warnings"}
         L += _cell(1, "Loading", "Reads the BIDS runs with MNE-BIDS (EEG, events.tsv) "
@@ -328,8 +342,8 @@ def _loading(recipe: dict) -> tuple[list[str], set]:
               "        warnings.simplefilter('ignore')",
               "        raw = read_raw_bids(get_bids_path_from_fname(path), verbose=False)",
               "    raw.load_data()",
-              "    events = pd.read_csv(str(path).rsplit('_eeg', 1)[0] + '_events.tsv', "
-              "sep='\\t')",
+              "    events = (pd.read_csv(ROOT / run['events'], sep='\\t') if run.get('events')",
+              "              else pd.DataFrame(columns=['onset', 'trial_type']))",
               "    events['name'] = events['trial_type']",
               "    gaze = None",
               "    if run.get('eye'):",
@@ -337,14 +351,28 @@ def _loading(recipe: dict) -> tuple[list[str], set]:
               "        meta = json.loads(eye.with_name(eye.name.replace('.tsv.gz', '.json'))"
               ".read_text(encoding='utf-8'))",
               "        g = pd.read_csv(eye, sep='\\t', header=None, names=meta['Columns'], "
-              "na_values='n/a')",
-              "        gaze = pd.DataFrame({'t': meta.get('StartTime', 0) + np.arange(len(g)) "
-              "/ meta['SamplingFrequency'],",
-              "                             'x': g[run['x']], 'y': g[run['y']]})",
+              "na_values='n/a').apply(pd.to_numeric, errors='coerce')",
+              "        start = meta.get('StartTime') or 0",
+              "        t = (g[run['time']] - g[run['time']].iloc[0] + start if run.get('time')",
+              "             else start + np.arange(len(g)) / meta['SamplingFrequency'])",
+              "        lost = (g[run['x']] == 0) & (g[run['y']] == 0)",
+              "        if run.get('valid'):",
+              "            lost |= g[run['valid']] != 1",
+              "        gaze = pd.DataFrame({'t': t, 'x': g[run['x']].where(~lost),",
+              "                             'y': g[run['y']].where(~lost)})",
               "        if run.get('pupil'):",
-              "            gaze['pupil'] = g[run['pupil']].where(g[run['pupil']] > 0)",
+              "            gaze['pupil'] = g[run['pupil']].where(~lost & (g[run['pupil']] > 0))",
+              "        if run.get('tracker'):  # the tracker's own fixations (ID, duration, …)",
+              "            gaze[['ch_' + c.lower() for c in run['tracker']]] = "
+              "g[run['tracker']].to_numpy()",
+              "        if gaze[['x', 'y']].abs().quantile(0.95).max() <= 1.5:  # 0–1 → px",
+              "            gaze[['x', 'y']] *= run['screen']",
+              "        w, h = run['screen']  # samples far outside the screen are tracker glitches",
+              "        off = ~gaze['x'].between(-0.5 * w, 1.5 * w) | "
+              "~gaze['y'].between(-0.5 * h, 1.5 * h)",
+              "        gaze.loc[off, ['x', 'y']] = np.nan",
               "    return raw, events, gaze", ""]
-        L += _join_parts(None, None, "read_run")
+        L += _join_parts(None, None, "read_run", rec_info)
     else:
         what = "Reads the file with MNE; its annotations become the events."
         L += _cell(1, "Loading", what)
@@ -357,7 +385,7 @@ def _loading(recipe: dict) -> tuple[list[str], set]:
         if k == "load":
             L += [f"raw, events, gaze = read_file({lit(paths[0])})"]
         else:
-            L += _join_parts(paths, rec_info.get("entities", {}), "read_file")
+            L += _join_parts(paths, rec_info.get("entities", {}), "read_file", rec_info)
     # later steps
     for st in steps[1:]:
         if st["kind"] == "gaze_offset":
@@ -382,13 +410,28 @@ def _loading(recipe: dict) -> tuple[list[str], set]:
         elif st["kind"] == "attach_gaze":
             raise ValueError("Scripts cannot yet repeat attaching a separate eye-tracking "
                              "file")
-    L += ["events = events.sort_values('onset', ignore_index=True)",
-          "print(raw)",
+    L += ["events = events.sort_values('onset', ignore_index=True)"]
+    if recipe["load"].get("event_filter"):
+        L += _event_filter_code(recipe["load"]["event_filter"])
+    L += ["print(raw)",
           "print(events['name'].value_counts().head(10))"]
     return L, imports
 
 
-def _join_parts(paths, entities, reader) -> list[str]:
+def _event_filter_code(flt: dict) -> list[str]:
+    """The app's event filter: the same conditions, run by the same function."""
+    return (["", "# the app's event filter: only the markers meeting these conditions are used",
+             assign("_NEGATED = ", C._NEGATED), ""]
+            + inspect.getsource(C._cell_test).splitlines() + ["", ""]
+            + inspect.getsource(C.filter_rows).splitlines() + [""]
+            + [assign("EVENT_FILTER = ", [list(c) for c in flt["conditions"]])
+               + "  # column (None: any), test, value",
+               assign("SEARCHED = ", flt["columns"]) + "  # the columns 'any column' looks in",
+               f"events = filter_rows(events, EVENT_FILTER, {flt['match']!r}, SEARCHED)"
+               ".reset_index(drop=True)"])
+
+
+def _join_parts(paths, entities, reader, rec_info=None) -> list[str]:
     """Read several parts and join them end to end."""
     if reader == "read_run":
         L = ["parts = [(r, *read_run(r)) for r in RUNS]"]
@@ -397,13 +440,27 @@ def _join_parts(paths, entities, reader) -> list[str]:
         L = [assign("FILES = ", {p: entities.get(p, {}) for p in paths}),
              f"parts = [(entities, *{reader}(path)) for path, entities in FILES.items()]"]
         tag = "**r"
-    return L + [
+    upsampled = (rec_info or {}).get("gaze_upsampled")
+    first = [""] + inspect.getsource(C.resample_gaze).splitlines() + [""] if upsampled else []
+    if (rec_info or {}).get("eeg_rates_differ"):
+        L = L + ["sf = parts[0][1].info['sfreq']  # every part at the first one's EEG rate",
+                 "for _, r, _, _ in parts[1:]:",
+                 "    if abs(r.info['sfreq'] / sf - 1) < 1e-3:  # the same amplifier, ppm apart",
+                 "        with r.info._unlock():",
+                 "            r.info['sfreq'] = sf",
+                 "    else:",
+                 "        r.resample(sf, method='polyphase')"]
+    return first + [*L,
         "starts = np.cumsum([0] + [p[1].n_times / p[1].info['sfreq'] for p in parts[:-1]])",
         "events = pd.concat([ev.assign(onset=ev['onset'] + t, " + tag + ")",
         "                    for (r, _, ev, _), t in zip(parts, starts)], ignore_index=True)",
-        "gaze = (pd.concat([g.assign(t=g['t'] + t) for (_, _, _, g), t in zip(parts, starts)",
-        "                   if g is not None], ignore_index=True)",
-        "        if any(p[3] is not None for p in parts) else None)",
+        "gazes = [(g, t) for (_, _, _, g), t in zip(parts, starts) if g is not None and len(g)]",
+        *(["rates = [1 / np.median(np.diff(g['t'])) for g, _ in gazes]",
+           "top = max(rates)  # different gaze rates: every part upsampled to the highest",
+           "gazes = [(resample_gaze(g, top) if top / r > 1.01 else g, t)",
+           "         for (g, t), r in zip(gazes, rates)]"] if upsampled else []),
+        "gaze = (pd.concat([g.assign(t=g['t'] + t) for g, t in gazes], ignore_index=True)",
+        "        if gazes else None)",
         "raw = mne.concatenate_raws([p[1] for p in parts])  # boundaries are annotated"]
 
 
@@ -436,31 +493,54 @@ def _gaze_events(recipe: dict) -> tuple[list[str], set]:
     if p is None:
         return [], set()
     key = C.preset_name(p)
-    L = ["", "# fixations (I-DT), saccades (Engbert & Kliegl) and blinks with pymovements",
-         *(_c(f"Preset: {C.PRESETS[key][0]}.") if key else []),
-         "sf = 1 / np.polyfit(np.arange(len(gaze)), gaze['t'], 1)[0]  # sampling rate",
-         "n = lambda seconds, least=1: max(int(round(seconds * sf)), least)  # → samples",
-         "xy = gaze[['x', 'y']].to_numpy().T",
-         "pg = pm.gaze.from_numpy(time=np.arange(len(gaze)), time_unit='ms', pixel=xy, "
-         "position=xy,",
-         "                        experiment=pm.Experiment(sampling_rate=sf))",
-         "pupil = gaze['pupil'] if 'pupil' in gaze else gaze['x'].notna().astype(float)"
-         ".where(gaze['x'].notna())",
-         "pg.samples = pg.samples.with_columns(pl.Series('pupil', pupil.to_numpy(float)))",
-         f"pg.pos2vel(method={lit(p.velocity_method)})",
-         f"pg.detect('idt', dispersion_threshold={lit(p.fix_dispersion)}, "
-         f"minimum_duration=n({lit(p.fix_min_dur)}, 2))",
-         f"pg.detect('microsaccades', threshold_factor={lit(p.sac_threshold_factor)}, "
-         f"minimum_duration=n({lit(p.sac_min_dur)}), name='saccade')",
-         f"pg.detect('blink', minimum_duration=n({lit(p.blink_min_dur)}), "
-         f"maximum_duration=n({lit(p.blink_max_dur)}), minimum_gap=n(0.005))",
-         "pg.compute_event_properties('location', name='fixation')",
-         "gaze_events = pg.events.frame.to_pandas()",
-         "t = gaze['t'].to_numpy()",
-         "gaze_events['duration'] = t[gaze_events['offset']] - t[gaze_events['onset']]",
-         "gaze_events['onset'] = t[gaze_events['onset']]",
-         "loc = gaze_events['location'].dropna()",
-         "gaze_events.loc[loc.index, ['x', 'y']] = np.vstack(loc.to_numpy())"]
+    info = recipe["load"]["steps"][0].get("recording") or {}
+    own = p.tracker_fixations and info.get("tracker_fixations")
+    joined = recipe["load"]["steps"][0]["kind"] in ("load_many", "load_bids")
+    L = ["", "# fixations (" + ("the eye tracker's own" if own else "I-DT") + "), saccades "
+         "(Engbert & Kliegl) and blinks with pymovements",
+         *(_c(f"Preset: {C.PRESETS[key][0]}.") if key else [])]
+    if own:
+        L += ["", f"TRACKER_FIXATION_COLUMNS = {C.TRACKER_FIXATION_COLUMNS!r}", ""] + \
+            inspect.getsource(C.tracker_fixations).splitlines() + [""]
+    L += ["def detect(gaze):",
+          "    sf = 1 / np.polyfit(np.arange(len(gaze)), gaze['t'], 1)[0]  # sampling rate",
+          "    n = lambda seconds, least=1: max(int(round(seconds * sf)), least)  # → samples",
+          "    xy = gaze[['x', 'y']].to_numpy().T",
+          "    pg = pm.gaze.from_numpy(time=np.arange(len(gaze)), time_unit='ms', pixel=xy, "
+          "position=xy,",
+          "                            experiment=pm.Experiment(sampling_rate=sf))",
+          "    pupil = gaze['pupil'] if 'pupil' in gaze else gaze['x'].notna().astype(float)"
+          ".where(gaze['x'].notna())",
+          "    pg.samples = pg.samples.with_columns(pl.Series('pupil', pupil.to_numpy(float)))",
+          f"    pg.pos2vel(method={lit(p.velocity_method)})"]
+    if not own:
+        L += [f"    pg.detect('idt', dispersion_threshold={lit(p.fix_dispersion)}, "
+              f"minimum_duration=n({lit(p.fix_min_dur)}, 2))"]
+    L += [f"    pg.detect('microsaccades', threshold_factor={lit(p.sac_threshold_factor)}, "
+          f"minimum_duration=n({lit(p.sac_min_dur)}), name='saccade')",
+          f"    pg.detect('blink', minimum_duration=n({lit(p.blink_min_dur)}), "
+          f"maximum_duration=n({lit(p.blink_max_dur)}), minimum_gap=n(0.005))"]
+    if not own:
+        L += ["    pg.compute_event_properties('location', name='fixation')"]
+    L += ["    found = pg.events.frame.to_pandas()",
+          "    t = gaze['t'].to_numpy()",
+          "    found['duration'] = t[found['offset']] - t[found['onset']]",
+          "    found['onset'] = t[found['onset']]"]
+    if own:
+        L += [f"    fix = tracker_fixations(gaze, {list(info.get('screen') or (1920, 1080))!r})",
+              "    return pd.concat([found, fix.assign(name='fixation')], ignore_index=True)",
+              ""]
+    else:
+        L += ["    loc = found['location'].dropna()",
+              "    found.loc[loc.index, ['x', 'y']] = np.vstack(loc.to_numpy())",
+              "    return found", ""]
+    if joined:
+        L += ["cuts = list(np.searchsorted(gaze['t'], starts[1:]))  # each joined part on its own",
+              "gaze_events = pd.concat([detect(gaze.iloc[a:b]) for a, b in zip([0] + cuts, "
+              "cuts + [len(gaze)])",
+              "                         if b - a > 10], ignore_index=True)"]
+    else:
+        L += ["gaze_events = detect(gaze)"]
     if gz.get("aois"):
         L += [assign("AOIS = ", gz["aois"]) + "  # left, top, width, height (px)",
               "gaze_events['aoi'] = ''",
@@ -468,91 +548,136 @@ def _gaze_events(recipe: dict) -> tuple[list[str], set]:
               "    inside = gaze_events['x'].between(left, left + w) & "
               "gaze_events['y'].between(top, top + h)",
               "    gaze_events.loc[inside & (gaze_events['aoi'] == ''), 'aoi'] = aoi"]
-    L += ["events = pd.concat([events, gaze_events.drop(columns=['offset', 'location'])],",
+    L += ["events = pd.concat([events, gaze_events.drop(columns=['offset', 'location'], "
+          "errors='ignore')],",
           "                   ignore_index=True).sort_values('onset', ignore_index=True)",
           "print(gaze_events['name'].value_counts())"]
     return L, {"pymovements", "polars"}
 
 
 # =========================================================================== preprocessing
+def pre_subjects(pre: dict) -> list[dict]:
+    """Each subject's preprocessing in a recipe (a recipe from before preprocessing per
+    subject: one, the whole recording)."""
+    if "subjects" in pre:
+        return pre["subjects"]
+    p = pre["params"]
+    return [{"key": "", "label": "recording", "start": 0, "stop": None,
+             "bads": list(p.bads), "exclude": list(p.ica_exclude),
+             "ica": pre.get("ica") if p.ica_exclude else None}]
+
+
 def _preprocessing(recipe: dict) -> tuple[list[str], set]:
     pre = recipe.get("pre")
     if pre is None:
         return _cell(2, "Preprocessing", "None: the epochs are cut from the data as "
                      "loaded.") + ["data = raw"], set()
-    p, ica = pre["params"], pre["ica"]
-    use_ica = bool(p.ica_exclude) and ica is not None
+    p, subs = pre["params"], pre_subjects(pre)
+    fits = [s["ica"]["steps"] for s in subs if s["ica"] is not None and s["exclude"]]
+    many = len(subs) > 1
     hp = f"{p.l_freq:g} Hz high-pass" if p.l_freq else "no high-pass"
-    what = (f"Filters ({hp}, {p.h_freq:g} Hz low-pass"
+    ar = any(f["segments"] == "autoreject" for f in fits)
+    what = (("Each subject on its own (heads differ): " if many else "")
+            + f"filters ({hp}, {p.h_freq:g} Hz low-pass"
             + (f", {p.notch:g} Hz notch" if p.notch else "") + ")"
-            + (f", bad channels {', '.join(p.bads)}" if p.bads else "")
+            + (", its bad channels" + (" interpolated" if p.interpolate_bads else "")
+               if any(s["bads"] for s in subs) else "")
             + ("; removes eye blinks with ICA, fitted as in the ERP guide "
                "(neuraldatascience.io/eeg/erp-artifacts) on a 1–30 Hz average-referenced "
                "copy cut into 1 s segments" + (", the bad ones found by AutoReject"
-                                               if ica["steps"]["segments"] == "autoreject"
-                                               else "") if use_ica else "") + ".")
+                                               if ar else "") if fits else "") + ".")
     L = _cell(2, "Preprocessing", what)
-    imports = set()
-    if p.bads:
-        L += [assign("raw.info['bads'] = ", list(p.bads))]
+    imports = {"autoreject"} if ar else set()
 
-    def filters(var, lo, hi, notch):
+    def filters(var, lo, hi, notch, ind="    "):
+        picks = ", picks=kinds" if var == "data" else ""  # EOG / ECG / EMG too, as the app
         out = []
         if lo and lo < 0.5:
-            out += [f"{var}.filter({lit(lo)}, None, method='iir', "
+            out += [f"{ind}{var}.filter({lit(lo)}, None, method='iir'{picks}, "
                     "iir_params=dict(order=4, ftype='butter', output='sos'))"]
             lo = None
         if lo or hi:
-            out += [f"{var}.filter({lit(lo)}, {lit(hi)})"]
+            out += [f"{ind}{var}.filter({lit(lo)}, {lit(hi)}{picks})"]
         if notch:
-            out += [f"{var}.notch_filter(np.arange({lit(notch)}, {var}.info['sfreq'] / 2, "
-                    f"{lit(notch)}))"]
+            out += [f"{ind}{var}.notch_filter(np.arange({lit(notch)}, {var}.info['sfreq'] / 2,"
+                    f" {lit(notch)}){picks})"]
         return out
 
-    if use_ica:
-        s = ica["steps"]
-        imports.add("autoreject") if s["segments"] == "autoreject" else None
-        L += ["", "# ICA on a separate copy"
-              + (f", from {s['tmin']:g} s (the first event)" if s["tmin"] else "")]
-        L += [f"ica_raw = raw.copy().pick({lit(s['chans'])})"
-              if len(lit(s["chans"])) < 60 else assign("ica_raw = raw.copy().pick(",
-                                                         s["chans"], ")")]
-        if s["tmin"]:
-            L += [f"ica_raw.crop(tmin={lit(s['tmin'])})"]
-        L += filters("ica_raw", s["l_freq"], s["h_freq"], s["notch"])
-        L += ["ica_raw.set_eeg_reference('average')"]
-        if s["resample"]:
-            L += [f"ica_raw.resample({lit(s['resample'])})"]
-        L += ["events_1s = mne.make_fixed_length_events(ica_raw, duration=1.0)",
-              "segments = mne.Epochs(ica_raw, events_1s, tmin=0, tmax=1.0, baseline=None, "
-              "preload=True)"]
-        if s["segments"] == "autoreject":
-            f = s.get("autoreject_fraction", 1.0)
-            L += [f"ar = AutoReject(n_interpolate=[1, 2, 4], random_state={s['seed']}, "
-                  "verbose=False)"]
-            if f < 1:
-                L += [f"fit_on = np.sort(np.random.default_rng({s['seed']}).choice("
-                      f"len(segments), max(2, round({lit(f)} * len(segments))), "
-                      f"replace=False))  # {f:.0%} of the segments",
-                      "good = ~ar.fit(segments[fit_on]).get_reject_log(segments).bad_epochs"]
+    # what differs between the subjects goes in the table; the rest is the same for all
+    rows = {}
+    for s in subs:
+        row = {"bads": list(s["bads"])}
+        if many:
+            row.update(start=s["start"], stop=s["stop"])
+        if s["ica"] is not None and s["exclude"]:
+            f = s["ica"]["steps"]
+            row.update(ica_channels=list(f["chans"]), tmin=f["tmin"], decim=f["decim"],
+                       exclude=list(s["exclude"]))
+        rows[s["key"] or "recording"] = row
+    L += [assign("SUBJECTS = ", rows) + ("  # each preprocessed on its own" if many else "")]
+    L += ["", "def preprocess(data, s):",
+          "    data.info['bads'] = s['bads']"]
+    if fits:
+        f = fits[0]
+        same = all(all(g[k] == f[k] for k in ("l_freq", "h_freq", "notch", "resample",
+                                              "n_components", "method", "fit_params",
+                                              "max_iter", "seed", "segments", "reject_uv",
+                                              "autoreject_fraction")) for g in fits)
+        if not same:
+            raise ValueError("The subjects' ICA were fitted with different settings: fit "
+                             "ICA again.")
+        L += ["    if 'exclude' in s:  # ICA on a separate copy, from the first event",
+              "        ica_raw = data.copy().pick(s['ica_channels']).crop(tmin=s['tmin'] or 0)"]
+        L += filters("ica_raw", f["l_freq"], f["h_freq"], f["notch"], "        ")
+        L += ["        ica_raw.set_eeg_reference('average')"]
+        if f["resample"]:
+            L += [f"        ica_raw.resample({lit(f['resample'])})"]
+        L += ["        events_1s = mne.make_fixed_length_events(ica_raw, duration=1.0)",
+              "        segments = mne.Epochs(ica_raw, events_1s, tmin=0, tmax=1.0, "
+              "baseline=None,",
+              "                              preload=True)"]
+        if f["segments"] == "autoreject":
+            fr = f.get("autoreject_fraction", 1.0)
+            L += [f"        ar = AutoReject(n_interpolate=[1, 2, 4], random_state={f['seed']},"
+                  " verbose=False)"]
+            if fr < 1:
+                L += [f"        fit_on = np.sort(np.random.default_rng({f['seed']}).choice("
+                      f"len(segments), max(2, round({lit(fr)} * len(segments))), "
+                      f"replace=False))  # {fr:.0%} of the segments",
+                      "        good = ~ar.fit(segments[fit_on]).get_reject_log(segments)"
+                      ".bad_epochs"]
             else:
-                L += ["good = ~ar.fit(segments).get_reject_log(segments).bad_epochs"]
-        elif s["segments"] == "threshold" and s["reject_uv"]:
-            L += [f"segments.drop_bad(reject=dict(eeg={lit(s['reject_uv'])}e-6))",
-                  "good = np.ones(len(segments), bool)"]
+                L += ["        good = ~ar.fit(segments).get_reject_log(segments).bad_epochs"]
+        elif f["segments"] == "threshold" and f["reject_uv"]:
+            L += [f"        segments.drop_bad(reject=dict(eeg={lit(f['reject_uv'])}e-6))",
+                  "        good = np.ones(len(segments), bool)"]
         else:
-            L += ["good = np.ones(len(segments), bool)"]
-        L += [f"ica = mne.preprocessing.ICA(n_components={lit(s['n_components'])}, "
-              f"method={lit(s['method'])},",
-              f"                            fit_params={lit(s['fit_params'])}, "
-              f"max_iter={s['max_iter']}, rng={s['seed']})",
-              f"ica.fit(segments[good], decim={s['decim']})",
-              f"ica.exclude = {lit(list(p.ica_exclude))}  # chosen in the app (blinks)"]
-    L += ["", "data = raw.copy()"] + filters("data", p.l_freq, p.h_freq, p.notch)
-    if use_ica:
-        L += ["ica.apply(data)"]
-    if p.interpolate_bads and p.bads:
-        L += ["data.interpolate_bads()"]
+            L += ["        good = np.ones(len(segments), bool)"]
+        L += [f"        ica = mne.preprocessing.ICA(n_components={lit(f['n_components'])}, "
+              f"method={lit(f['method'])},",
+              f"                                    fit_params={lit(f['fit_params'])}, "
+              f"max_iter={f['max_iter']}, rng={f['seed']})",
+              "        ica.fit(segments[good], decim=s['decim'])",
+              "        ica.exclude = s['exclude']  # chosen in the app (blinks)"]
+    if p.l_freq or p.h_freq or p.notch:
+        L += ["    kinds = [t for t in ('eeg', 'eog', 'ecg', 'emg') if t in data]"]
+    L += filters("data", p.l_freq, p.h_freq, p.notch)
+    if fits:
+        L += ["    if 'exclude' in s:", "        ica.apply(data)"]
+    if p.interpolate_bads:
+        L += ["    if data.info['bads']:", "        data.interpolate_bads()"]
+    L += ["    return data", ""]
+    if many:
+        L += ["sf = raw.info['sfreq']",
+              "parts = [preprocess(raw.copy().crop(s['start'] / sf, (s['stop'] - 1) / sf), s)",
+              "         for s in SUBJECTS.values()]",
+              "bads = sorted({b for part in parts for b in part.info['bads']})",
+              "for part in parts:  # the subjects joined again (their bad channels together)",
+              "    part.info['bads'] = bads",
+              "data = mne.concatenate_raws(parts)",
+              "data.set_annotations(raw.annotations)  # not the joins' boundaries twice"]
+    else:
+        L += ["data = preprocess(raw.copy(), next(iter(SUBJECTS.values())))"]
     return L, imports
 
 

@@ -30,6 +30,7 @@ class Worker(QtCore.QObject):
     """One background task at a time, with a busy indicator in the status bar."""
 
     busyChanged = QtCore.Signal(bool)
+    _reported = QtCore.Signal(int, int, str)
 
     def __init__(self, window: QtWidgets.QMainWindow):
         super().__init__(window)
@@ -40,7 +41,7 @@ class Worker(QtCore.QObject):
         self._keep = None
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 0)
-        self.progress.setMaximumWidth(140)
+        self.progress.setMaximumWidth(160)
         self.progress.setVisible(False)
         self.label = QtWidgets.QLabel("")
         window.statusBar().addPermanentWidget(self.label)
@@ -51,6 +52,23 @@ class Worker(QtCore.QObject):
         self._tick.timeout.connect(self._show_elapsed)
         self._text = ""
         window.statusBar().addPermanentWidget(self.progress)
+        self._reported.connect(self._show_report)  # queued: reports come from the job
+
+    def report(self, done: int, total: int, text: str = ""):
+        """Progress of the running job (callable from its thread): ``done`` of ``total``
+        steps, and what it is doing now (e.g. the subject being read)."""
+        self._reported.emit(int(done), int(total), str(text))
+
+    def _show_report(self, done, total, text):
+        if not self.busy:
+            return
+        self.progress.setRange(0, max(total, 1))
+        self.progress.setValue(min(done, total))
+        self.progress.setFormat(f"{done}/{total}")
+        self.progress.setTextVisible(True)
+        if text:
+            self._text = text
+        self._show_elapsed()
 
     def _show_elapsed(self):
         s = self._clock.elapsed() // 1000
@@ -67,6 +85,8 @@ class Worker(QtCore.QObject):
         self.label.setText(label)
         self._clock.start()
         self._tick.start()
+        self.progress.setRange(0, 0)  # busy, until the job reports how far it is
+        self.progress.setTextVisible(False)
         self.progress.setVisible(True)
         sig = _Signals()
         self._keep = sig

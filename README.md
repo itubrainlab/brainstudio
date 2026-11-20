@@ -176,10 +176,15 @@ Several XDF files, several EDF/BDF/… files, or several BIDS runs can be loaded
 In the BIDS tree, select runs, a subject or a session, then use **Load selected runs
 together**. The files are joined end to end into one recording:
 
-- EEG is joined with `mne.concatenate_raws` on the channels all files share.
+- EEG is joined on the channels all files share. Each file's EEG is moved into the joined
+  recording rather than copied, so about one copy of the data is held at a time: the 62
+  hours of EEG in a 268-run dataset (29 GB in memory) load in about a minute with a 40 GB
+  peak.
 - Sampling rates that differ by less than 0.1 % are aligned (the same amplifier's
-  effective rate varies by a few ppm); others are resampled.
-- `BAD boundary` annotations keep epochs from spanning two files.
+  effective rate varies by a few ppm); others are resampled (MNE, polyphase).
+- `BAD boundary` annotations keep epochs from spanning two files, as
+  `mne.concatenate_raws` marks them.
+- Of the eye tracker's own channels, the fixation columns (Gazepoint `FPOG*`) are kept.
 - Gaze and markers are shifted onto the joined time base.
 
 Every event carries the `subject`, `session`, `bids_task`, `acq`, `run` and `file` of its
@@ -258,13 +263,17 @@ The two panels are fixed, resizable parts of the tab.
 **Viewer**
 
 - **EEG traces** with event markers and shaded saccades, blinks and fixations.
-- **Subjects** of combined files or BIDS runs: a labelled line marks where each
-  recording starts (`sub-01 · ses-1 · run-2`), and the overview strip shades each
-  subject. The **Subject** row in the Controls panel jumps to a subject's start
-  (◀ ▶ step to the previous / next one) and follows the window as you scroll.
-- The traces show the **preprocessed** EEG by default, without the channels marked bad
-  in ① Preprocessing. Switch to *Raw* in the Controls panel to see every EEG channel,
-  with bad ones greyed.
+- **One subject at a time** for combined files or BIDS runs: the EEG traces, the gaze
+  plot and the overview strip show only the current subject. Choose it in the
+  **Subject** row of the Controls panel (◀ ▶ step to the previous / next one) or in
+  ① Preprocessing: every view follows. Double-clicking an event of another subject
+  switches to it. A labelled line marks where each run starts
+  (`sub-01 · ses-1 · run-2`), and the overview strip shades the subject's runs and
+  sessions.
+- The traces show the subject's **good channels** only: those bad in that subject (from
+  the dataset, detection or the channel table in ① Preprocessing) are left out. They
+  show the **preprocessed** EEG by default; switch to *Raw* in the Controls panel to
+  see the data as recorded.
 - Only EEG-type channels are drawn.
 - **Gaze** x/y and **pupil** traces on the same time axis, an overview bar (gaze
   validity and events) and playback.
@@ -281,6 +290,12 @@ The two panels are fixed, resizable parts of the tab.
 - The Streams table (XDF) and the trigger panel.
 - The info panel.
 - The list of markers with all their columns. Double-click a marker to jump to it.
+- The event filter above it: conditions of column (or any column), test and value —
+  contains, does not contain, is, is not, starts with, >, ≥, <, ≤, is empty, is not
+  empty — met all or any. The list shows what the conditions keep; **Apply** makes those
+  the markers used everywhere: the EEG and gaze views, the overview, stimuli, epoching
+  and exported scripts (gaze events are kept). Scripts repeat the filter with the same
+  function, but not on columns only the app has (phase, task, acquisition, file).
 
 **Controls panel**
 
@@ -312,8 +327,17 @@ The **EEG** tab is a three-stage pipeline:
 
 ![Preprocessing with ICA](docs/preprocessing.png)
 
+- **Each subject on its own.** A recording joined from several subjects is preprocessed
+  subject by subject: each has its own bad channels, its own ICA (heads and electrode
+  placements differ, so one decomposition does not fit them all), its own removed
+  components and interpolation. The *Subject* selector chooses which subject the channel
+  and component tables show; the filters are the same for all. The subjects are done one
+  after another, straight into one recording, so only one subject's data is worked on at
+  a time. *Interpolate bad channels* is on by default then: a channel left bad (not
+  interpolated) in any subject is bad in the result, and with many subjects that can be
+  every channel (in a 72-subject dataset each of the 63 channels was bad somewhere).
 - **Ignore the data before the first event** (on by default): bad-channel detection and
-  the ICA fit use the recording from the first marker on. Set-up, calibration and
+  the ICA fit use each subject's data from its first marker on. Set-up, calibration and
   impedance checks before it are left out. Filters and ICA are still applied to the
   whole recording. Gaze events, file boundaries and `BAD_` spans don't count as the
   first event.
@@ -321,7 +345,8 @@ The **EEG** tab is a three-stage pipeline:
   - The data are cut into windows, band-passed and notched like the output will be.
   - A channel is bad when more than a set share of its windows are *noisy* (above a
     peak-to-peak threshold) or *flat*, or when it is a robust-z outlier.
-  - Untick channels by hand to mark them bad.
+  - Untick channels by hand to mark them bad. Detection and the ticks are per subject;
+    a BIDS subject starts with the channels its own `channels.tsv` files mark bad.
   - Bad channels are left out of ICA, the average reference, epochs and statistics, or
     are interpolated with spherical splines.
 - **Filtering and reference.**
@@ -358,7 +383,8 @@ The **EEG** tab is a three-stage pipeline:
     outliers. Check them: automated picks are not always right.
   - Clicking a component shows its scalp map, spectrum, blink-locked average and time
     course. Double-click opens MNE's properties window.
-- **Checks**: the spectrum before and after, noisy and flat windows per channel, and the
+- **Checks**: the spectrum before and after (averaged over the subjects, on the channels
+  good in all), noisy and flat windows per channel (of the subject shown), and the
   blink-locked frontal EEG before and after.
 
 ### ② Epoching
@@ -498,8 +524,9 @@ How groups are compared:
 - **Plain code with standard libraries** — MNE, MNE-BIDS, pyxdf, pymovements,
   AutoReject, scipy and pandas, listed in its first lines — and **no brAInStudio**.
 - **The app's settings, written in**: files, channels, montage, gaze detection, bad
-  channels, filters, the ICA fit and the components removed, event groups, epoch
-  window, rejection, reference, baseline, bands and windows. Each cell opens with a
+  channels, filters, the ICA fit and the components removed (per subject, in a
+  `SUBJECTS` table), event groups, epoch window, rejection, reference, baseline, bands
+  and windows. Each cell opens with a
   one-paragraph explanation. Only the steps that apply are written.
 - **Same results as the app**: the few lines of loading that matter for timing (EEG
   start and rate from a line fit, the Gazepoint clock offset, smoothing the gaze
@@ -534,6 +561,10 @@ How groups are compared:
 - **Fixations**: I-DT (`pm.events.idt`): samples whose dispersion, (max − min x) +
   (max − min y), stays within the threshold (40 px, about 1° at a typical set-up) for at
   least the minimum duration (100 ms). The fixation's location is the mean position.
+  When the data has the eye tracker's own fixations (Gazepoint `FPOGID`, `FPOGD`,
+  `FPOGX`, `FPOGY`, `FPOGV`), those are used instead (*Eye tracker's own fixations when
+  available*, on by default): each ends at its last valid sample and starts `FPOGD`
+  earlier, so it does not depend on the sampling rate.
 - **Saccades**: the Engbert & Kliegl algorithm (`pm.events.microsaccades`, which finds
   saccades of any size): velocity (`Gaze.pos2vel`, Savitzky-Golay) above λ = 6 times
   its median-based spread, for at least 6 ms. Amplitude (px) and peak velocity (px/s)
@@ -557,6 +588,20 @@ How groups are compared:
   samples), so any sampling rate works, even an irregular one; onsets are the exact
   sample times. Detection runs in the background; long recordings take a while (about
   18 s for 47 min at 150 Hz).
+- **Different sampling rates.** A stated rate more than 10 % away from the timestamps
+  (e.g. a sample period written as `SamplingFrequency`) is replaced by the measured one.
+  When files, runs or participants with different gaze rates are loaded together, every
+  part is upsampled to the highest rate by linear interpolation onto a regular grid.
+  A new sample is lost when the nearer original one is lost, so losses (blinks) keep
+  their edges to within half an original interval, and gaps over 3 intervals stay
+  lost. The tracker's fixation channels (Gazepoint FPOG…) come from the nearest
+  sample, with the duration so far interpolated: each of its fixations keeps its
+  start exactly and ends at the new sample nearest to its end (on Affec, 62 → 146 Hz:
+  same fixations, ends within ±3 ms; blinks about 10 ms longer, their edges now
+  between the last valid and first lost sample instead of on the lost one). There is
+  no accepted standard for resampling gaze, and upsampling adds no information:
+  lower-rate parts tend to show more short saccades afterwards. Each joined part is detected on its own, so the saccade threshold (λ times
+  the velocity spread) is that participant's / run's.
 
 ## Events, groups and filters
 
@@ -641,6 +686,11 @@ scores = C.score_blink_components(ica, fit_raw, ev.blinks)      # ICLabel + EOG/
 pp = C.PreprocParams(bads=bads, l_freq=0.1, h_freq=30, notch=50,
                      ica_exclude=scores.loc[scores.suggested, "component"].tolist())
 clean = C.run_preprocessing(rec.raw, pp, ica)
+# several subjects joined: each on its own (its bad channels, ICA, removed components)
+# parts = C.subject_parts(rec.raw, rec.segments)                # one per subject
+# one = C.part_raw(rec.raw, parts[0])                            # a subject's data from 0 s
+# clean = C.preprocess_subjects(rec.raw, parts, pp, {parts[0]["key"]: {"bads": bads,
+#                                 "ica": ica, "exclude": [0]}, ...})
 
 # 2 epoching: named groups of events
 fx = C.filter_events(table, query='phase == "READING"', names={"fixation"})

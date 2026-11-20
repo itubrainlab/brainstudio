@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -32,9 +33,10 @@ def find_bids_runs(root, keys: list[tuple]) -> list:
     return [runs[tuple(k)] for k in keys]
 
 
-def load_step(step: dict):
+def load_step(step: dict, progress=None):
     """The Recording a loading step describes: ``load`` (one file), ``load_many``
-    (files joined) or ``load_bids`` (BIDS runs joined)."""
+    (files joined) or ``load_bids`` (BIDS runs joined). ``progress(done, total, text)``
+    hears which file / run is read."""
     from . import io as bio
     kind = step["kind"]
     if kind == "load":
@@ -42,10 +44,10 @@ def load_step(step: dict):
                         options=step.get("options"))
     if kind == "load_many":
         return bio.load_many(step["paths"], step["screen_size"], step.get("roles_by_name"),
-                             step.get("options_by_name"))
+                             step.get("options_by_name"), progress)
     if kind == "load_bids":
         return bio.load_bids_runs(step["root"], find_bids_runs(step["root"], step["runs"]),
-                                  step.get("screen_size"))
+                                  step.get("screen_size"), progress)
     raise ValueError(f"Unknown loading step {kind!r}")
 
 
@@ -56,6 +58,13 @@ def recording_info(rec, step: dict) -> dict:
     out = {"channels_in": list(rec.raw.ch_names) if rec.raw is not None else [],
            "types_in": list(rec.raw.get_channel_types()) if rec.raw is not None else [],
            "streams": [dict(s) for s in (rec.streams or [])]}
+    if rec.gaze is not None:
+        out["screen"] = list(rec.gaze.screen_size)
+        out["tracker_fixations"] = all(c[3:] in rec.gaze.extra
+                                       for c in C.TRACKER_FIXATION_COLUMNS)
+    out["gaze_upsampled"] = "gaze upsampled to" in (rec.description or "")
+    out["eeg_rates_differ"] = bool(re.search(r"rates aligned to|resampled [\d.]+ → ",
+                                             rec.description or ""))
     if step["kind"] == "load_many":
         out["entities"] = {p: {k: v for k, v in C.entities_from_path(p).items() if v}
                            for p in step["paths"]}
@@ -67,6 +76,9 @@ def recording_info(rec, step: dict) -> dict:
                                       ("session", r.entities.get("session")),
                                       ("run", r.entities.get("run"))) if v}
             item["eeg"] = str(Path(r.eeg).relative_to(root))
+            ev = C.bids_file(r.eeg, "events.tsv")
+            if ev is not None:
+                item["events"] = str(ev.relative_to(root))
             if r.gaze:
                 eye = Path(r.gaze[0])
                 meta = json.loads(eye.with_name(eye.name.replace(".tsv.gz", ".json")
@@ -75,9 +87,15 @@ def recording_info(rec, step: dict) -> dict:
                 cols = meta.get("Columns", [])
                 m = C.gaze_columns([c.lower() for c in cols], len(cols))
                 item["eye"] = str(eye.relative_to(root))
-                for role in ("x", "y", "pupil"):
+                for role in ("x", "y", "pupil", "valid"):
                     if m.get(role):
                         item[role] = cols[m[role][0]]
+                item["time"] = next((c for c in cols if c.lower() == "onset"), None)
+                own = {"ch_" + c.lower(): c for c in cols}
+                if all(c in own for c in C.TRACKER_FIXATION_COLUMNS):
+                    item["tracker"] = [own[c] for c in C.TRACKER_FIXATION_COLUMNS]
+                item["screen"] = list(rec.gaze.screen_size) if rec.gaze is not None \
+                    else [1920, 1080]
             runs.append(item)
         out["runs"] = runs
     return out
@@ -100,9 +118,18 @@ def suggest_preset(gaze) -> str:
     return C.suggest_preset(gaze_table(gaze))
 
 
-def detect_gaze_events(gaze, params: C.DetectionParams = C.DetectionParams()):
-    from .io import gaze_table
-    return C.detect_gaze_events(gaze_table(gaze), params)
+def detect_gaze_events(gaze, params: C.DetectionParams = C.DetectionParams(),
+                       segments=None, progress=None):
+    """Each segment (joined participant / run) on its own; ``progress(done, total,
+    text)`` hears which one is detected."""
+    from .io import gaze_table, part_label
+    starts = [seg["start"] for seg in segments] if segments and len(segments) > 1 else None
+    tell = None
+    if progress is not None and starts:
+        def tell(k, n):
+            progress(k, n, f"Detecting gaze events: {part_label(segments[k])} "
+                           f"({k + 1} of {n})…")
+    return C.detect_gaze_events(gaze_table(gaze), params, starts, tell)
 
 
 def clean_pupil(gaze, blinks, pad: float = 0.05):
@@ -144,6 +171,30 @@ def dataset_root(paths) -> Path | None:
     return None
 
 
+# =========================================================================== per subject
+class SubjectPre:
+    """Preprocessing of one subject (or of the whole recording without subjects): its
+    bad channels, their peak-to-peak statistics, its ICA and the components removed."""
+
+    def __init__(self, part: dict):
+        self.part = dict(part)  # key, label, start / stop sample, dataset bad channels
+        self.bads: list[str] = list(part.get("bads", []))
+        self.bad_stats: pd.DataFrame | None = None
+        self.exclude: list[int] = []
+        self.clear_ica()
+
+    def clear_ica(self):
+        self.ica = self.fit_raw = self.scores = self.spec = self.sources = None
+
+    @property
+    def key(self) -> str:
+        return self.part["key"]
+
+    @property
+    def label(self) -> str:
+        return self.part["label"]
+
+
 # =========================================================================== the session
 class Session:
     def __init__(self):
@@ -171,7 +222,9 @@ class Session:
         self.gaze_offset = 0.0      # manual sync correction (s), applied to the gaze
         self.gaze_params = None     # detection settings of the current gaze events
         self.gaze_events = None
-        self.event_table = C.event_table(None)
+        #: the markers' filter (``C.event_filter``) and the event table before and after it
+        self.event_filter = None
+        self.event_table_all = self.event_table = C.event_table(None)
         #: stimuli: the folder with the files, the event column naming them, the mapping
         #: of its values to files, and the resulting timeline of images / videos shown
         self.stimulus_folder, self.stimulus_column, self.stimulus_map = None, None, {}
@@ -186,8 +239,8 @@ class Session:
         self.rec = rec
         self.clear_recording()
         self.raw_gaze = rec.gaze
-        if rec.raw is not None:  # e.g. from BIDS channels.tsv
-            self.params.bads = list(rec.raw.info["bads"])
+        if rec.raw is not None:  # one preprocessing per subject; bad channels from BIDS
+            self.subjects = [SubjectPre(p) for p in C.subject_parts(rec.raw, rec.segments)]
         if step is not None:
             try:  # what an exported script needs to know about the files
                 step["recording"] = recording_info(rec, step)
@@ -196,10 +249,11 @@ class Session:
             self.load_steps = [step]
         if getattr(rec, "detected_with", None) is not None:
             self.gaze_events, self.gaze_params = rec.gaze_events, rec.detected_with
-        self.event_table = C.event_table(rec.all_events(), self.gaze_events,
-                                         C.make_aois(self.aois), rec.segments)
+        self._set_table(C.event_table(rec.all_events(), self.gaze_events,
+                                      C.make_aois(self.aois), rec.segments))
         root = dataset_root(rec.sources or [rec.source])
-        folder = root / "stimuli" if root is not None and (root / "stimuli").is_dir() else None
+        folder = next((root / d for d in ("stimuli", "stim") if root is not None
+                       and (root / d).is_dir()), None)
         self._files_of, self.stimulus_files = folder, C.stimulus_files(folder)
         column = C.guess_stimulus_column(self.event_table, self.stimulus_files)
         self.set_stimuli(folder, column, None, notify=False)
@@ -225,7 +279,8 @@ class Session:
 
     def load_recipe(self) -> dict:
         return {"steps": list(self.load_steps),
-                "gaze": {"params": self.gaze_params, "aois": dict(self.aois)}}
+                "gaze": {"params": self.gaze_params, "aois": dict(self.aois)},
+                "event_filter": copy.deepcopy(self.event_filter)}
 
     def set_gaze(self, gaze, step: dict | None = None):
         """Gaze attached from another file."""
@@ -262,11 +317,39 @@ class Session:
 
     def rebuild_event_table(self):
         rec = self.rec
-        self.event_table = C.event_table(rec.all_events() if rec is not None else None,
-                                         self.gaze_events, C.make_aois(self.aois),
-                                         rec.segments if rec is not None else None)
+        self._set_table(C.event_table(rec.all_events() if rec is not None else None,
+                                      self.gaze_events, C.make_aois(self.aois),
+                                      rec.segments if rec is not None else None))
         self.notify("events")
         self.mark_stale("epoching")
+
+    def _set_table(self, table):
+        self.event_table_all = table
+        self.event_table = C.apply_event_filter(table, self.event_filter)
+
+    def set_event_filter(self, conditions, match: str = "all") -> bool:
+        """Keep only the markers meeting ``conditions`` (see ``C.filter_rows``) in the
+        event table everything uses: views, stimuli, epoching. False when unchanged."""
+        flt = C.event_filter(conditions, match, self.event_table_all)
+        if flt == self.event_filter:
+            return False
+        self.event_filter = flt
+        self._set_table(self.event_table_all)
+        if self.stimulus_column:
+            self.set_stimuli(self.stimulus_folder, self.stimulus_column, self.stimulus_map)
+        self.notify("events")
+        self.mark_stale("epoching")
+        return True
+
+    def shown_events(self) -> pd.DataFrame:
+        """The recording's markers (onset, duration, description) the filter keeps."""
+        ev = self.rec.all_events()
+        if not self.event_filter or not len(ev):
+            return ev
+        kept = self.event_table[self.event_table["kind"] == "marker"]
+        keys = set(zip(kept["onset"].round(9), kept["description"].astype(str)))
+        return ev[[k in keys for k in zip(ev["onset"].astype(float).round(9),
+                                          ev["description"].astype(str))]]
 
     def set_trigger_events(self, channel: str, mask, mode: str, names: dict[int, str],
                            as_stim: bool = True) -> bool:
@@ -281,8 +364,9 @@ class Session:
         retyped = as_stim and raw.get_channel_types([channel])[0] != "stim"
         if retyped:
             raw.set_channel_types({channel: "stim"}, verbose="error")
-            self.params.bads = [b for b in self.params.bads if b != channel]
-            self.bad_stats = None
+            for sub in self.subjects:
+                sub.bads = [b for b in sub.bads if b != channel]
+                sub.bad_stats = None
             self.invalidate_ica()
         self.rebuild_event_table()
         if retyped:
@@ -306,9 +390,11 @@ class Session:
         self.load_steps.append({"kind": "montage", "source": source,
                                 "names": list(names) if names else None})
         rename = dict(zip(old, self.rec.raw.ch_names))
-        self.params.bads = [rename.get(b, b) for b in (self.params.bads if bads is None
-                                                         else bads)]
-        self.bad_stats = None
+        for sub in self.subjects:  # ``bads``: the shown subject's, as edited
+            sub.bads = [rename.get(b, b) for b in (bads if bads is not None and sub is
+                                                   self.subject else sub.bads)]
+            sub.part["bads"] = [rename.get(b, b) for b in sub.part["bads"]]
+            sub.bad_stats = None
         self.invalidate_ica()
         self.notify("channels")
         self.mark_stale("preprocessing")
@@ -322,10 +408,11 @@ class Session:
     def reset_stages(self):
         self.params = C.PreprocParams(reference=None)
         self.clean = None
-        self.bad_stats: pd.DataFrame | None = None  # peak-to-peak per channel
+        #: preprocessing of each subject, and the one the views show
+        self.subjects: list[SubjectPre] = []
+        self.current = 0
+        self.ica_errors: list[str] = []  # subjects the last ICA fit could not do
         self.blink_check = (None, None)  # blink-locked average before / after
-        self.ica = self.ica_fit_raw = self.ica_scores = self.ica_key = None
-        self.ica_sources = None
         self.psd_before = self.psd_after = None
         self.epoch_settings = C.EpochSettings()
         self.epochs: dict = {}
@@ -333,7 +420,6 @@ class Session:
         self.group_desc: dict[str, str] = {}
         self.state = {s: "pending" for s in STAGES}
         # what each output was computed from, so an exported script reproduces it
-        self.ica_spec: dict | None = None      # fit_ica arguments of the current ICA
         self.pre_recipe: dict | None = None    # loading + ICA + parameters of ``clean``
         self.epoch_recipe: dict | None = None  # loading + preprocessing + groups of epochs
 
@@ -359,14 +445,82 @@ class Session:
         self.state["analysis"] = "ok"
         self.notify("state")
 
-    def set_ica(self, ica, fit_raw, scores, sources, key, spec):
-        self.ica, self.ica_fit_raw, self.ica_scores = ica, fit_raw, scores
-        self.ica_sources, self.ica_key, self.ica_spec = sources, key, spec
+    # ------------------------------------------------------------------ subjects
+    @property
+    def subject(self) -> SubjectPre | None:
+        """The subject the preprocessing views show."""
+        return self.subjects[self.current] if self.subjects else None
+
+    def select_subject(self, k: int):
+        if self.subjects and 0 <= k < len(self.subjects) and k != self.current:
+            self.current = k
+            self.notify("subject")
+
+    def subject_blinks(self, sub: SubjectPre | None = None):
+        """The eye tracker's blinks on a subject's time base."""
+        sub = sub or self.subject
+        ev = self.gaze_events
+        if ev is None or sub is None or self.raw is None:
+            return None
+        return C.part_events(ev.blinks, sub.part, self.raw.info["sfreq"])
+
+    def subject_first_event(self, sub: SubjectPre) -> float | None:
+        """The first marker inside a subject's data, on its time base."""
+        sf = self.raw.info["sfreq"]
+        return C.first_event_time(C.part_events(self.event_table, sub.part, sf))
+
+    # the shown subject's state, under the names the views use
+    def _sub_attr(name):  # noqa: N805
+        def get(self):
+            sub = self.subject
+            return getattr(sub, name) if sub is not None else None
+
+        def put(self, value):
+            if self.subject is not None:
+                setattr(self.subject, name, value)
+        return property(get, put)
+
+    ica = _sub_attr("ica")
+    ica_fit_raw = _sub_attr("fit_raw")
+    ica_scores = _sub_attr("scores")
+    bad_stats = _sub_attr("bad_stats")
+    bads = _sub_attr("bads")
+    ica_exclude = _sub_attr("exclude")
+    del _sub_attr
+
+    @property
+    def ica_sources(self):
+        """The shown subject's ICA sources on its fit data (computed when first shown)."""
+        sub = self.subject
+        if sub is None or sub.ica is None:
+            return None
+        if sub.sources is None:
+            sub.sources = sub.ica.get_sources(sub.fit_raw).get_data()
+        return sub.sources
+
+    def set_icas(self, fits: dict):
+        """ICA of each subject: key → (ica, fit_raw, scores, spec); the suggested blink
+        components are ticked."""
+        for sub in self.subjects:
+            if sub.key in fits:
+                sub.ica, sub.fit_raw, sub.scores, sub.spec = fits[sub.key]
+                sub.sources = None
+                sub.exclude = ([int(c) for c in sub.scores.loc[sub.scores["suggested"],
+                                                                "component"]]
+                               if sub.scores is not None else [])
         self.mark_stale("preprocessing")
 
     def invalidate_ica(self):
-        self.ica = self.ica_fit_raw = self.ica_scores = self.ica_key = None
-        self.ica_spec = self.ica_sources = None
+        for sub in self.subjects:
+            sub.clear_ica()
+            sub.exclude = []
+
+    def subject_settings(self, use_ica: bool = True) -> dict:
+        """For ``C.preprocess_subjects``: each subject's bad channels, ICA and removed
+        components."""
+        return {sub.key: {"bads": list(sub.bads), "ica": sub.ica if use_ica else None,
+                          "exclude": list(sub.exclude) if use_ica and sub.ica is not None
+                          else []} for sub in self.subjects}
 
     def mark_stale(self, stage: str):
         """Settings of ``stage`` changed: it and every later stage are out of date."""
@@ -376,10 +530,18 @@ class Session:
         self.notify("state")
 
     # ------------------------------------------------------------------ recipes
-    def snapshot_pre_recipe(self, params, ica) -> dict:
-        return {"load": copy.deepcopy(self.load_recipe()),
-                "ica": copy.deepcopy(self.ica_spec) if ica is not None else None,
-                "params": copy.deepcopy(params)}
+    def snapshot_pre_recipe(self, params, settings: dict) -> dict:
+        """Loading, filters and each subject's bad channels, ICA fit and removed
+        components (``settings`` as from ``subject_settings``)."""
+        subs = []
+        for sub in self.subjects:
+            s = settings.get(sub.key, {})
+            subs.append({"key": sub.key, "label": sub.label, "start": sub.part["start"],
+                         "stop": sub.part["stop"], "bads": list(s.get("bads", [])),
+                         "exclude": list(s.get("exclude", [])),
+                         "ica": copy.deepcopy(sub.spec) if s.get("exclude") else None})
+        return {"load": copy.deepcopy(self.load_recipe()), "params": copy.deepcopy(params),
+                "subjects": subs}
 
     def snapshot_epoch_recipe(self, raw, specs, settings) -> dict:
         """Everything the epochs are built from. ``data`` / ``table`` keep the objects

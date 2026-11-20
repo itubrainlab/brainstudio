@@ -555,6 +555,47 @@ def test_bids_dataset_info_bads_and_positions(tmp_path):
     assert __import__("brainstudio.core", fromlist=["x"]).electrodes_file(run.eeg) == el
 
 
+def test_bids_gazepoint_physio_next_to_a_face_video_stream(tmp_path):
+    """A Gazepoint file (``recording-gaze``, sidecar ``Type: gaze``, an ``onset`` column,
+    0–1 BPOGX/BPOGY, ``display_resolution``) is the eye tracker, not the OpenFace stream
+    beside it (``Type: videostream``, gaze_0_x …); events.tsv at the subject level."""
+    import gzip
+    import json
+    from pathlib import Path
+    from brainstudio.io import load_bids_runs
+    root = tmp_path / "bids"
+    write_bids(root, subjects=("01",), stimuli=False)
+    eeg = root / "sub-01" / "eeg"
+    for f in eeg.glob("*recording-eye1*"):
+        f.unlink()
+    (eeg / "sub-01_task-freeview_events.tsv").rename(
+        root / "sub-01" / "sub-01_task-freeview_events.tsv")
+    beh = root / "sub-01" / "beh"
+    beh.mkdir()
+    n, rate = 600, 60.0
+    t = np.arange(n) / rate
+    x, y = 0.5 + 0.1 * np.sin(t), 0.5 + 0.1 * np.cos(t)
+    gaze_cols = ["onset", "TIME", "BPOGX", "BPOGY", "BPOGV"]
+    face_cols = ["onset", "frame", "gaze_0_x", "gaze_0_y", "gaze_angle_x"]
+    for rec, kind, cols, rows in (
+            ("gaze", "gaze", gaze_cols, np.c_[t, t + 100, x, y, np.ones(n)]),
+            ("videostream", "videostream", face_cols,
+             np.c_[t, np.arange(n), -5 + 0 * t, 1 + 0 * t, 0 * t])):
+        stem = beh / f"sub-01_task-freeview_recording-{rec}_physio"
+        with gzip.open(f"{stem}.tsv.gz", "wt") as fh:
+            np.savetxt(fh, rows, delimiter="\t")
+        meta = {"SamplingFrequency": rate, "StartTime": 0, "Columns": cols, "Type": kind,
+                "display_resolution": "1280x1024"}
+        Path(f"{stem}.json").write_text(json.dumps(meta))
+    run = scan_bids(root)[0]
+    assert [g.name for g in run.gaze] == ["sub-01_task-freeview_recording-gaze_physio.tsv.gz"]
+    rec = load_bids_runs(root, [run])
+    g = rec.gaze
+    assert tuple(g.screen_size) == (1280, 1024)
+    assert np.allclose(g.times, t) and np.allclose(g.x, x * 1280) and np.allclose(g.y, y * 1024)
+    assert len(rec.all_events()) > 0
+
+
 def test_ica_uses_the_kept_channels_not_the_file_bad_list(demo):
     """Channels the file marks bad but the user keeps must be in the ICA fit."""
     rec = load_bids_run(demo / "bids", scan_bids(demo / "bids")[0])
@@ -733,6 +774,38 @@ def test_script_literals_are_exact_python():
     assert SC.lit(np.float64(0.1)) == "0.1" and SC.lit(np.int64(3)) == "3"
 
 
+def test_group_labels_from_events_and_filters():
+    """Groups are named after their events and filters, uniquely; typed names stay."""
+    from brainstudio import script as SC
+    G = C.GroupSpec
+    assert C.group_label(G("", ["stimulus"])) == "stimulus"
+    assert C.group_label(G("", ["stimulus", "response"])) == "response/stimulus"
+    assert C.group_label(G("", list("abcde"))) == "a/b/c +2"
+    assert C.group_label(G("", [])) == "no events"
+    assert C.group_label(G("", ["stimulus"], conditions=[["emotion", "=", "happy"]])) \
+        == "stimulus · emotion=happy"
+    assert C.group_label(G("", ["stimulus"], conditions=[
+        ["rt", "<", "2"], ["emotion", "one of", "happy, sad"], ["word", "contains", "ab"],
+        ["x", "=", ""]])) == "stimulus · rt<2 · emotion∈{happy,sad} · word~ab"
+    assert C.group_label(G("", ["stimulus"], text="face", query="rt  < 2")) \
+        == "stimulus · /face/ · rt < 2"
+    # recordings are the same for every group: not part of the name
+    assert C.group_label(G("x", ["stimulus"], recordings={"subject": ["01"]})) == "stimulus"
+    long = C.group_label(G("", ["stimulus"], query="a == 1 and " * 20))
+    assert len(long) == C.GROUP_LABEL_MAX and long.endswith("…")
+    specs = [G("Group A", ["stimulus"]), G("stimulus", ["response"]), G("Group C", ["stimulus"]),
+             G("mine", ["blink"])]
+    labels = C.auto_group_labels(specs, [True, False, True, False])
+    assert labels == ["stimulus (2)", "stimulus", "stimulus (3)", "mine"]
+    assert C.auto_group_labels(specs[:1] + specs[2:3], [True, True]) == \
+        ["stimulus", "stimulus (2)"]
+    # automatic labels are plain keys: they survive the exported scripts' literals
+    spec = G(labels[0], ["stimulus"], conditions=[["rt", "≤", "2"]])
+    ns = {"GroupSpec": G}
+    exec(SC.assign("spec = ", spec), ns)
+    assert ns["spec"] == spec
+
+
 def test_exported_script_repeats_the_erp(tmp_path):
     """The short exported ERP script (standard libraries only, no brAInStudio) builds the
     same epochs and per-subject ERP values as the app."""
@@ -864,3 +937,196 @@ def test_stimulus_column_and_value_matching():
     assert list(st.file) == ["82.png", "2.png", "82.png"]
     assert list(st.end) == pytest.approx([1.9, 3.0, 10.0])  # duration, else next / end
     assert C.guess_stimulus_column(tab.assign(stim_file=["a", "b", "c"]), files) == "stim_file"
+
+
+def _gazepoint(rate, seconds=20.0, seed=0):
+    """Gazepoint-like gaze: fixations of 0.3 s at random places (FPOG… columns) with
+    noise, 0–1 coordinates."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(int(seconds * rate)) / rate
+    fid = (t // 0.3).astype(int)
+    centre = rng.uniform(0.2, 0.8, (fid.max() + 1, 2))
+    x = centre[fid, 0] + rng.normal(0, 0.003, len(t))
+    y = centre[fid, 1] + rng.normal(0, 0.003, len(t))
+    start = fid * 0.3
+    data = np.c_[x, y, fid, t - start, centre[fid, 0], centre[fid, 1], np.ones(len(t))]
+    return C.gaze_table(t, data, ["BPOGX", "BPOGY", "FPOGID", "FPOGD", "FPOGX", "FPOGY",
+                                  "FPOGV"], (1000, 1000), sfreq=rate)
+
+
+def test_gaze_rates_resampling_and_tracker_fixations():
+    """A rate that disagrees with the timestamps (a period written as the rate) is
+    replaced by the measured one; joined parts at different rates are upsampled to the
+    highest (linear, gaps kept) and detected each on its own; the tracker's own fixations
+    replace I-DT and do not depend on the rate."""
+    t = np.arange(200) / 62.0
+    assert C.checked_rate(1 / 62.0, t) == pytest.approx(62.0)
+    assert C.checked_rate(60.0, t) == 60.0  # within 10 %: the stated rate
+    # linear interpolation; a loss keeps its edges (the nearer sample decides)
+    g = pd.DataFrame({"t": [0.0, 0.1, 0.2, 0.3], "x": [0.0, 10.0, np.nan, 30.0],
+                      "y": [0.0, 1.0, 2.0, 3.0], "ch_id": [1.0, 1.0, 2.0, 2.0]})
+    r = C.resample_gaze(g, 20.0)
+    assert np.allclose(r["t"], np.arange(7) * 0.05)
+    assert np.allclose(r["x"], [0, 5, 10, 10, np.nan, np.nan, 30], equal_nan=True)
+    assert list(r["ch_id"]) == [1, 1, 1, 1, 2, 2, 2] and r.attrs["sfreq"] == 20.0
+    # the tracker's fixations keep their start, end at the nearest new sample, and a
+    # fixation valid on one sample only survives
+    for slow in (_gazepoint(60.0), _gazepoint(60.0).assign(
+            ch_fpogv=lambda d: np.where(d["ch_fpogd"] < 0.28, 0.0, 1.0))):
+        native = C.tracker_fixations(slow, (1000, 1000))
+        up = C.tracker_fixations(C.resample_gaze(slow, 150.0), (1000, 1000))
+        assert len(up) == len(native) > 60
+        assert np.allclose(up["onset"], native["onset"], atol=1e-9)
+        assert np.allclose(up["offset"], native["offset"], atol=0.5 / 150 + 1e-9)
+    # the tracker's fixations: 0.3 s each, at their place in pixels, at any rate
+    for rate in (60.0, 150.0):
+        fix = C.tracker_fixations(_gazepoint(rate), (1000, 1000))
+        assert len(fix) == 67 and np.allclose(fix["duration"][:-1], 0.3, atol=1.5 / rate)
+        assert fix["x"].between(200, 800).all()
+    slow, fast = _gazepoint(60.0), _gazepoint(150.0, seed=1)
+    raw, events, gaze, segments, notes = C.join(
+        [(None, pd.DataFrame(columns=["onset", "duration", "description"]), g_, {})
+         for g_ in (slow, fast)])
+    assert any(n.startswith("gaze upsampled to 150.0 Hz") for n in notes)
+    assert gaze.attrs["sfreq"] == pytest.approx(150.0)
+    first = gaze[gaze["t"] < segments[1]["start"]]
+    assert np.median(np.diff(first["t"])) == pytest.approx(1 / 150.0)
+    ev = C.detect_gaze_events(gaze, C.DetectionParams(), [s["start"] for s in segments])
+    assert ev.fixations.attrs["source"] == "eye tracker" and len(ev.fixations) == 2 * 67
+    idt = C.detect_gaze_events(fast, C.DetectionParams(tracker_fixations=False))
+    assert idt.fixations.attrs["source"] == "I-DT"
+
+
+def test_event_filter_conditions():
+    df = pd.DataFrame({"onset": [1.0, 2.0, 3.0, 4.0],
+                       "name": ["stimulus", "response", "Stimulus", "BAD boundary"],
+                       "subject": ["acl", "acl", "agk", ""]})
+    f = lambda *conds, match="all": list(C.filter_rows(df, conds, match)["onset"])  # noqa: E731
+    assert f((None, "contains", "stim")) == [1.0, 3.0]
+    assert f((None, "contains", "STIM agk")) == [3.0]          # every word, any column
+    assert f(("name", "contains", "acl")) == []
+    assert f(("name", "is", "stimulus"), ("subject", "is not", "agk")) == [1.0]
+    assert f(("onset", "≥", "2"), ("onset", "<", "4")) == [2.0, 3.0]
+    assert f(("onset", "is", "3")) == [3.0]
+    assert f(("name", "starts with", "bad"), ("subject", "is", "agk"), match="any") == [3.0, 4.0]
+    assert f(("subject", "is empty", "")) == [4.0]
+    assert f((None, "does not contain", "acl")) == [3.0, 4.0]
+    assert f(("onset", ">", "x")) == [] and f(("name", "is", "  ")) == [1.0, 2.0, 3.0, 4.0]
+
+
+def test_event_filter_applies_everywhere_and_in_scripts(tmp_path):
+    """Applied, the event filter leaves out markers in the session's table (gaze events
+    stay), in the markers shown, and in the exported script's epochs."""
+    import runpy
+    import sys
+    from brainstudio import io as bio
+    from brainstudio import script as SC
+    from brainstudio.demo import write_bids
+    root = tmp_path / "bids"
+    write_bids(root, subjects=("01", "02"))
+    runs = bio.scan_bids(root)
+    rec = bio.load_bids_runs(root, runs, None)
+    step = {"kind": "load_bids", "root": str(root), "runs": [list(r.key) for r in runs],
+            "screen_size": None}
+    rec.gaze_events = S.detect_gaze_events(rec.gaze, C.DetectionParams(), rec.segments)
+    rec.detected_with = C.DetectionParams()
+    ses = S.Session()
+    ses.set_recording(rec, step)
+    marker = lambda t: t[t["kind"] == "marker"]  # noqa: E731
+    n_all, n_gaze = len(marker(ses.event_table)), (ses.event_table["kind"] != "marker").sum()
+    conds = [("onset", "≥", "30"), ("subject", "is", "02")]
+    assert ses.set_event_filter(conds, "any") and not ses.set_event_filter(conds, "any")
+    kept = marker(ses.event_table)
+    assert 0 < len(kept) < n_all and (ses.event_table["kind"] != "marker").sum() == n_gaze
+    assert ((kept["onset"] >= 30) | (kept["subject"] == "02")).all()
+    assert len(ses.shown_events()) == len(kept) < len(rec.all_events())
+    assert len(marker(ses.event_table_all)) == n_all
+    specs = [C.GroupSpec("stim", ["stimulus"]), C.GroupSpec("resp", ["response"])]
+    st = C.EpochSettings(autoreject=False)
+    epochs, _ = C.build_group_epochs(
+        rec.raw, {g.label: C.select_events(ses.event_table, g) for g in specs}, st,
+        ses.gaze_events.blinks)
+    spec = C.ErpSpec(["stim", "resp"], C.COMPONENT_PRESETS["P300"], (-0.1, 0.0), "average")
+    recipe = {"load": ses.load_recipe(), "groups": specs, "settings": st, "pre": None}
+    assert SC.check_recipe(recipe) is None
+    code = SC.build_script("erp", recipe, spec, {"ch_names": list(epochs["stim"].ch_names),
+                                                 "n_subjects": 2})
+    path = tmp_path / "erp.py"
+    path.write_text(code, encoding="utf-8")
+    saved = {k: v for k, v in sys.modules.items() if k.split(".")[0] == "brainstudio"}
+    for k in saved:  # the script must not need brainstudio
+        sys.modules[k] = None
+    import matplotlib
+    matplotlib.use("Agg")
+    try:
+        g = runpy.run_path(str(path), run_name="exported")
+    finally:
+        sys.modules.update(saved)
+    assert {k: len(v) for k, v in g["epochs"].items()} == {k: len(v) for k, v in epochs.items()}
+    unfiltered = {g_.label: len(C.select_events(ses.event_table_all, g_)) for g_ in specs}
+    assert all(len(epochs[k]) < unfiltered[k] for k in unfiltered)  # the filter mattered
+    bad = dict(recipe, load=dict(recipe["load"], event_filter=C.event_filter(
+        [("phase", "is", "x")], "all", ses.event_table_all)))
+    assert "phase" in SC.check_recipe(bad)
+
+
+def test_preprocessing_per_subject_matches_the_exported_script(tmp_path):
+    """Each subject is preprocessed on its own (its bad channels, its ICA, its removed
+    components), the same as preprocessing that subject alone; the exported script
+    (standard libraries only) gives the same data."""
+    from brainstudio import io as bio
+    from brainstudio import script as SC
+    root = tmp_path / "bids"
+    write_bids(root, subjects=("01", "02"), stimuli=False)
+    runs = bio.scan_bids(root)
+    rec = bio.load_bids_runs(root, runs, None)
+    step = {"kind": "load_bids", "root": str(root), "runs": [list(r.key) for r in runs],
+            "screen_size": None}
+    ses = S.Session()
+    ses.set_recording(rec, step)
+    raw = rec.raw
+    assert [s.label for s in ses.subjects] == ["sub-01", "sub-02"]
+    assert ses.subjects[1].part["start"] == ses.subjects[0].part["stop"] > 0
+    ses.subjects[0].bads = [raw.ch_names[3]]  # a different bad channel per subject
+    ses.subjects[1].bads = [raw.ch_names[7]]
+    ip = C.ICAParams(n_components=5, clean="threshold", iclabel=False)
+    fits = {}
+    for sub in ses.subjects:
+        ica, fit_raw = C.fit_ica(C.part_raw(raw, sub.part), sub.bads, None, None, ip,
+                                 tmin=ses.subject_first_event(sub))
+        assert len(fit_raw.times) < raw.n_times / 2  # this subject's data only
+        fits[sub.key] = (ica, fit_raw, C.score_blink_components(ica, fit_raw), dict(
+            bads=list(sub.bads), params=ip, steps=dict(fit_raw.fit_steps)))
+    ses.set_icas(fits)
+    ses.subjects[0].exclude, ses.subjects[1].exclude = [0], [1, 2]
+    p = C.PreprocParams(l_freq=1.0, h_freq=30.0, notch=None, interpolate_bads=True)
+    settings = ses.subject_settings()
+    p.per_subject = {k: {"bads": v["bads"], "exclude": v["exclude"]}
+                     for k, v in settings.items()}
+    parts = [s.part for s in ses.subjects]
+    clean = C.preprocess_subjects(raw, parts, p, settings)
+    assert clean.info["bads"] == [] and "2 subjects" in p.describe()
+    for sub in ses.subjects:  # each subject as if it were preprocessed alone
+        alone = C.run_preprocessing(C.part_raw(raw, sub.part),
+                                    C.replace(p, bads=sub.bads, ica_exclude=sub.exclude),
+                                    sub.ica)
+        a, b = sub.part["start"], sub.part["stop"]
+        assert np.array_equal(alone.get_data(), clean.get_data()[:, a:b])
+    before, after = C.psd_check_subjects(raw, clean, parts)
+    assert before.get_data().shape == after.get_data().shape
+    # the exported script's loading and preprocessing cells give the same data
+    step["recording"] = S.recording_info(rec, step)
+    recipe = {"load": {"steps": [step], "gaze": {"params": None, "aois": {}}},
+              "pre": ses.snapshot_pre_recipe(p, settings)}
+    load, imp = SC._loading(recipe)
+    pre, imp2 = SC._preprocessing(recipe)
+    code = "\n".join([SC._IMPORT[m] for m in sorted(imp | imp2) if m in SC._IMPORT]
+                     + ["import json", "import warnings", "from pathlib import Path",
+                        "mne.set_log_level('error')"] + load + pre)
+    assert "SUBJECTS" in code and "brainstudio" not in code
+    g = {}
+    exec(compile(code, "exported", "exec"), g)
+    assert np.allclose(g["data"].get_data(), clean.get_data(), rtol=0, atol=1e-12)
+    edges = lambda r: sorted(zip(*[np.round(r.annotations.onset, 6), r.annotations.description]))  # noqa: E731
+    script_edges = [e for e in edges(g["data"]) if C.is_data_annotation(pd.Series([e[1]]))[0]]
+    assert script_edges == edges(clean)  # the joins' boundaries once, as in the app

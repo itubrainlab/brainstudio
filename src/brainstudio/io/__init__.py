@@ -59,8 +59,9 @@ def load(path, screen_size=(1920, 1080), roles=None, options=None) -> Recording:
     return rec
 
 
-def _joined(recs: list[Recording], first: Recording) -> Recording:
-    """Recordings joined end to end (:func:`brainstudio.core.join`)."""
+def _joined(recs: list[Recording], first: Recording, notes_before=()) -> Recording:
+    """Recordings joined end to end (:func:`brainstudio.core.join`); ``notes_before``:
+    what was done to the parts already (e.g. resampled while read)."""
     if len(recs) == 1:
         return recs[0]
     parts = []
@@ -73,6 +74,7 @@ def _joined(recs: list[Recording], first: Recording) -> Recording:
             events = events[~C.is_data_annotation(events["description"])]
         parts.append((r.raw, events, gaze_table(r.gaze), {"segments": r.segments}))
     raw, events, gaze, segments, notes = C.join(parts)
+    notes = list(notes_before) + notes
     out = recording(raw, events, gaze, {"streams": first.streams}, first.source)
     out.segments, out.sources = segments, [r.source for r in recs]
     if any(r.metadata for r in recs):  # first file's info; bad channels from all files
@@ -100,10 +102,15 @@ def gaze_table(g: GazeData | None):
 
 
 def load_many(paths, screen_size=(1920, 1080), roles_by_name=None,
-              options_by_name=None) -> Recording:
-    """Several files joined; for XDF, roles and options are given per stream name."""
+              options_by_name=None, progress=None) -> Recording:
+    """Several files joined; for XDF, roles and options are given per stream name.
+    ``progress(done, total, text)`` is told which file is read."""
     recs = []
-    for p in map(Path, paths):
+    paths = [Path(p) for p in paths]
+    for i, p in enumerate(paths):
+        if progress is not None:
+            progress(i, len(paths) + 1, f"Reading {part_label(entities_from_path(p))} "
+                                        f"({i + 1} of {len(paths)})…")
         roles = options = None
         if p.name.lower().endswith((".xdf", ".xdfz")) and (roles_by_name or options_by_name):
             keys = {s["name"]: str(s["stream_id"]) for s in
@@ -112,6 +119,8 @@ def load_many(paths, screen_size=(1920, 1080), roles_by_name=None,
             options = {keys[n]: o for n, o in (options_by_name or {}).items()
                        if n in keys} or None
         recs.append(load(p, screen_size, roles, options))
+    if progress is not None and len(recs) > 1:
+        progress(len(paths), len(paths) + 1, f"Joining {len(paths)} files…")
     return _joined(recs, recs[0])
 
 
@@ -120,11 +129,29 @@ def load_bids_run(root, run, screen_size=None) -> Recording:
     return recording(raw, events, gaze, info, run.eeg or (run.gaze[0] if run.gaze else root))
 
 
-def load_bids_runs(root, runs, screen_size=None) -> Recording:
-    """BIDS runs joined, each keeping its subject/session/task/acq/run/file."""
-    recs = []
-    for run in runs:
+def part_label(entities: dict) -> str:
+    """``sub-01 ses-1 run-2`` of a run or joined part (else its file name)."""
+    ent = entities or {}
+    label = " ".join(f"{p}-{ent[k]}" for k, p in (("subject", "sub"), ("session", "ses"),
+                                                  ("run", "run")) if ent.get(k))
+    return label or str(ent.get("file", ""))
+
+
+def load_bids_runs(root, runs, screen_size=None, progress=None) -> Recording:
+    """BIDS runs joined, each keeping its subject/session/task/acq/run/file.
+    ``progress(done, total, text)`` is told which run is read."""
+    recs, notes, sf = [], [], None
+    for i, run in enumerate(runs):
+        if progress is not None:
+            progress(i, len(runs) + 1, f"Reading {part_label(run.entities)} "
+                                       f"({i + 1} of {len(runs)})…")
         r = load_bids_run(root, run, screen_size)
+        if r.raw is not None and len(runs) > 1:
+            sf = sf or r.raw.info["sfreq"]
+            d = abs(r.raw.info["sfreq"] - sf)
+            if d / sf >= 1e-3:  # as the join would, now: high rates are not all held
+                notes.append(f"resampled {r.raw.info['sfreq']:g} → {sf:g} Hz")
+                r.raw.resample(sf, method="polyphase")
         ent = {k: run.entities.get(e) for k, e in (("subject", "subject"), ("session", "session"),
                                                    ("bids_task", "task"), ("acq", "acquisition"),
                                                    ("run", "run"))}
@@ -132,7 +159,9 @@ def load_bids_runs(root, runs, screen_size=None) -> Recording:
         r.segments = [{"start": 0.0, "end": float(r.duration),
                        **{k: v for k, v in ent.items() if v not in (None, "")}}]
         recs.append(r)
-    return _joined(recs, recs[0])
+    if progress is not None and len(recs) > 1:
+        progress(len(runs), len(runs) + 1, f"Joining {len(runs)} runs…")
+    return _joined(recs, recs[0], notes)
 
 
 def load_eyetracking_file(path, screen_size=(1920, 1080)) -> GazeData:

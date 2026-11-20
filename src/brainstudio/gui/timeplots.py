@@ -316,6 +316,10 @@ class GazePlot(pg.GraphicsLayoutWidget, TimeCursorMixin, EventLinesMixin, Segmen
         self._ylim = (0, max(g.screen_size))
         self.pos_plot.setYRange(0, max(g.screen_size), padding=0.02)
 
+    def set_span(self, t0: float, t1: float):
+        """Only ``t0`` … ``t1`` can be seen (one subject)."""
+        self.pos_plot.getViewBox().setLimits(xMin=t0, xMax=t1)
+
     def _overlay_yrange(self):
         return self._ylim
 
@@ -355,8 +359,28 @@ class OverviewBar(pg.PlotWidget):
         for t in self.ticks:
             t.setBrush(pg.mkBrush(THEME.event))
 
+    def set_span(self, t0: float, t1: float):
+        """The strip covers ``t0`` … ``t1`` only (the subject shown)."""
+        self.plotItem.setXRange(t0, max(t1, t0 + 1e-3), padding=0)  # no neighbour shown
+        self.region.setBounds((t0, t1))
+
+    def set_segments(self, segments: list[dict]):
+        """The runs / sessions (joined files) as alternately shaded spans with their
+        session and run (else file) name."""
+        for it in self._spans:
+            self.removeItem(it)
+        self._spans = []
+        spans = []
+        for seg in segments or []:
+            label = " ".join(f"{p}-{seg[k]}" for k, p in (("session", "ses"), ("run", "run"))
+                             if seg.get(k)) or str(seg.get("file", ""))
+            spans.append({"label": label, "start": seg["start"], "end": seg["end"]})
+        if len(spans) < 2:
+            return
+        self.set_subjects(spans)
+
     def set_subjects(self, spans: list[dict]):
-        """Subjects as alternately shaded spans with their name (click one to jump)."""
+        """Spans (subjects, runs) alternately shaded, with their name."""
         for it in self._spans:
             self.removeItem(it)
         self._spans = []
