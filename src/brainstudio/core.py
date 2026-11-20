@@ -2490,10 +2490,22 @@ def run_preprocessing(raw, p: PreprocParams, ica=None):
         ica.apply(data)
     if p.interpolate_bads and data.info["bads"]:
         data.interpolate_bads(reset_bads=True)
-    ref = parse_reference(p.reference, data)
+    ref = preprocessing_reference(p.reference, data)
     if ref:
         set_reference(data, ref)
     return data
+
+
+def preprocessing_reference(spec, data):
+    """What ``set_eeg_reference`` needs for the preprocessing reference ``spec`` ("as
+    recorded", "average", "mastoids" or channel names), over ``data``'s good EEG
+    channels (as :func:`resolve_erp_reference`); None keeps the recorded reference."""
+    if spec is None:
+        return None
+    if not isinstance(spec, str):
+        spec = ", ".join(spec)
+    good = [data.ch_names[i] for i in mne.pick_types(data.info, eeg=True)]
+    return resolve_erp_reference(spec, good)[0]
 
 
 def blink_locked_average(raw, blinks, channels, tmin=-0.3, tmax=0.6):
@@ -3154,7 +3166,7 @@ def resolve_erp_reference(spec: str, ch_names: list[str]):
     "M1, M2") as what ``set_eeg_reference`` needs, plus a label. The channels are the
     epochs' good ones; without a mastoid pair the data stay as recorded."""
     low, lower = (spec or "").strip().lower(), {c.lower(): c for c in ch_names}
-    if low in ("recorded", "keep", "as recorded", ""):
+    if low in ("recorded", "keep", "as recorded", "none", ""):
         return None, "as recorded"
     if low in ("average", "avg", "car"):
         return "average", "average reference"

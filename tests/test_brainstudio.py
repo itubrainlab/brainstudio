@@ -1130,3 +1130,25 @@ def test_preprocessing_per_subject_matches_the_exported_script(tmp_path):
     edges = lambda r: sorted(zip(*[np.round(r.annotations.onset, 6), r.annotations.description]))  # noqa: E731
     script_edges = [e for e in edges(g["data"]) if C.is_data_annotation(pd.Series([e[1]]))[0]]
     assert script_edges == edges(clean)  # the joins' boundaries once, as in the app
+    # a reference chosen in preprocessing: each subject over its own good channels, the
+    # same in the exported script
+    eeg = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude=[])]
+    for ref, interp in (("average", True), ("average", False),
+                        (f"{eeg[10]}, {eeg[11]}", True), ("mastoids", True)):
+        q = C.replace(p, reference=ref, interpolate_bads=interp)
+        clean = C.preprocess_subjects(raw, parts, q, settings)
+        if ref == "average":
+            for sub in ses.subjects:
+                good = [i for i, c in enumerate(clean.ch_names) if c in eeg
+                        and (interp or c not in sub.bads)]
+                seg = clean.get_data()[good, sub.part["start"]:sub.part["stop"]]
+                assert np.abs(seg.mean(0)).max() < 1e-12  # average reference, per subject
+        recipe["pre"] = ses.snapshot_pre_recipe(q, settings)
+        pre, imp2 = SC._preprocessing(recipe)
+        code = "\n".join([SC._IMPORT[m] for m in sorted(imp | imp2) if m in SC._IMPORT]
+                         + ["import json", "import warnings", "from pathlib import Path",
+                            "mne.set_log_level('error')"] + load + pre)
+        assert ("REFERENCE" in code) and "brainstudio" not in code
+        g = {}
+        exec(compile(code, "exported", "exec"), g)
+        assert np.allclose(g["data"].get_data(), clean.get_data(), rtol=0, atol=1e-12), ref

@@ -355,9 +355,12 @@ The **EEG** tab is a three-stage pipeline:
   - High-pass from **0 Hz (off)** upwards. Below 0.5 Hz it is a zero-phase 4th-order
     Butterworth (IIR); above that, MNE's FIR.
   - Low-pass and notch.
-  - The data keep their **recorded reference**. Re-referencing happens in each analysis:
-    ERPs use the reference conventional for the component, band power the average
-    reference.
+  - **Reference**: as recorded (the default), the average, the mastoids (M1/M2,
+    TP9/TP10, A1/A2 or P9/P10, the first pair present) or any channel(s), e.g. `Cz` or
+    `M1, M2`. It is applied to every subject after its bad channels are interpolated,
+    over that subject's good EEG channels; exported scripts do the same. The analyses
+    can re-reference again: ERPs to the reference conventional for the component, band
+    power to the average.
 - **ICA blink removal** (`mne.preprocessing.ICA`), following the
   [ERP guide](https://neuraldatascience.io/eeg/erp-artifacts):
   - fitted on a separate **1–30 Hz**, average-referenced copy of the good, non-flat

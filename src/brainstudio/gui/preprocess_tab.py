@@ -138,9 +138,18 @@ class PreprocessTab(QtWidgets.QWidget):
         f.addRow("High-pass", self.hp)
         f.addRow("Low-pass", self.lp)
         f.addRow("Notch", self.notch)
-        f.addRow(hint("The data keep their recorded reference here. Each analysis chooses "
-                      "its own: ERPs the reference conventional for the component, band "
-                      "power the average reference (③ Analysis)."))
+        self.reference = QtWidgets.QComboBox()
+        self.reference.setEditable(True)
+        self.reference.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.reference.addItems(list(self.REF_CHOICES))
+        self.reference.setToolTip(
+            "as recorded · average: common average of the subject's good channels · "
+            "mastoids: mean of M1/M2, TP9/TP10, A1/A2 or P9/P10 (the first pair present) · "
+            "or channel name(s), e.g. Cz or “M1, M2”")
+        f.addRow("Reference", self.reference)
+        f.addRow(hint("The reference is applied to every subject, after its bad channels "
+                      "are interpolated. The analyses (③) can re-reference again: ERPs to "
+                      "the component's usual reference, band power to the average."))
         lay.addWidget(box)
 
         # ---------------------------------------------------------------- ICA
@@ -250,6 +259,7 @@ class PreprocessTab(QtWidgets.QWidget):
         for w in (self.hp, self.lp):
             w.valueChanged.connect(stale)
         self.notch.currentTextChanged.connect(stale)
+        self.reference.currentTextChanged.connect(stale)
         for w in (self.interp, self.ica_on):
             w.toggled.connect(stale)
         self._refilling = False  # rescoring refills the table without changing the choice
@@ -345,7 +355,13 @@ class PreprocessTab(QtWidgets.QWidget):
         # bad channels and ICA components are each subject's (session.subjects)
         return C.PreprocParams(l_freq=self.hp.value() or None,
                                h_freq=self.lp.value() or None, notch=notch,
-                               reference=None, interpolate_bads=self.interp.isChecked())
+                               reference=self.reference_spec(),
+                               interpolate_bads=self.interp.isChecked())
+
+    def reference_spec(self) -> str | None:
+        """The reference chosen: None (as recorded), "average", "mastoids" or names."""
+        t = self.reference.currentText().strip()
+        return None if t.lower() in ("", "as recorded") else t
 
     def run(self, then=None) -> bool:
         raw = self.pl.raw
@@ -486,8 +502,22 @@ class PreprocessTab(QtWidgets.QWidget):
 
 
     # ================================================================== reference
+    REF_CHOICES = ("as recorded", "average", "mastoids")
+
     def refresh_reference_choices(self):
-        """Kept for callers: the reference is chosen in the analyses now."""
+        """The fixed choices, then the recording's EEG channels (keeping the choice)."""
+        raw = self.pl.raw
+        names = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude=[])] \
+            if raw is not None else []
+        cur = self.reference.currentText()
+        self.reference.blockSignals(True)
+        self.reference.clear()
+        self.reference.addItems(list(self.REF_CHOICES))
+        if names:
+            self.reference.insertSeparator(len(self.REF_CHOICES))
+            self.reference.addItems(names)
+        self.reference.setCurrentText(cur)
+        self.reference.blockSignals(False)
 
     # ================================================================== ICA
 

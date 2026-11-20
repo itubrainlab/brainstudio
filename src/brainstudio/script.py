@@ -582,6 +582,8 @@ def _preprocessing(recipe: dict) -> tuple[list[str], set]:
             + (f", {p.notch:g} Hz notch" if p.notch else "") + ")"
             + (", its bad channels" + (" interpolated" if p.interpolate_bads else "")
                if any(s["bads"] for s in subs) else "")
+            + (f"; re-references to {p.reference if isinstance(p.reference, str) else ', '.join(p.reference)}"
+               if p.reference else "")
             + ("; removes eye blinks with ICA, fitted as in the ERP guide "
                "(neuraldatascience.io/eeg/erp-artifacts) on a 1–30 Hz average-referenced "
                "copy cut into 1 s segments" + (", the bad ones found by AutoReject"
@@ -614,6 +616,11 @@ def _preprocessing(recipe: dict) -> tuple[list[str], set]:
             row.update(ica_channels=list(f["chans"]), tmin=f["tmin"], decim=f["decim"],
                        exclude=list(s["exclude"]))
         rows[s["key"] or "recording"] = row
+    if p.reference:  # the same rule as the app (and the analyses) for every subject
+        ref = p.reference if isinstance(p.reference, str) else ", ".join(p.reference)
+        L += [assign("MASTOID_PAIRS = ", [list(x) for x in C.MASTOID_PAIRS]), ""]
+        L += inspect.getsource(C.resolve_erp_reference).splitlines() + [""]
+        L += [f"REFERENCE = {ref!r}  # chosen in ① Preprocessing", ""]
     L += [assign("SUBJECTS = ", rows) + ("  # each preprocessed on its own" if many else "")]
     L += ["", "def preprocess(data, s):",
           "    data.info['bads'] = s['bads']"]
@@ -666,6 +673,11 @@ def _preprocessing(recipe: dict) -> tuple[list[str], set]:
         L += ["    if 'exclude' in s:", "        ica.apply(data)"]
     if p.interpolate_bads:
         L += ["    if data.info['bads']:", "        data.interpolate_bads()"]
+    if p.reference:
+        L += ["    good = [data.ch_names[i] for i in mne.pick_types(data.info, eeg=True)]",
+              "    ref, _ = resolve_erp_reference(REFERENCE, good)  # each subject's good channels",
+              "    if ref:",
+              "        data.set_eeg_reference(ref)"]
     L += ["    return data", ""]
     if many:
         L += ["sf = raw.info['sfreq']",
